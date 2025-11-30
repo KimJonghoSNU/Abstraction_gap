@@ -148,10 +148,10 @@ cd scripts
 | `--load_existing` | Resume from checkpoint defined by hyperparams | False |
 | `--suffix` | Experiment name suffix | - |
 | `--llm_api_backend` | LLM API backend (genai or vllm) | genai |
-| `--llm` | Model name to use | gemini-2.0-flash-thinking-exp-01-21 |
+| `--llm` | Model name to use | gemini-2.5-flash |
 | `--llm_api_timeout` | API call timeout in seconds | 180 |
 | `--llm_api_max_retries` | Maximum number of API retries | 5 |
-| `--llm_max_concurrent_calls` | Maximum concurrent API calls | 50 |
+| `--llm_max_concurrent_calls` | Maximum concurrent API calls | 20 |
 | `--llm_api_staggering_delay` | Delay between staggered API calls (seconds) | 0.1 |
 
 For a complete list, see [`src/hyperparams.py`](src/hyperparams.py).
