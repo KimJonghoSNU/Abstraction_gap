@@ -29,7 +29,8 @@ def compress_hparam_string(hparam_str: str) -> str:
         if "=" in part:
             key, val = part.split("=", 1)
             if val and val.lower() not in ['false', 'none']:
-                val = val.replace('/', '__')
+                # val = val.replace('/', '__')
+                val = os.path.basename(val).split(".")[0]
                 compressed_parts.append(f"{abbreviate_key(key)}={val}")
         else:
             # Handle flag-only parameters
@@ -41,13 +42,28 @@ def compress_hparam_string(hparam_str: str) -> str:
     return final_str
 
 class HyperParams(argparse.Namespace):
-    NO_SAVE_VARS = set(['dataset', 'rerank', 'load_existing', 'llm_max_concurrent_calls', 'num_threads', 'search_with_path_relevance', 'llm_api_timeout', 'llm_api_max_retries', 'llm_api_staggering_delay'])
+    NO_SAVE_VARS = set([
+        'dataset',
+        'rerank',
+        'load_existing',
+        'llm_max_concurrent_calls',
+        'num_threads',
+        'search_with_path_relevance',
+        'llm_api_timeout',
+        'llm_api_max_retries',
+        'llm_api_staggering_delay',
+        # avoid excessively long log filenames
+        'retriever_model_path',
+        'node_emb_path',
+        # 'qe_cache_path',
+    ])
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
     
     def __str__(self):
         return compress_hparam_string('--'.join(f'{k.lower()}={v}' for k, v in vars(self).items() if k.lower() not in self.NO_SAVE_VARS))
+        # return compress_hparam_string('--'.join(f'{k.lower()}={os.path.basename(str(v)).split(".")[0]}' for k, v in vars(self).items() if k.lower() not in self.NO_SAVE_VARS))
 
     def __repr__(self):
         return self.__str__()
@@ -86,6 +102,17 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--load_existing', default=False, action='store_true') 
         parser.add_argument('--num_threads', type=int, default=os.cpu_count())
         parser.add_argument('--suffix', type=str, default='')
+
+        # Flat retrieval -> gated traversal (optional)
+        parser.add_argument('--flat_then_tree', default=False, action='store_true')
+        parser.add_argument('--retriever_model_path', type=str, default=None, help='Local path to Diver-Retriever-4B (or compatible) model')
+        parser.add_argument('--node_emb_path', type=str, default=None, help='Path to precomputed node embeddings (.npy) aligned with node_registry order')
+        parser.add_argument('--flat_topk', type=int, default=200, help='Top-K nodes to retrieve from the flattened node set')
+        parser.add_argument('--gate_branches_topb', type=int, default=10, help='Number of branch gates to keep')
+        # parser.add_argument('--qe_prompt_path', type=str, default=None, help='Optional prompt file for query expansion (used when QE cache misses)')
+        parser.add_argument('--qe_prompt_name', type=str, default=None, help='Optional built-in QE prompt name (used when QE cache misses)')
+        parser.add_argument('--qe_cache_path', type=str, default=None, help='Optional JSONL cache for query expansion results') 
+        parser.add_argument('--qe_force_refresh', default=False, action='store_true', help='Ignore QE cache and regenerate expansions')
         
         # Parse arguments
         parsed_args = parser.parse_args(args.split() if args else None)

@@ -12,3 +12,5 @@ torch==2.6.0
 tqdm==4.66.4
 wandb==0.22.2
 google-genai==1.33.0
+vllm==0.13.0
+accelerate==1.12.0

@@ -1,0 +1,126 @@
+# Abstraction Gap in Reasoning-Intensive Retrieval: Feedback Locality and Corpus-Induced Abstraction Units
+
+> 목적: `abstraction_gap.md`의 **Problem definition ↔ Method**를 논문 서술처럼 “같은 축”에 맞춰 정렬한 버전.  
+> 핵심: abstraction gap을 (A) **bridge 표현 부족** + (B) **top‑K→rewrite 피드백이 만드는 locality(경로 의존성)** 로 정의하고, 이를 완화하는 방법을 **corpus‑induced abstraction units(요약/중간 노드) + 전역 앵커링(flat) + (선택적) gated navigation**으로 제시한다.
+
+---
+
+## 1. Problem Definition
+
+Reasoning‑Intensive Retrieval(예: BRIGHT)에서는 질의가 종종 **구체(현상/사례)** 로 표현되지만, 정답 문서는 **추상(원리/모델/메커니즘)** 수준에 존재한다. 이때 단순 semantic similarity 기반 top‑K는 gold(또는 gold로 가는 bridge concept)를 놓치기 쉽고, 그 결과 LLM의 추론이 쉽게 흔들린다. 우리는 이 현상을 **abstraction gap**으로 부른다.
+
+### 1.1 Two coupled failure modes of abstraction gap
+
+**(A) Bridge representation bottleneck (표현/브릿지 부족)**  
+- 초기 질의 표현이 gold의 추상 개념과 직접 연결되지 않는다.  
+- 따라서 retriever가 “gold로 가는 중간 개념(bridge)”을 top‑K에 올리지 못한다.  
+- 관측되지 않은 개념은 이후 어떤 reasoning/rewriting에도 사용될 수 없으므로, 실패가 구조적으로 고착된다.
+
+**(B) Feedback locality (top‑K → query rewrite가 만드는 경로 의존성)**  
+- agentic search는 보통 `Retrieve(top‑K) → LLM으로 요약/답/키워드 생성 → Query rewrite → Retrieve ...` 형태의 피드백 루프를 가진다.  
+- 이때 rewrite의 입력이 항상 “직전 top‑K”에 의해 제한되므로, 초기에 특정 semantic region(대개 표면적으로 비슷한 region)에 진입하면 이후 rewrite가 그 region을 **자기강화(self‑reinforcing)** 하여 다른 region으로 점프하기 어렵다.  
+- 즉, 여기서의 locality는 “계층 탐색을 했기 때문”이 아니라, **top‑K 기반 관측 자체가 만드는 locality**다.
+
+> 연결성: (A)로 인해 올바른 bridge가 top‑K에 안 뜨면, (B)의 피드백 루프는 잘못된 region을 계속 강화한다. 두 병목은 독립이 아니라 **서로를 증폭**한다.
+
+### 1.2 Hard negative → logic poisoning as a special case of (A)+(B)
+
+Reasoning setting에서는 “주제는 비슷하지만 논리가 틀린” hard negative가 LLM의 추론을 오염시키는 **logic poisoning**을 유발한다.
+
+이 현상은 (A)(B)와 유기적으로 연결된다.
+- (A) bridge가 없을 때, hard negative는 gold의 대체 근거처럼 보이며 “잘못된 추상 방향”을 제공한다.
+- (B) 피드백 루프에서 hard negative는 단지 reasoning만 망치는 게 아니라, **rewrite를 오염**시켜 다음 retrieval까지 같은 region으로 끌고 간다(= “초기에 잘못 진입하면…”의 강화판).
+
+따라서 abstraction gap을 해결하려면 “더 많은 문서”가 아니라, **관측(top‑K)과 이동(다음 query/다음 region)을 강건하게 만드는 메커니즘**이 필요하다.
+
+---
+
+## 2. Prior Attempts and the pivot
+
+### 2.1 Baseline agentic search (일반적 형태)
+우리가 사용해온 agentic search의 핵심은 다음 중 하나다.
+- top‑K 문서를 주고 LLM이 **답/요약**을 작성하게 한 뒤, 그 텍스트를 다음 retrieval query로 사용
+- top‑K에서 **키워드/핵심 표현**을 뽑아 query rewrite에 반영
+
+이 방식은 (B) 피드백 locality를 본질적으로 가진다(입력이 top‑K로 제한되기 때문).
+
+### 2.2 Fixed-level prompts (우리 아이디어)와 한계
+저번 주까지의 시도는 example/entity/theory 같은 **고정 레벨(level)을 프롬프트로 명시**하고, 레벨별 explore/exploit을 수행하는 방식이었다.
+- 장점: “어떤 추상 방향으로 갈지”를 시스템이 강제로 만들어냄
+- 한계: 레벨 taxonomy는 쿼리/도메인에 따라 유효성이 달라서, 효과 없는 서브카테고리가 남는다
+
+결론적으로, 다음 단계의 질문은:
+> “레벨을 사람이 미리 정하는 대신, **corpus 정보를 사용해 쿼리마다 유효한 abstraction 단위를 동적으로 만들 수 있을까?**”
+
+---
+
+## 3. Corpus-induced abstraction units (and why interaction matters)
+
+LATTICE류 방법은 코퍼스에서 문서 클러스터의 **중간 요약 노드(branch)** 를 생성한다. 중요한 점은:
+- 이 요약은 **질의 없이 코퍼스만 보고 만들어진** 표현이다(= query‑dependent가 아님).
+
+따라서 핵심은 “branch 요약이 곧 레벨”이 아니라,
+> 검색 과정에서 **어떤 branch 요약을 관측/선택해 rewriting에 넣고**, 그 결과가 다음 이동을 어떻게 바꾸는지(= 상호작용)다.
+
+이 관점에서 branch 요약은 fixed level의 “대체물”이라기보다, 피드백 locality(B)를 깨기 위한 **외부 개념 핸들(concept handle)** 로 기능할 수 있다:
+- top‑K 문서만 보던 루프에, **코퍼스가 제공하는 중간 개념**을 주입하여
+- 잘못된 region을 강화하는 rewrite를 완화하고, 새로운 region으로 점프할 기회를 만든다.
+
+---
+
+## 4. Method: Flat anchoring → gate → (optional) navigation
+
+### 4.1 Global anchoring by flat retrieval over all nodes
+leaf/branch를 구분하지 않고 “모든 노드”를 dense retriever로 한 번에 검색한다.
+- 목적: (A)의 bridge 관측 실패를 줄이고, (B)의 피드백 locality를 깨기 위한 **전역 앵커 후보**를 확보
+
+### 4.2 Gate induction
+flat top‑K에서 선택된 노드들을 “들어갈 region”으로 정규화한다.
+- branch hit: 그대로 gate 후보
+- leaf hit: leaf의 ancestor branch로 승격(규칙은 ablation)
+- 결과 gate는 허용 prefix 집합(`allowed_prefixes`)으로 표현
+
+### 4.3 Local expansion inside the gate (선택적)
+gate 내부에서만 local expansion을 수행한다(예: 기존 LATTICE traversal).  
+여기서 “계층 탐색”은 연구의 major direction이라기보다, **gate로 정한 region 내부에서의 exploit** 구현체다.
+
+### 4.4 Robust final ranking
+flat에서 직접 잡힌 leaf와 gate 내부 탐색 결과 leaf를 함께 사용하고, 랭크‑레벨 fusion(RRF 등)으로 결합한다.
+
+---
+
+## 5. Interaction design (TODO): Query rewriting ↔ corpus units ↔ retrieval loop
+
+이 연구가 궁극적으로 겨냥하는 것은 다음의 닫힌 루프다.
+
+1) flat/top‑K로 얻은 후보 + 선택된 branch 요약(코퍼스 단위)을 관측  
+2) 그 컨텍스트로 query rewrite를 생성(bridge/추상 이동을 반영)  
+3) rewrite로 다음 retrieval(또는 gate/확장 정책)을 업데이트  
+4) 반복하며 “필요한 abstraction”을 점진적으로 정렬
+
+비용 제어를 위해 rewrite는 예산 기반으로 호출한다(예: 정체 시에만).
+
+---
+
+## 6. What we can claim (aligned to the problem)
+
+### 6.1 Empirical result we already have (True)
+`Flat → Gate → Traversal`이 baseline 대비 **Recall을 증가**시킨다.
+
+이 결과로부터 최소한 다음을 주장할 수 있다.
+- top‑K 기반 피드백 루프가 만드는 locality(B)에서 벗어나기 위해, **전역 앵커(flat) + region gate**가 유효하다.  
+  (초기 관측/진입이 바뀌면 이후 탐색이 달라진다.)
+
+### 6.2 Next claim to validate (TODO)
+interaction rewriting이 `Flat→Gate` 대비 추가 이득을 준다면:
+- abstraction gap의 핵심에는 “정적 1회 보정(QE)”을 넘어선 **동적 bridge 생성(표현 업데이트)** 이 포함되며,
+- 코퍼스가 제공하는 중간 요약 노드를 rewriting 컨텍스트로 주입하는 것이 (B) locality와 hard negative 오염을 완화한다.
+
+---
+
+## 7. Minimal experiment checklist (for the TODO)
+
+- 조건: baseline / flat→gate / flat→gate + interaction rewrite(예산 제한) 비교
+- 지표: nDCG/Recall + (진단) ancestor/gate hit, rewrite drift 사례
+- 분석: 효과 없는 서브카테고리에서 “fixed level 대신 corpus‑unit conditioning”이 개선을 주는지 확인
+

@@ -85,7 +85,7 @@ def get_node_id(id, docs_df):
     return None
 
 #region Saving and loading results helper functions
-def save_exp(RESULTS_DIR, hp, llm_api, eval_samples, all_eval_metric_dfs, allow_overwrite=False, save_llm_api_history=False):
+def save_exp(RESULTS_DIR, hp, llm_api, eval_samples, all_eval_metric_dfs, allow_overwrite=False, save_llm_api_history=True):
   def sanitize_dict(d):
     if isinstance(d, dict):
       return {k: sanitize_dict(v) for k, v in d.items() if any([isinstance(v, allowed) for allowed in PICKLE_ALLOWED_CLASSES])}

@@ -22,7 +22,8 @@ BASE_PORT=8000
 NUM_GPUS=4
 GPU_MEM_UTIL=0.95
 # Specify GPU IDs to use
-GPU_IDS=(0 1 3 4)
+# GPU_IDS=(0 1 3 4)
+GPU_IDS=(4 5 6 7)
 MAX_MODEL_LEN=128000
 
 # Colors for output
@@ -72,6 +73,7 @@ if [[ "$MODE" == "tensor" ]]; then
         --gpu-memory-utilization $GPU_MEM_UTIL \
         --disable-log-requests \
         --max-model-len $MAX_MODEL_LEN \
+        --trust-remote-code \
         > $LOG_FILE 2>&1 &
 
     PID=$!
@@ -128,6 +130,8 @@ else
             --gpu-memory-utilization $GPU_MEM_UTIL \
             --disable-log-requests \
             --max-model-len $MAX_MODEL_LEN \
+            --trust-remote-code \
+            --max_num_seqs 128 \
             > $LOG_FILE 2>&1 &
 
         PID=$!

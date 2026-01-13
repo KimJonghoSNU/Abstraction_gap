@@ -74,6 +74,11 @@ For data parallel mode (recommended for throughput):
 ```bash
 cd scripts
 ./start_vllm_cluster.sh "Qwen/Qwen3-VL-8B-Instruct" data
+
+# mine
+./start_vllm_cluster.sh  
+/data2/da02/models/Qwen3-4B-Instruct-2507 data 
+# parallel size는 .sh 파일 안에서 조절
 ```
 
 For tensor parallel mode (for larger models):

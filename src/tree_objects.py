@@ -85,6 +85,10 @@ class MaskedSemanticNode:
         return self.semantic_node.num_leaves
 
     @property
+    def path(self):
+        return self.semantic_node.path
+
+    @property
     def child(self):
         if self._child is None:
             self._child = [MaskedSemanticNode(x, self.excluded_ids_set) for x in self.semantic_node.child]
@@ -228,10 +232,11 @@ class PredictionNode(object):
     return self.semantic_node.id
   
 class InferSample(object):
-  def __init__(self, semantic_root_node, node_registry, hp, logger, query='', gold_paths=[], excluded_ids_set=None, max_rerank_size=20):
+  def __init__(self, semantic_root_node, node_registry, hp, logger, query='', gold_paths=[], excluded_ids_set=None, max_rerank_size=20, allowed_prefixes=None):
     self.query = query
     self.gold_paths = gold_paths
     self.excluded_ids_set = excluded_ids_set
+    self.allowed_prefixes = [tuple(x) for x in allowed_prefixes] if allowed_prefixes else None
     self.semantic_root_node = semantic_root_node
     if (self.excluded_ids_set is not None) and (len(self.excluded_ids_set) > 0):
       self.semantic_root_node = MaskedSemanticNode(semantic_root_node, excluded_ids_set)
@@ -255,6 +260,16 @@ class InferSample(object):
     self.relevance_chain_factor = hp.RELEVANCE_CHAIN_FACTOR
 
     self.SAVE_LIST = ['query', 'gold_paths', 'max_beam_size', 'max_rerank_size', 'num_iters', 'search_with_path_relevance', 'num_leaf_calib', 'excluded_ids_set']
+
+  def _is_path_allowed(self, path):
+    if not self.allowed_prefixes:
+      return True
+    path = tuple(path)
+    for gate in self.allowed_prefixes:
+      # allow nodes on the way to a gate, and nodes within the gate subtree
+      if (len(path) <= len(gate) and gate[:len(path)] == path) or (len(gate) <= len(path) and path[:len(gate)] == gate):
+        return True
+    return False
 
   def __str__(self):
     string = f'Query: {self.query}\n\nBeam state paths:'
@@ -361,17 +376,31 @@ class InferSample(object):
 
     for state_path in self.beam_state_paths:
       cur_state = state_path[-1]
-      slate = [(child.desc, child.registry_idx) for child in cur_state.semantic_node.child]
-      leaf_cluster = all([(len(child.child)==0) for child in cur_state.semantic_node.child])
+      base_children = list(cur_state.semantic_node.child)
+      if self.allowed_prefixes:
+        allowed_children = [c for c in base_children if self._is_path_allowed(c.path)]
+        if len(allowed_children) > 0:
+          base_children = allowed_children
+
+      slate = [(child.desc, child.registry_idx) for child in base_children]
+      leaf_cluster = all([(len(child.child)==0) for child in base_children])
       anchor = None; anchor_score = None
       if self.num_leaf_calib:
         if leaf_cluster:
-          slate += top_preds_slate
+          if self.allowed_prefixes:
+            gated_top_preds_slate = []
+            for desc, ridx in top_preds_slate:
+              if self._is_path_allowed(self.node_registry[ridx].path):
+                gated_top_preds_slate.append((desc, ridx))
+            slate += gated_top_preds_slate
+          else:
+            slate += top_preds_slate
         else:
           cur_level = len(cur_state.path)
           best_node_at_cur_level = self.get_best_node_at_level(cur_level)
           if (best_node_at_cur_level is not None) and (cur_level > 0):
-            slate += [(best_node_at_cur_level.desc, best_node_at_cur_level.registry_idx)]
+            if (not self.allowed_prefixes) or self._is_path_allowed(best_node_at_cur_level.path):
+              slate += [(best_node_at_cur_level.desc, best_node_at_cur_level.registry_idx)]
 
       desc_list = [x[0] for x in slate]
       prompt = self.get_traversal_prompt(self.query, desc_list, leaf_cluster=leaf_cluster, anchor=anchor, anchor_score=anchor_score)
@@ -387,7 +416,21 @@ class InferSample(object):
       reasoning = recursive_key_search(response_json, 'reasoning')
       relevance_scores = recursive_key_search(response_json, 'relevance_scores')
       try:
-        relevance_scores = {slate[int(k)]: float(v)/100 for k, v in relevance_scores}
+        cleaned = {}
+        if isinstance(relevance_scores, (list, tuple)):
+          for k, v in relevance_scores:
+            try:
+              idx = int(k)
+            except Exception:
+              continue
+            if idx < 0 or idx >= len(slate):
+              continue
+            try:
+              score = float(v) / 100
+            except Exception:
+              continue
+            cleaned[slate[idx]] = score
+        relevance_scores = cleaned if cleaned else None
       except Exception as e:
         self.logger.error(f'Error parsing relevance scores: {relevance_scores}, slate: {slate} with error {e}')
         relevance_scores = None
