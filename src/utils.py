@@ -86,66 +86,73 @@ def get_node_id(id, docs_df):
 
 #region Saving and loading results helper functions
 def save_exp(RESULTS_DIR, hp, llm_api, eval_samples, all_eval_metric_dfs, allow_overwrite=False, save_llm_api_history=True):
-  def sanitize_dict(d):
-    if isinstance(d, dict):
-      return {k: sanitize_dict(v) for k, v in d.items() if any([isinstance(v, allowed) for allowed in PICKLE_ALLOWED_CLASSES])}
-    elif isinstance(d, list):
-      return [sanitize_dict(v) for v in d if any([isinstance(v, allowed) for allowed in PICKLE_ALLOWED_CLASSES])]
-    else:
-      return d
+    def sanitize_dict(d):
+        if isinstance(d, dict):
+            return {k: sanitize_dict(v) for k, v in d.items() if any([isinstance(v, allowed) for allowed in PICKLE_ALLOWED_CLASSES])}
+        elif isinstance(d, list):
+            return [sanitize_dict(v) for v in d if any([isinstance(v, allowed) for allowed in PICKLE_ALLOWED_CLASSES])]
+        else:
+            return d
 
-  eval_dump_path = f'{RESULTS_DIR}/all_eval_sample_dicts-{hp}.pkl'
-  eval_metrics_dump_path = f'{RESULTS_DIR}/all_eval_metrics-{hp}.pkl'
-  llm_api_history_dump_path = f'{RESULTS_DIR}/llm_api_history-{hp}.pkl'
-  os.makedirs(os.path.dirname(eval_dump_path), exist_ok=True)
-  os.makedirs(os.path.dirname(eval_metrics_dump_path), exist_ok=True)
-  os.makedirs(os.path.dirname(llm_api_history_dump_path), exist_ok=True)
+    eval_dump_path = f'{RESULTS_DIR}/all_eval_sample_dicts.pkl'
+    eval_metrics_dump_path = f'{RESULTS_DIR}/all_eval_metrics.pkl'
+    llm_api_history_dump_path = f'{RESULTS_DIR}/llm_api_history.pkl'
+    os.makedirs(os.path.dirname(eval_dump_path), exist_ok=True)
+    os.makedirs(os.path.dirname(eval_metrics_dump_path), exist_ok=True)
+    os.makedirs(os.path.dirname(llm_api_history_dump_path), exist_ok=True)
 
-  all_eval_sample_dicts = [sanitize_dict(sample.to_dict()) for sample in eval_samples]
-  if os.path.exists(eval_dump_path) and (not allow_overwrite):
-    user_input = input(f'Dump path exists, override (y/n)?')
-    assert user_input.lower() == 'y'
+    all_eval_sample_dicts = [sanitize_dict(sample.to_dict()) for sample in eval_samples]
+    if os.path.exists(eval_dump_path) and (not allow_overwrite):
+        user_input = input(f'Dump path exists, override (y/n)?')
+        assert user_input.lower() == 'y'
 
-  pkl.dump(all_eval_sample_dicts, open(eval_dump_path, 'wb'))
-  # print(f'Saved predictions to {eval_dump_path}')
+    pkl.dump(all_eval_sample_dicts, open(eval_dump_path, 'wb'))
+    # print(f'Saved predictions to {eval_dump_path}')
 
-  pd.concat(all_eval_metric_dfs, axis=1, keys=[f'Iter {i}' for i in range(len(all_eval_metric_dfs))]).to_pickle(eval_metrics_dump_path)
-  # print(f'Saved metrics to {eval_metrics_dump_path}')
+    pd.concat(all_eval_metric_dfs, axis=1, keys=[f'Iter {i}' for i in range(len(all_eval_metric_dfs))]).to_pickle(eval_metrics_dump_path)
+    # print(f'Saved metrics to {eval_metrics_dump_path}')
 
-  if save_llm_api_history:
-    pkl.dump(llm_api.history, open(llm_api_history_dump_path, 'wb'))
+    if save_llm_api_history:
+        pkl.dump(llm_api.history, open(llm_api_history_dump_path, 'wb'))
 
 def load_exp(RESULTS_DIR, hp, semantic_root_node, node_registry, logger, hp_str=None):
-  if hp_str is None:
-    hp_str = str(hp)
-  from tree_objects import InferSample
-  eval_dump_path = f'{RESULTS_DIR}/all_eval_sample_dicts-{hp_str}.pkl'
-  eval_metrics_dump_path = f'{RESULTS_DIR}/all_eval_metrics-{hp_str}.pkl'
+    if hp_str is None:
+        hp_str = str(hp)
+    from tree_objects import InferSample
+    eval_dump_path = f'{RESULTS_DIR}/all_eval_sample_dicts.pkl'
+    eval_metrics_dump_path = f'{RESULTS_DIR}/all_eval_metrics.pkl'
 
-  if not os.path.exists(eval_dump_path) or not os.path.exists(eval_metrics_dump_path):
-     logger.warning(f'No existing dump found at {eval_dump_path} or {eval_metrics_dump_path}, starting fresh')
-     return [], []
+    if not os.path.exists(eval_dump_path) or not os.path.exists(eval_metrics_dump_path):
+        legacy_eval_dump_path = f'{RESULTS_DIR}/all_eval_sample_dicts-{hp_str}.pkl'
+        legacy_eval_metrics_dump_path = f'{RESULTS_DIR}/all_eval_metrics-{hp_str}.pkl'
+        if os.path.exists(legacy_eval_dump_path) and os.path.exists(legacy_eval_metrics_dump_path):
+            eval_dump_path = legacy_eval_dump_path
+            eval_metrics_dump_path = legacy_eval_metrics_dump_path
 
-  all_eval_sample_dicts = pkl.load(open(eval_dump_path, 'rb'))
-  eval_samples = [InferSample(semantic_root_node, node_registry, hp, logger, excluded_ids_set=d.get('excluded_ids_set', None)).load_dict(d) for d in all_eval_sample_dicts]
-  
-  for sample in eval_samples:
-     sample.post_load_processing()
+    if not os.path.exists(eval_dump_path) or not os.path.exists(eval_metrics_dump_path):
+        logger.warning(f'No existing dump found at {eval_dump_path} or {eval_metrics_dump_path}, starting fresh')
+        return [], []
 
-  # Load the concatenated DataFrame and split it back into a list
-  concatenated_df = pd.read_pickle(eval_metrics_dump_path)
-  
-  # Extract individual DataFrames from the multi-level columns
-  all_eval_metric_dfs = []
-  if hasattr(concatenated_df.columns, 'levels'):  # Check if it has MultiIndex columns
-    for iter_key in concatenated_df.columns.levels[0]:
-      df = concatenated_df[iter_key]
-      all_eval_metric_dfs.append(df)
-  else:
-    # Fallback if it's not a MultiIndex (single iteration case)
-    all_eval_metric_dfs = [concatenated_df]
+    all_eval_sample_dicts = pkl.load(open(eval_dump_path, 'rb'))
+    eval_samples = [InferSample(semantic_root_node, node_registry, hp, logger, excluded_ids_set=d.get('excluded_ids_set', None)).load_dict(d) for d in all_eval_sample_dicts]
+    
+    for sample in eval_samples:
+        sample.post_load_processing()
 
-  return eval_samples, all_eval_metric_dfs
+    # Load the concatenated DataFrame and split it back into a list
+    concatenated_df = pd.read_pickle(eval_metrics_dump_path)
+    
+    # Extract individual DataFrames from the multi-level columns
+    all_eval_metric_dfs = []
+    if hasattr(concatenated_df.columns, 'levels'):  # Check if it has MultiIndex columns
+        for iter_key in concatenated_df.columns.levels[0]:
+            df = concatenated_df[iter_key]
+            all_eval_metric_dfs.append(df)
+    else:
+        # Fallback if it's not a MultiIndex (single iteration case)
+        all_eval_metric_dfs = [concatenated_df]
+
+    return eval_samples, all_eval_metric_dfs
 #endregion
 
 #region Setup logging

@@ -57,7 +57,7 @@ Reasoning setting에서는 “주제는 비슷하지만 논리가 틀린” hard
 - 한계: top‑K에 묶인 rewrite loop 안에서 레벨만 바꾸면 **잘못된 region의 locality**를 깨지 못한다
 
 결론적으로, 다음 단계의 질문은:
-> “레벨을 사람이 미리 정하는 대신, **corpus 정보를 사용해 쿼리마다 유효한 abstraction 단위를 동적으로 만들고, 그 단위가 rewrite의 landing point로 작동하도록 만들 수 있을까?**”
+> “레벨을 사람이 미리 정하는 대신, **corpus 정보를 사용해 쿼리마다 유효한 abstraction 단위를 동적으로 만들고, 그 단위가 rewrite의 anchor로 작동하도록 만들 수 있을까?**”
 
 ---
 
@@ -120,10 +120,15 @@ Gate 내부 탐색(Exploit)만으로 충분한지(Router 판단), 아니면 Gate
 - top‑K 기반 피드백 루프가 만드는 locality(B)에서 벗어나기 위해, **전역 앵커(flat) + region gate**가 유효하다.  
   (초기 관측/진입이 바뀌면 이후 탐색이 달라진다.)
 
-### 6.2 Next claim to validate (TODO)
+### 6.2 Next claim to validate (TODO. not fixed. still on a discussion)
 interaction rewriting이 `Flat→Gate` 대비 추가 이득을 준다면:
 - abstraction gap의 핵심에는 “정적 1회 보정(QE)”을 넘어선 **동적 bridge 생성(표현 업데이트)** 이 포함되며,
 - 코퍼스가 제공하는 중간 요약 노드를 rewriting 컨텍스트로 주입하는 것이 (B) locality와 hard negative 오염을 완화한다.
+
+언제 rewrite해야할까? 
+- stagnation: 이전 라운드 대비 top-K 노드들의 prefix 다양성이 거의 안 변함
+- low gate confidence: gate 후보들의 score gap이 작음(1등~3등 비슷)
+- poison signal: top-K leaf 간 상호 모순/불일치가 높거나, 질문과의 “논리적 entailment”가 낮음(간단히는 LLM judge 1회)
 
 ---
 

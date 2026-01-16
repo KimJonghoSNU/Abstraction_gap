@@ -1,4 +1,4 @@
-import re, os
+import re, os, json, hashlib
 import argparse
 
 def abbreviate_key(key: str) -> str:
@@ -17,7 +17,7 @@ def abbreviate_key(key: str) -> str:
             abbrev_parts.append(p[:1].capitalize())  # take first 3 letters
     return "".join(abbrev_parts)
 
-def compress_hparam_string(hparam_str: str) -> str:
+def compress_hparam_string(hparam_str: str, chunk_size: int = 5) -> str:
     """
     Compress a hyperparameter string into a shorter form
     without hardcoded replacement rules.
@@ -39,21 +39,11 @@ def compress_hparam_string(hparam_str: str) -> str:
     final_str = "-".join(compressed_parts)
     final_str = re.sub(r"\.log$", "", final_str)
 
-    # Split into subdir/file at MaxBS if present to keep filenames short.
+    # Split into subdirs in fixed-size chunks to avoid overly long paths.
     parts = [p for p in final_str.split("-") if p]
-    split_idx = None
-    for i, part in enumerate(parts):
-        if part.startswith("MaxBS="):
-            split_idx = i + 1  # include MaxBS in the subdir
-            break
-    if split_idx is None:
-        split_idx = min(3, len(parts))
-    prefix = "-".join(parts[:split_idx])
-    suffix = "-".join(parts[split_idx:])
-    if suffix:
-        final_str = f"{prefix}/{suffix}"
-    else:
-        final_str = prefix
+    if parts:
+        chunks = ["-".join(parts[i:i + chunk_size]) for i in range(0, len(parts), chunk_size)]
+        final_str = "/".join(chunks)
 
     return final_str
 
@@ -88,6 +78,22 @@ class HyperParams(argparse.Namespace):
 
     def __getattr__(self, k):
         return vars(self).get(k.lower())
+
+    def exp_hash(self, length: int = 16) -> str:
+        """Stable hash over all hyperparameters."""
+        def normalize(value):
+            if isinstance(value, dict):
+                return {str(k): normalize(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+            if isinstance(value, (list, tuple)):
+                return [normalize(v) for v in value]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return str(value)
+
+        payload = {str(k).lower(): normalize(v) for k, v in vars(self).items()}
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        return digest if length is None else digest[:length]
     
     @classmethod
     def from_args(cls, args=None):
@@ -138,7 +144,19 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--rewrite_mode', type=str, default='concat', choices=['concat', 'replace'], help='How to combine rewrite with the traversal query')
         parser.add_argument('--rewrite_every', type=int, default=1, help='Rewrite every N iterations when rewrite is enabled')
         parser.add_argument('--rewrite_context_topk', type=int, default=5, help='Max number of summaries to include in rewrite context')
-        parser.add_argument('--rewrite_context_source', type=str, default='mixed', choices=['flat', 'slate', 'fused', 'mixed'], help='Context source for rewrite')
+        parser.add_argument(
+            '--rewrite_context_source',
+            type=str,
+            default='mixed',
+            choices=['flat', 'slate', 'fused', 'mixed'],
+            help=(
+                "Context source for rewrite: "
+                "flat=topk descriptions from flat retrieval; "
+                "slate=topk descriptions from current traversal slates; "
+                "fused=RRF fusion of flat-retrieval leaf ranks and traversal leaf ranks; "
+                "mixed=RRF fusion of fused (if available) and slate ranks."
+            ),
+        )
         parser.add_argument('--rewrite_at_start', default=False, action='store_true', help='Run rewrite once before the first traversal iteration')
         
         # Parse arguments

@@ -15,6 +15,9 @@ log "Starting run_flat.sh script"
 RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
 NODE_EMB_BASE="../trees/BRIGHT"
 
+# Cache base dirs (optional, will be created if missing)
+QE_CACHE_BASE="/data4/jongho/Search-o1/data/QA_Datasets/bright/stepback_json/pre_flat/qwen3-4b-instruct-2507"
+
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
     --suffix flat_gate
@@ -32,7 +35,10 @@ COMMON_PARAMS=(
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
     --gate_branches_topb 10
-    
+
+    # Pre-flat rewrite (query -> rewrite -> flat retrieval)
+    --qe_prompt_name stepback_json_pre
+    # --qe_force_refresh    
 )
 
 # Define RUNS directly as strings (space-separated args)
@@ -66,7 +72,7 @@ for idx in "${!RUNS[@]}"; do
     fi
     NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.diver.npy"
     # QE_CACHE_PATH="/data4/jongho/Search-o1/data/QA_Datasets/bright/stepback_json_round5_route_exec/qwen3-4b-instruct-2507/${subset}_converted_qe_woplan.jsonl"
-    QE_CACHE_PATH="/data4/jongho/Search-o1/data/QA_Datasets/bright/stepback_json_round5_route_exec/qwen3-4b-instruct-2507/${subset}_converted_qe.jsonl"
+    # QE_CACHE_PATH="/data4/jongho/Search-o1/data/QA_Datasets/bright/stepback_json_round5_route_exec/qwen3-4b-instruct-2507/${subset}_converted_qe.jsonl"
     # QE_CACHE_PATH="/data4/jongho/Search-o1/data/QA_Datasets/bright/thinkqe_round2/qwen3-4b-instruct-2507/${subset}_thinkqe_round2.jsonl"
 
     # Build final args: first common params, then iteration-specific params
@@ -82,6 +88,8 @@ for idx in "${!RUNS[@]}"; do
         fi
         ((i++))
     done
+
+    QE_CACHE_PATH="${QE_CACHE_BASE}/${subset}_pre_flat_rewrite.jsonl"
 
     # Add node embeddings path for this subset
     final_args+=("--node_emb_path" "$NODE_EMB_PATH")

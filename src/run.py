@@ -429,14 +429,31 @@ def _get_rewrite_context(
         return _slates_to_context_descs(sample_slates, node_registry, topk, max_desc_len)
     return []
 
+def _count_slate_depths(slates: List[List[int]], node_registry: List[object], topk: int) -> dict[int, int]:
+    depth_counts: dict[int, int] = {}
+    seen: set[int] = set()
+    for slate in slates:
+        for ridx in slate:
+            if ridx in seen:
+                continue
+            seen.add(ridx)
+            depth = len(node_registry[ridx].path)
+            depth_counts[depth] = depth_counts.get(depth, 0) + 1
+            if topk and len(seen) >= topk:
+                return depth_counts
+    return depth_counts
+
 #region Setup
 hp = HyperParams.from_args()
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS_DIR = f'{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/'
+exp_dir_name = str(hp)
+RESULTS_DIR = f'{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/{exp_dir_name}/'
 os.makedirs(RESULTS_DIR, exist_ok=True)
-log_path = f"{RESULTS_DIR}/{hp}.log"
+log_path = f"{RESULTS_DIR}/run.log"
 os.makedirs(os.path.dirname(log_path), exist_ok=True)
 logger = setup_logger('lattice_runner', log_path, logging.INFO)
+with open(f"{RESULTS_DIR}/hparams.json", "w", encoding="utf-8") as f:
+    json.dump(vars(hp), f, indent=2, ensure_ascii=True, sort_keys=True)
 
 # Initialize wandb logging
 # run_name = init_wandb_logging(hp, RESULTS_DIR)
@@ -486,7 +503,7 @@ rewrite_enabled = False
 rewrite_map = {}
 rewrite_template = None
 
-if hp.LOAD_EXISTING and os.path.exists(f'{RESULTS_DIR}/all_eval_sample_dicts-{hp}.pkl'):
+if hp.LOAD_EXISTING and os.path.exists(f'{RESULTS_DIR}/all_eval_sample_dicts.pkl'):
     all_eval_samples, all_eval_metric_dfs = load_exp(RESULTS_DIR, hp, semantic_root_node, node_registry, logger)
     logger.info(f'Loaded existing experiment with {len(all_eval_samples)} eval samples and {len(all_eval_metric_dfs)} eval metric dfs')
     if len(all_eval_samples) > 0:
@@ -742,6 +759,9 @@ async def retrieval_loop_step(iter_idx: int):  # Make the function asynchronous
     flat_inputs = [y for x in inputs for y in x]
     flat_prompts, flat_slates = list(zip(*flat_inputs))
     slates = [flat_slates[indptr[j]:indptr[j+1]] for j in range(len(inputs))]
+    flat_slates_all = [slate for sample_slates in slates for slate in sample_slates]
+    depth_counts = _count_slate_depths(flat_slates_all, node_registry, hp.FLAT_TOPK)
+    logger.info(f"Iter {iter_idx}: slate depth counts (topk={hp.FLAT_TOPK}) {depth_counts}")
 
     flat_responses = await llm_api.run_batch(flat_prompts, **llm_api_kwargs)
     flat_response_jsons = [post_process(output, return_json=True) for output in tqdm(flat_responses)]
