@@ -26,7 +26,7 @@ def main() -> None:
         tree_obj = pkl.load(open(args.tree_pkl, "rb"))
     root = SemanticNode().load_dict(tree_obj) if isinstance(tree_obj, dict) else tree_obj
     node_registry = compute_node_registry(root)
-
+    import pdb; pdb.set_trace()
     os.makedirs(os.path.dirname(args.out_jsonl) or ".", exist_ok=True)
     with open(args.out_jsonl, "w", encoding="utf-8") as f:
         for node in node_registry:

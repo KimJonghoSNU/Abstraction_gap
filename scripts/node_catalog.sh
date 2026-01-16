@@ -1,7 +1,7 @@
-# categories=("biology" "psychology")
+categories=("biology" "psychology")
 # categories=("leetcode" "earth_science")
 # "biology" "earth_science" "psychology" "leetcode"
-categories=("economics" "robotics" "stackoverflow" "sustainable_living" "pony" "aops" "theoremqa_questions" "theoremqa_theorems")
+# categories=("economics" "robotics" "stackoverflow" "sustainable_living" "pony" "aops" "theoremqa_questions" "theoremqa_theorems")
 
 export CUDA_VISIBLE_DEVICES=3
 

@@ -243,3 +243,16 @@ python run.py \
 - rewrite cache key 정의: `(original_query, subset, tree_version, path_signature, iter_idx, beam_idx)` 중 필요한 최소만
 - rewrite 예산/트리거를 명시적으로 고정(질의당 최대 호출 수)
 - 결과 저장: 조건(C0–C4), rewrite 호출 수, 마지막 fused ranking, gate paths를 함께 저장(재분석 가능)
+
+## 260114) Implementation updates (rewrite + logging)
+
+- Rewrite 입력 단순화: **original query + last rewrite(raw)**만 프롬프트로 전달 (current/user query 제거).
+- Query composition: 실제 retrieval/traversal query는 **original + current rewrite**로 구성, rewrite는 `replace` 모드 권장.
+- Rewrite 컨텍스트 소스 확장:
+  - `flat`: flat retrieval top‑K hits
+  - `slate`: 현재 traversal slate
+  - `fused`: flat leaf + traversal leaf RRF
+  - `mixed`: `fused` + `slate`를 다시 RRF로 섞어 top‑K 추출
+- Rewrite history 저장: `rewrite_history`를 pkl에 포함하도록 `SAVE_LIST` 추가.
+- QE 템플릿 파싱 안정화: JSON braces로 인한 `str.format` 오류에 fallback 추가.
+- 로그/결과 저장 경로 단축: `HyperParams.__str__`에서 `MaxBS` 기준으로 subfolder 분리, `save_exp`는 hp 경로에 맞게 mkdirs 처리.

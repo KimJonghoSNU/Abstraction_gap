@@ -259,7 +259,17 @@ class InferSample(object):
     self.node_registry = node_registry
     self.relevance_chain_factor = hp.RELEVANCE_CHAIN_FACTOR
 
-    self.SAVE_LIST = ['query', 'gold_paths', 'max_beam_size', 'max_rerank_size', 'num_iters', 'search_with_path_relevance', 'num_leaf_calib', 'excluded_ids_set']
+    self.SAVE_LIST = [
+        'query',
+        'gold_paths',
+        'max_beam_size',
+        'max_rerank_size',
+        'num_iters',
+        'search_with_path_relevance',
+        'num_leaf_calib',
+        'excluded_ids_set',
+        'rewrite_history',
+    ]
 
   def _is_path_allowed(self, path):
     if not self.allowed_prefixes:

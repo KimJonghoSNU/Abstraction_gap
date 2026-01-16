@@ -53,7 +53,7 @@ def build_gates_and_leaf_candidates(
                 continue
             gates.append(anc)
             seen.add(anc)
-            if len(gates) >= gate_branches_topb:
+            if len(gates) >= gate_branches_topb: # leaf hit들을 score 순으로 보며, 각 leaf의 **모든 ancestor prefix**(depth 1→…→parent)를 gate에 보충(중복 제거
                 return gates[:gate_branches_topb], flat_leaf_ranked
 
     return gates[:gate_branches_topb], flat_leaf_ranked

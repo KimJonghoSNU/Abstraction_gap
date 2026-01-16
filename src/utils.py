@@ -97,6 +97,9 @@ def save_exp(RESULTS_DIR, hp, llm_api, eval_samples, all_eval_metric_dfs, allow_
   eval_dump_path = f'{RESULTS_DIR}/all_eval_sample_dicts-{hp}.pkl'
   eval_metrics_dump_path = f'{RESULTS_DIR}/all_eval_metrics-{hp}.pkl'
   llm_api_history_dump_path = f'{RESULTS_DIR}/llm_api_history-{hp}.pkl'
+  os.makedirs(os.path.dirname(eval_dump_path), exist_ok=True)
+  os.makedirs(os.path.dirname(eval_metrics_dump_path), exist_ok=True)
+  os.makedirs(os.path.dirname(llm_api_history_dump_path), exist_ok=True)
 
   all_eval_sample_dicts = [sanitize_dict(sample.to_dict()) for sample in eval_samples]
   if os.path.exists(eval_dump_path) and (not allow_overwrite):

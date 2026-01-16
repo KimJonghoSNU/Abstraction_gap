@@ -39,6 +39,22 @@ def compress_hparam_string(hparam_str: str) -> str:
     final_str = "-".join(compressed_parts)
     final_str = re.sub(r"\.log$", "", final_str)
 
+    # Split into subdir/file at MaxBS if present to keep filenames short.
+    parts = [p for p in final_str.split("-") if p]
+    split_idx = None
+    for i, part in enumerate(parts):
+        if part.startswith("MaxBS="):
+            split_idx = i + 1  # include MaxBS in the subdir
+            break
+    if split_idx is None:
+        split_idx = min(3, len(parts))
+    prefix = "-".join(parts[:split_idx])
+    suffix = "-".join(parts[split_idx:])
+    if suffix:
+        final_str = f"{prefix}/{suffix}"
+    else:
+        final_str = prefix
+
     return final_str
 
 class HyperParams(argparse.Namespace):
@@ -55,6 +71,8 @@ class HyperParams(argparse.Namespace):
         # avoid excessively long log filenames
         'retriever_model_path',
         'node_emb_path',
+        'rewrite_prompt_path',
+        'rewrite_cache_path',
         # 'qe_cache_path',
     ])
 
@@ -113,6 +131,15 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--qe_prompt_name', type=str, default=None, help='Optional built-in QE prompt name (used when QE cache misses)')
         parser.add_argument('--qe_cache_path', type=str, default=None, help='Optional JSONL cache for query expansion results') 
         parser.add_argument('--qe_force_refresh', default=False, action='store_true', help='Ignore QE cache and regenerate expansions')
+        parser.add_argument('--rewrite_prompt_name', type=str, default=None, help='Optional built-in rewrite prompt name (used when cache misses)')
+        parser.add_argument('--rewrite_prompt_path', type=str, default=None, help='Optional prompt file for rewrite (used when cache misses)')
+        parser.add_argument('--rewrite_cache_path', type=str, default=None, help='Optional JSONL cache for rewrite results')
+        parser.add_argument('--rewrite_force_refresh', default=False, action='store_true', help='Ignore rewrite cache and regenerate rewrites')
+        parser.add_argument('--rewrite_mode', type=str, default='concat', choices=['concat', 'replace'], help='How to combine rewrite with the traversal query')
+        parser.add_argument('--rewrite_every', type=int, default=1, help='Rewrite every N iterations when rewrite is enabled')
+        parser.add_argument('--rewrite_context_topk', type=int, default=5, help='Max number of summaries to include in rewrite context')
+        parser.add_argument('--rewrite_context_source', type=str, default='mixed', choices=['flat', 'slate', 'fused', 'mixed'], help='Context source for rewrite')
+        parser.add_argument('--rewrite_at_start', default=False, action='store_true', help='Run rewrite once before the first traversal iteration')
         
         # Parse arguments
         parsed_args = parser.parse_args(args.split() if args else None)

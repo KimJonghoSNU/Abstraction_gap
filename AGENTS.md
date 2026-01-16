@@ -1,1 +1,3 @@
-- You have to use 4 space inline tab
+- You have to use 4 space inline tab.
+- Do not just follow my order but be critic and suggest better direction if possible.
+- 내가 작업 목적과 배경 자료를 공유했을 때, 우리 둘이 서로 같은 페이지에 있어야 해. 나를 최대한 꼼꼼하게 인터뷰해줘. 
