@@ -271,6 +271,52 @@ class InferSample(object):
         'rewrite_history',
     ]
 
+  def seed_beam_from_gate_paths(self, gate_paths, gate_scores=None):
+    if not gate_paths:
+      return
+    gate_scores = gate_scores or {}
+    edge_scores = {}
+    for path in gate_paths:
+      path = tuple(path)
+      score = gate_scores.get(path, 1.0)
+      for depth, child_idx in enumerate(path):
+        parent_path = tuple(path[:depth])
+        parent_scores = edge_scores.setdefault(parent_path, {})
+        prev = parent_scores.get(child_idx)
+        if (prev is None) or (score > prev):
+          parent_scores[child_idx] = score
+
+    def ensure_children(node, path_prefix):
+      if node.child_relevances is not None:
+        return
+      child_scores = edge_scores.get(tuple(path_prefix), {})
+      child_rels = [0.0 for _ in range(node.num_children)]
+      for idx, score in child_scores.items():
+        if 0 <= idx < len(child_rels):
+          child_rels[idx] = score
+      node.instantiate_children(child_rels, reasoning='seeded_gate', creation_step=0)
+
+    beam_paths = []
+    for path in gate_paths:
+      node = self.prediction_tree
+      path_nodes = [node]
+      for depth, child_idx in enumerate(path):
+        parent_path = tuple(path[:depth])
+        if parent_path in edge_scores:
+          ensure_children(node, parent_path)
+        if not node.child:
+          break
+        if (child_idx < 0) or (child_idx >= len(node.child)):
+          break
+        node = node.child[child_idx]
+        path_nodes.append(node)
+      beam_paths.append(path_nodes)
+
+    if beam_paths:
+      self.beam_state_paths = beam_paths
+      self.beam_state_paths_history = []
+      self.seeded_gate_paths = [tuple(p) for p in gate_paths]
+
   def _is_path_allowed(self, path):
     if not self.allowed_prefixes:
       return True

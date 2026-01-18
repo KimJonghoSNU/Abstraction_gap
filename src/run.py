@@ -531,6 +531,9 @@ else:
         retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
 
         qe_enabled = bool(hp.QE_PROMPT_NAME or hp.QE_CACHE_PATH)
+        if hp.PRE_FLAT_REWRITE and qe_enabled:
+            logger.warning('QE is ignored when --pre_flat_rewrite is set. Using original query for initial flat retrieval.')
+            qe_enabled = False
         if rewrite_enabled:
             if hp.REWRITE_PROMPT_NAME:
                 if hp.REWRITE_PROMPT_NAME not in REWRITE_PROMPT_TEMPLATES:
@@ -605,6 +608,75 @@ else:
                                 'prompt_name': hp.QE_PROMPT_NAME,
                                 'llm': hp.LLM,
                             }, ensure_ascii=False) + '\n')
+        preflat_rewrite_map = {}
+        if hp.PRE_FLAT_REWRITE:
+            if not rewrite_enabled:
+                raise ValueError('--pre_flat_rewrite requires rewrite prompt or cache')
+            eval_queries = [examples_df.iloc[i]['query'][:hp.MAX_QUERY_CHAR_LEN] for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES))]
+            preflat_prompts = []
+            preflat_meta = []
+            for q in eval_queries:
+                hits = flat_retrieve_hits(
+                    retriever=retriever,
+                    query=q,
+                    node_embs=node_embs,
+                    node_registry=node_registry,
+                    topk=hp.FLAT_TOPK,
+                )
+                if hp.PRE_FLAT_REWRITE_SOURCE == "branch":
+                    context_hits = [h for h in hits if not h.is_leaf]
+                else:
+                    context_hits = hits
+                context_descs = _hits_to_context_descs(
+                    context_hits,
+                    node_registry,
+                    hp.REWRITE_CONTEXT_TOPK,
+                    hp.MAX_DOC_DESC_CHAR_LEN,
+                )
+                cache_key = _rewrite_cache_key("preflat", q, context_descs, iter_idx=None)
+                if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
+                    preflat_rewrite_map[q] = rewrite_map[cache_key]
+                    continue
+                if rewrite_template is None:
+                    raise ValueError('Rewrite enabled but no prompt template is available.')
+                preflat_prompts.append(_format_rewrite_prompt(
+                    rewrite_template,
+                    q,
+                    "",
+                    context_descs,
+                ))
+                preflat_meta.append({
+                    'cache_key': cache_key,
+                    'base_query': q,
+                    'context_descs': context_descs,
+                })
+            if preflat_prompts:
+                preflat_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(preflat_loop)
+                try:
+                    preflat_outputs = preflat_loop.run_until_complete(
+                        llm_api.run_batch(preflat_prompts, max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS)
+                    )
+                finally:
+                    preflat_loop.close()
+                    asyncio.set_event_loop(None)
+                new_rewrite_records = []
+                for meta, out in zip(preflat_meta, preflat_outputs):
+                    rewrite = _clean_qe_text(out)
+                    rewrite_map[meta['cache_key']] = rewrite
+                    preflat_rewrite_map[meta['base_query']] = rewrite
+                    new_rewrite_records.append({
+                        'key': meta['cache_key'],
+                        'rewritten_query': rewrite,
+                        'prompt_name': hp.REWRITE_PROMPT_NAME,
+                        'llm': hp.LLM,
+                        'context_descs': meta.get('context_descs', []),
+                    })
+                if hp.REWRITE_CACHE_PATH and new_rewrite_records:
+                    os.makedirs(os.path.dirname(hp.REWRITE_CACHE_PATH) or '.', exist_ok=True)
+                    with open(hp.REWRITE_CACHE_PATH, 'a', encoding='utf-8') as f:
+                        for rec in new_rewrite_records:
+                            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
 node_by_path = {tuple(node.path): node for node in node_registry}
 for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
@@ -616,7 +688,9 @@ for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
     allowed_prefixes = None
     flat_leaf_ranked = None
     if hp.FLAT_THEN_TREE:
-        if qe_enabled:
+        if hp.PRE_FLAT_REWRITE:
+            expanded_query = preflat_rewrite_map.get(query, "")
+        elif qe_enabled:
             expanded_query = qe_map[query]  # raw rewrite output
         else:
             expanded_query = ""
@@ -628,7 +702,7 @@ for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
             node_registry=node_registry,
             topk=hp.FLAT_TOPK,
         )
-        allowed_prefixes, flat_leaf_ranked = build_gates_and_leaf_candidates(
+        allowed_prefixes, flat_leaf_ranked, gate_scores = build_gates_and_leaf_candidates(
             hits=hits,
             gate_branches_topb=hp.GATE_BRANCHES_TOPB,
         )
@@ -661,11 +735,14 @@ for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
     if flat_leaf_ranked is not None:
         sample.flat_leaf_ranked = flat_leaf_ranked
         sample.flat_gates = allowed_prefixes
+        sample.flat_gate_scores = gate_scores
         sample.flat_query = flat_query
         sample.gold_paths_tuples = [tuple(p) for p in gold_paths]
         sample.flat_retrieved_paths = [h.path for h in hits]
         sample.gate_descs = gate_descs
         sample.flat_context_descs = context_descs
+    if allowed_prefixes and hp.SEED_FROM_FLAT_GATES:
+        sample.seed_beam_from_gate_paths(allowed_prefixes, gate_scores)
     all_eval_samples.append(sample)
 if rewrite_enabled and hp.REWRITE_AT_START:
     start_prompts = []
@@ -769,6 +846,10 @@ async def retrieval_loop_step(iter_idx: int):  # Make the function asynchronous
 
     for sample, sample_slates, sample_response_jsons in tqdm(zip(all_eval_samples, slates, response_jsons), total=len(all_eval_samples), desc='Updating samples'):
       sample.update(sample_slates, sample_response_jsons)
+    if iter_idx == 0:
+      for sample in all_eval_samples:
+        if getattr(sample, 'seeded_gate_paths', None):
+          sample.allowed_prefixes = None
 
     if rewrite_enabled and (hp.REWRITE_EVERY > 0) and ((iter_idx + 1) % hp.REWRITE_EVERY == 0):
       rewrite_prompts = []

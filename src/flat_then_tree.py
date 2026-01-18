@@ -23,7 +23,7 @@ def build_gates_and_leaf_candidates(
     *,
     hits: Sequence[FlatHit],
     gate_branches_topb: int,
-) -> tuple[list[Path], list[tuple[Path, float]]]:
+) -> tuple[list[Path], list[tuple[Path, float]], Dict[Path, float]]:
     """
     Robust policy:
     - Do NOT promote-and-drop leaf hits; keep them as final candidates.
@@ -36,27 +36,42 @@ def build_gates_and_leaf_candidates(
     flat_leaf_ranked = sorted([(h.path, h.score) for h in leaf_hits], key=lambda x: x[1], reverse=True)
 
     gates: List[Path] = []
-    seen: set[Path] = set()
+    gate_scores: Dict[Path, float] = {}
+
+    def add_gate(path: Path, score: float) -> None:
+        nonlocal gates, gate_scores
+        to_remove: List[Path] = []
+        for existing in gates:
+            if is_prefix(existing, path) or is_prefix(path, existing):
+                if score > gate_scores.get(existing, float("-inf")):
+                    to_remove.append(existing)
+                else:
+                    return
+        for existing in to_remove:
+            gates.remove(existing)
+            gate_scores.pop(existing, None)
+        if path not in gate_scores:
+            gates.append(path)
+            gate_scores[path] = score
 
     for h in sorted(branch_hits, key=lambda x: x.score, reverse=True):
-        if h.path in seen:
-            continue
-        gates.append(h.path)
-        seen.add(h.path)
+        add_gate(h.path, h.score)
         if len(gates) >= gate_branches_topb:
-            return gates[:gate_branches_topb], flat_leaf_ranked
+            break
 
-    for h in sorted(leaf_hits, key=lambda x: x.score, reverse=True):
-        for d in range(1, len(h.path)):
-            anc = h.path[:d]
-            if anc in seen:
-                continue
-            gates.append(anc)
-            seen.add(anc)
-            if len(gates) >= gate_branches_topb: # leaf hit들을 score 순으로 보며, 각 leaf의 **모든 ancestor prefix**(depth 1→…→parent)를 gate에 보충(중복 제거
-                return gates[:gate_branches_topb], flat_leaf_ranked
+    if len(gates) < gate_branches_topb:
+        for h in sorted(leaf_hits, key=lambda x: x.score, reverse=True):
+            for d in range(1, len(h.path)):
+                anc = h.path[:d]
+                add_gate(anc, h.score)
+                if len(gates) >= gate_branches_topb:
+                    break
+            if len(gates) >= gate_branches_topb:
+                break
 
-    return gates[:gate_branches_topb], flat_leaf_ranked
+    gates = sorted(gates, key=lambda p: gate_scores.get(p, 0.0), reverse=True)[:gate_branches_topb]
+    gate_scores = {p: gate_scores[p] for p in gates}
+    return gates, flat_leaf_ranked, gate_scores
 
 
 def flat_retrieve_hits(
@@ -115,4 +130,3 @@ def gate_hit(gates: Sequence[Path], gold_paths: Sequence[Path]) -> bool:
             if is_prefix(g, gp):
                 return True
     return False
-

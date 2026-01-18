@@ -256,3 +256,23 @@ python run.py \
 - Rewrite history 저장: `rewrite_history`를 pkl에 포함하도록 `SAVE_LIST` 추가.
 - QE 템플릿 파싱 안정화: JSON braces로 인한 `str.format` 오류에 fallback 추가.
 - 로그/결과 저장 경로 단축: `HyperParams.__str__`에서 `MaxBS` 기준으로 subfolder 분리, `save_exp`는 hp 경로에 맞게 mkdirs 처리.
+
+## 260116) Pre-flat rewrite pipeline + logging + run scripts
+
+- Added pre-flat rewrite stage: initial flat retrieval on original query, rewrite from flat context, then re-run flat retrieval for gating/traversal.
+    - New flags: `--pre_flat_rewrite`, `--pre_flat_rewrite_source {branch,all}`.
+    - When `--pre_flat_rewrite` is set, QE is disabled for that run.
+    - Pre-flat rewrite uses the same rewrite prompt/template as traversal rewrite.
+- Expanded argument help to clarify QE vs rewrite vs pre-flat rewrite usage.
+- Added per-iteration logging of slate node counts by depth (top-k capped by `flat_topk`) in `run.log`.
+- New run scripts under `src/bash/` for experiment variants:
+    - `run_exp1_qe_iter.sh` (QE -> flat -> traversal with iterative rewrite)
+    - `run_exp2_preflat_branch_noiter.sh` (branch-only pre-flat rewrite, no traversal rewrite)
+    - `run_exp2_preflat_all_noiter.sh` (all-node pre-flat rewrite, no traversal rewrite)
+    - `run_exp3_preflat_branch_iter.sh` (branch-only pre-flat rewrite, traversal rewrite enabled)
+
+## 260118) Branch-seeded traversal from flat retrieval gates
+
+- Gate construction now resolves ancestor/descendant conflicts by score: keep the higher-scoring path when one is a prefix of the other.
+- Flat gate scores are carried into traversal and used to seed beam state paths (branch nodes as initial beam states).
+- Traversal uses gate-seeded beams only for iter 0; after the first update, gating is cleared and normal traversal continues.
