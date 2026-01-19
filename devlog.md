@@ -276,3 +276,7 @@ python run.py \
 - Gate construction now resolves ancestor/descendant conflicts by score: keep the higher-scoring path when one is a prefix of the other.
 - Flat gate scores are carried into traversal and used to seed beam state paths (branch nodes as initial beam states).
 - Traversal uses gate-seeded beams only for iter 0; after the first update, gating is cleared and normal traversal continues.
+- Difference vs previous version:
+    - Before: flat retrieval only constrained traversal via `allowed_prefixes` (slates still started at the root).
+    - Now: flat retrieval gates directly initialize the beam to those branch nodes (traversal starts from the retrieved branches).
+    - Toggle: `--seed_from_flat_gates` enables the new behavior; omit it to keep the old behavior.

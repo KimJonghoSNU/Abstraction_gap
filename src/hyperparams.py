@@ -135,7 +135,13 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--gate_branches_topb', type=int, default=10, help='Number of branch gates to keep')
         parser.add_argument('--seed_from_flat_gates', default=False, action='store_true', help='Seed traversal beam from flat retrieval gate paths at iter 0')
         parser.add_argument('--pre_flat_rewrite', default=False, action='store_true', help='Run rewrite after an initial flat retrieval and re-run flat retrieval with that rewrite; replaces QE for that run')
-        parser.add_argument('--pre_flat_rewrite_source', type=str, default='branch', choices=['branch', 'all'], help='Initial rewrite context from flat retrieval: branch=non-leaf nodes only, all=all nodes')
+        parser.add_argument(
+            '--pre_flat_rewrite_source',
+            type=str,
+            default='branch',
+            choices=['branch', 'leaf', 'all'],
+            help='Initial rewrite context from flat retrieval: branch=non-leaf nodes only, leaf=leaf nodes only, all=all nodes',
+        )
         # parser.add_argument('--qe_prompt_path', type=str, default=None, help='Optional prompt file for query expansion (used when QE cache misses)')
         parser.add_argument('--qe_prompt_name', type=str, default=None, help='Optional built-in QE prompt name (used when QE cache misses); QE runs before flat retrieval and expands the original query')
         parser.add_argument('--qe_cache_path', type=str, default=None, help='Optional JSONL cache for query expansion results') 

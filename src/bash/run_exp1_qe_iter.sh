@@ -21,6 +21,7 @@ QE_PROMPT_NAME="pre_flat_rewrite_v1"
 REWRITE_PROMPT_NAME="gate_rewrite_v1"
 QE_CACHE_BASE="${CACHE_BASE_ROOT}/qe_${QE_PROMPT_NAME}"
 REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${REWRITE_PROMPT_NAME}"
+REWRITE_CACHE_TAG="exp1_qe_iter"
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
@@ -39,7 +40,7 @@ COMMON_PARAMS=(
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
     --gate_branches_topb 10
-    --seed_from_flat_gates
+    # --seed_from_flat_gates
 
     # QE before flat retrieval
     --qe_prompt_name "$QE_PROMPT_NAME"
@@ -79,7 +80,7 @@ for idx in "${!RUNS[@]}"; do
 
     NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.diver.npy"
     QE_CACHE_PATH="${QE_CACHE_BASE}/${subset}_${QE_PROMPT_NAME}.jsonl"
-    REWRITE_CACHE_PATH="${REWRITE_CACHE_BASE}/${subset}_${REWRITE_PROMPT_NAME}.jsonl"
+    REWRITE_CACHE_PATH="${REWRITE_CACHE_BASE}/${subset}_${REWRITE_PROMPT_NAME}_${REWRITE_CACHE_TAG}.jsonl"
 
     # Build final args: first common params, then iteration-specific params
     final_args=()

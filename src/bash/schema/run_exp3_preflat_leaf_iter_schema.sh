@@ -2,14 +2,14 @@
 
 # Create log file with timestamp
 mkdir -p ../logs
-LOG_FILE="../logs/run_exp3_preflat_branch_iter_$(date '+%Y_%m_%d').log"
+LOG_FILE="../logs/run_exp3_preflat_leaf_iter_$(date '+%Y_%m_%d').log"
 
 # Function to log with timestamp
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting run_exp3_preflat_branch_iter.sh script"
+log "Starting run_exp3_preflat_leaf_iter.sh script"
 
 # Edit these paths for your setup
 RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
@@ -17,13 +17,13 @@ NODE_EMB_BASE="../trees/BRIGHT"
 
 # Cache base dirs (optional, will be created if missing)
 CACHE_BASE_ROOT="/data4/jongho/Search-o1/data/QA_Datasets/bright/cache"
-REWRITE_PROMPT_NAME="gate_rewrite_v1"
+REWRITE_PROMPT_NAME="gate_rewrite_schema_v1"
 REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${REWRITE_PROMPT_NAME}"
-REWRITE_CACHE_TAG="exp3_preflat_branch_iter"
+REWRITE_CACHE_TAG="exp3_preflat_leaf_iter"
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
-    --suffix exp3_preflat_branch_iter
+    --suffix exp3_preflat_leaf_iter
     --reasoning_in_traversal_prompt -1
     --load_existing
     --num_iters 5
@@ -38,11 +38,11 @@ COMMON_PARAMS=(
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
     --gate_branches_topb 10
-    --seed_from_flat_gates
+    # --seed_from_flat_gates
 
-    # Pre-flat rewrite (branch-only context)
+    # Pre-flat rewrite (leaf-only context)
     --pre_flat_rewrite
-    --pre_flat_rewrite_source branch
+    --pre_flat_rewrite_source leaf
     --rewrite_prompt_name "$REWRITE_PROMPT_NAME"
 
     # Rewrite during traversal

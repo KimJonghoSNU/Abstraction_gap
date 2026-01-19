@@ -17,7 +17,7 @@ NODE_EMB_BASE="../trees/BRIGHT"
 
 # Cache base dirs (optional, will be created if missing)
 CACHE_BASE_ROOT="/data4/jongho/Search-o1/data/QA_Datasets/bright/cache"
-REWRITE_PROMPT_NAME="gate_rewrite_v1"
+REWRITE_PROMPT_NAME="gate_rewrite_schema_v1"
 REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${REWRITE_PROMPT_NAME}"
 REWRITE_CACHE_TAG="exp3_preflat_branch_iter"
 

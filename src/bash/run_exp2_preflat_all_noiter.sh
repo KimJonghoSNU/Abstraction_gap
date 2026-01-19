@@ -19,6 +19,7 @@ NODE_EMB_BASE="../trees/BRIGHT"
 CACHE_BASE_ROOT="/data4/jongho/Search-o1/data/QA_Datasets/bright/cache"
 REWRITE_PROMPT_NAME="gate_rewrite_v1"
 REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${REWRITE_PROMPT_NAME}"
+REWRITE_CACHE_TAG="exp2_preflat_all_noiter"
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
@@ -74,7 +75,7 @@ for idx in "${!RUNS[@]}"; do
     fi
 
     NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.diver.npy"
-    REWRITE_CACHE_PATH="${REWRITE_CACHE_BASE}/${subset}_${REWRITE_PROMPT_NAME}.jsonl"
+    REWRITE_CACHE_PATH="${REWRITE_CACHE_BASE}/${subset}_${REWRITE_PROMPT_NAME}_${REWRITE_CACHE_TAG}.jsonl"
 
     # Build final args: first common params, then iteration-specific params
     final_args=()

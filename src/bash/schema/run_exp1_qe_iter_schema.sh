@@ -2,14 +2,14 @@
 
 # Create log file with timestamp
 mkdir -p ../logs
-LOG_FILE="../logs/run_exp3_preflat_branch_iter_$(date '+%Y_%m_%d').log"
+LOG_FILE="../logs/run_exp1_qe_iter_$(date '+%Y_%m_%d').log"
 
 # Function to log with timestamp
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting run_exp3_preflat_branch_iter.sh script"
+log "Starting run_exp1_qe_iter.sh script"
 
 # Edit these paths for your setup
 RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
@@ -17,13 +17,15 @@ NODE_EMB_BASE="../trees/BRIGHT"
 
 # Cache base dirs (optional, will be created if missing)
 CACHE_BASE_ROOT="/data4/jongho/Search-o1/data/QA_Datasets/bright/cache"
-REWRITE_PROMPT_NAME="gate_rewrite_v1"
+QE_PROMPT_NAME="pre_flat_rewrite_v1"
+REWRITE_PROMPT_NAME="gate_rewrite_schema_v1"
+QE_CACHE_BASE="${CACHE_BASE_ROOT}/qe_${QE_PROMPT_NAME}"
 REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${REWRITE_PROMPT_NAME}"
-REWRITE_CACHE_TAG="exp3_preflat_branch_iter"
+REWRITE_CACHE_TAG="exp1_qe_iter"
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
-    --suffix exp3_preflat_branch_iter
+    --suffix exp1_qe_iter
     --reasoning_in_traversal_prompt -1
     --load_existing
     --num_iters 5
@@ -38,14 +40,13 @@ COMMON_PARAMS=(
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
     --gate_branches_topb 10
-    --seed_from_flat_gates
+    # --seed_from_flat_gates
 
-    # Pre-flat rewrite (branch-only context)
-    --pre_flat_rewrite
-    --pre_flat_rewrite_source branch
-    --rewrite_prompt_name "$REWRITE_PROMPT_NAME"
+    # QE before flat retrieval
+    --qe_prompt_name "$QE_PROMPT_NAME"
 
     # Rewrite during traversal
+    --rewrite_prompt_name "$REWRITE_PROMPT_NAME"
     --rewrite_every 1
     --rewrite_context_topk 5
     --rewrite_context_source fused
@@ -78,6 +79,7 @@ for idx in "${!RUNS[@]}"; do
     fi
 
     NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.diver.npy"
+    QE_CACHE_PATH="${QE_CACHE_BASE}/${subset}_${QE_PROMPT_NAME}.jsonl"
     REWRITE_CACHE_PATH="${REWRITE_CACHE_BASE}/${subset}_${REWRITE_PROMPT_NAME}_${REWRITE_CACHE_TAG}.jsonl"
 
     # Build final args: first common params, then iteration-specific params
@@ -96,6 +98,7 @@ for idx in "${!RUNS[@]}"; do
 
     # Add node embeddings path for this subset
     final_args+=("--node_emb_path" "$NODE_EMB_PATH")
+    final_args+=("--qe_cache_path" "$QE_CACHE_PATH")
     final_args+=("--rewrite_cache_path" "$REWRITE_CACHE_PATH")
 
     # Append iteration-specific params

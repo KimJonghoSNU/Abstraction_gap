@@ -14,9 +14,10 @@
 SCRIPTS=(
     "bash/run_exp1_qe_iter.sh"
     "bash/run_exp2_preflat_branch_noiter.sh"
+    "bash/run_exp2_preflat_leaf_noiter.sh"
     "bash/run_exp2_preflat_all_noiter.sh"
     "bash/run_exp3_preflat_branch_iter.sh"
-    "bash/run_leaf_rank.sh"
+    # "bash/run_leaf_rank.sh"
 )
 
 for script in "${SCRIPTS[@]}"; do
