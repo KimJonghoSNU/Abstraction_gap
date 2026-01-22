@@ -239,6 +239,26 @@ python run.py \
 - “Flat→Gate는 올바른 semantic region으로의 **초기 진입**을 교정하고, interaction rewrite는 그 region 내부에서 필요한 abstraction/bridge를 **점진적으로 정제**한다.”
 - “따라서 성능 향상이 C1에서만 나타나면 gap의 주원인은 locality이고, C2–C4에서 추가 향상이 나타나면 gap의 주원인은 ‘동적 브릿지 생성(표현 업데이트)’까지 포함한다.”
 
+---
+
+## 260122) Round 3 (Hybrid Retrieval + Action Rewrite) 구현
+
+- 신규 실행 파일: `src/run_round3.py`
+    - traversal 없이 Round3 파이프라인만 수행
+    - Query_t 규칙: EXPLOIT → concat, EXPLORE → replace
+    - rewrite_every=0 → rewrite 비활성화
+    - leaf depth > 1 전제 주석 추가 (prefix 누락 가능성 경고)
+- 프롬프트 업데이트: `round3_action_v1` in `src/rewrite_prompts.py`
+    - stepback_json 스타일 (Plan + Possible_Answer_Docs)
+    - abstract evidence 강조, lexical overlap 불필요
+    - exploit은 evidence key term을 anchor로 유지하면서 추상성 유지
+    - explore는 이전 rewrite를 negative constraint로 취급
+- 하이퍼파라미터 추가: `--round3_*` in `src/hyperparams.py`
+    - anchor/local/global topk, RRF k, rewrite context 모드
+- Abalation 스크립트: `src/bash/run_round3_ablation.sh`
+    - leaf-only vs leaf+branch context 비교
+- 캐시: rewrite cache에 action + rewritten_query 저장
+
 ### 구현 전 체크리스트(실험이 깔끔해지기 위한 최소 요구)
 - rewrite cache key 정의: `(original_query, subset, tree_version, path_signature, iter_idx, beam_idx)` 중 필요한 최소만
 - rewrite 예산/트리거를 명시적으로 고정(질의당 최대 호출 수)

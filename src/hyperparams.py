@@ -167,6 +167,17 @@ class HyperParams(argparse.Namespace):
             ),
         )
         parser.add_argument('--rewrite_at_start', default=False, action='store_true', help='Run rewrite once before the first traversal iteration')
+
+        # Round 3 (run_round3.py)
+        parser.add_argument('--round3_anchor_topk', type=int, default=None, help='Top-K for anchor flat retrieval (defaults to flat_topk)')
+        parser.add_argument('--round3_local_topk', type=int, default=None, help='Top-K for local (B_active descendants) retrieval (defaults to flat_topk)')
+        parser.add_argument('--round3_global_topk', type=int, default=10, help='Top-K for global leaf retrieval')
+        parser.add_argument('--round3_rrf_k', type=int, default=60, help='RRF k for fusing local/global ranked lists')
+        parser.add_argument('--round3_rewrite_context', type=str, default='leaf', choices=['leaf', 'leaf_branch'],
+                            help='Rewrite context evidence: leaf=leaf-only; leaf_branch=leaf evidence + branch context')
+        parser.add_argument('--round3_rewrite_once', default=False, action='store_true', help='Rewrite only at iter 0 in round3')
+        parser.add_argument('--round3_explore_mode', type=str, default='replace', choices=['replace', 'original'],
+                            help='Round3 explore query: replace=use rewrite only, original=ignore rewrite and use original query')
         
         # Parse arguments
         parsed_args = parser.parse_args(args.split() if args else None)

@@ -198,6 +198,8 @@ Rewriter는 다음을 출력한다.
 Rewritten Query Q_rewritten.
 Action a는 explore 또는 exploit 중 하나다.
 
+TODO: per-level action (abstraction category별 action)도 실험 필요. 지금은 global action만.
+
 exploit은 현재 B_active가 맞는 지역이라고 보고 구체화를 시도한다.
 explore는 B_active가 불완전하거나 틀렸을 수 있다고 보고 탈출을 시도한다.
 
@@ -256,6 +258,36 @@ Action이 explore이면 local 신뢰가 낮다고 보고 global 결과가 다음
 TODO explore에서 B_active 업데이트 규칙을 정량화한다.
 TODO drift signal.
 TODO conflict signal.
+
+## Round 3 Implementation Notes (260122)
+
+- 구현 파일: `src/run_round3.py`
+    - traversal 없이 round3 전용 파이프라인만 수행
+    - Query_t = (exploit) original + rewrite, (explore) rewrite-only
+    - rewrite_every=0이면 **rewrite 비활성화**
+    - leaf depth는 현재 > 1 전제 (prefix 누락 가능성 주석 추가)
+- Prompt: `round3_action_v1` in `src/rewrite_prompts.py`
+    - stepback_json 스타일 (Plan + Possible_Answer_Docs)
+    - abstract evidence 강조, lexical overlap 불필요
+    - exploit은 evidence key term을 anchor로 유지하되 abstractive 유지
+    - explore는 이전 rewrite를 negative constraint로 취급
+- Rewrite context ablation:
+    - `--round3_rewrite_context leaf` (leaf-only)
+    - `--round3_rewrite_context leaf_branch` (leaf + branch, prompt에서 label 분리)
+    - branch_descs가 비면 prompt에서 Branch Context 블록 제거
+- Retrieval:
+    - Anchor flat retrieval로 L_init / B_hit 분리
+    - ActiveBranches = leaf prefixes + branch hit prefixes
+    - Local pool = B_active descendants (leaf-only), global pool = all leaf
+    - Local + Global RRF fusion only (tree traversal 없음)
+- Cache:
+    - rewrite cache에 action + rewritten_query 저장
+- Scripts:
+    - `src/bash/run_round3_ablation.sh` (leaf vs leaf_branch ablation)
+
+TODO
+- Per-level action (category별 EXPLORE/EXPLOIT) 적용
+- density 기반 weighted fusion
 
 
 ## Current best setting
