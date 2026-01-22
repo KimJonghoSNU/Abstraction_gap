@@ -19,11 +19,11 @@ NODE_EMB_BASE="../trees/BRIGHT"
 CACHE_BASE_ROOT="/data4/jongho/Search-o1/data/QA_Datasets/bright/cache"
 REWRITE_PROMPT_NAME="gate_rewrite_schema_v1"
 REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${REWRITE_PROMPT_NAME}"
-REWRITE_CACHE_TAG="exp2_preflat_all_noiter"
+REWRITE_CACHE_TAG="exp2_preflat_all_noiter_schema"
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
-    --suffix exp2_preflat_all_noiter
+    --suffix exp2_preflat_all_noiter_schema_d1
     --reasoning_in_traversal_prompt -1
     --load_existing
     --num_iters 5
@@ -38,7 +38,6 @@ COMMON_PARAMS=(
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
     --gate_branches_topb 10
-    --seed_from_flat_gates
 
     # Pre-flat rewrite (all-node context)
     --pre_flat_rewrite

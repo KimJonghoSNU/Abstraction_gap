@@ -16,7 +16,10 @@ from hyperparams import HyperParams
 from tree_objects import SemanticNode, InferSample
 from llm_apis import GenAIAPI, VllmAPI
 from prompts import get_traversal_prompt_response_constraint, get_reranking_prompt
-from rewrite_prompts import REWRITE_PROMPT_TEMPLATES, SCHEMA_PROMPT_TEMPLATE
+from rewrite_prompts import REWRITE_PROMPT_TEMPLATES
+from qe_prompts import QE_PROMPT_TEMPLATES
+from rewrite_pipeline import SchemaGenerator
+from cache_utils import _rewrite_cache_key, load_rewrite_cache, append_jsonl
 from flat_then_tree import (
     ancestor_hit,
     build_gates_and_leaf_candidates,
@@ -43,115 +46,6 @@ from utils import (
 np.random.seed(42)
 #endregion
 
-QE_PROMPT_TEMPLATES = {
-    # Bridge-focused: explicitly try to jump abstraction levels without assuming a fixed taxonomy.
-    "bridge_v1": (
-        "You are helping retrieval for a reasoning-intensive question where the answer may live at a different abstraction level.\n"
-        "Produce a expanded retrieval query that includes:\n"
-        "- the original query intent,\n"
-        "- possible underlying mechanisms / theories / examples / canonical terms,\n"
-        "- alternative formulations and related concepts that could bridge to the correct topic cluster.\n"
-        "Output ONLY the expanded query text.\n\n"
-        "User query:\n{query}\n"
-    ),
-    # Adapted from previous/shortcut_reranker/utils/agent_prompts.py (executor-style).
-    "agent_executor_v1": (
-        "Your goal is to generate the next set of 'Possible Answer Documents' (Search Queries).\n"
-        "No prior retrieved docs are given, so propose diverse hypotheses that could bridge abstraction gaps.\n\n"
-        "**Thinking Process (Execute inside 'Plan'):**\n"
-        "1. Identify User Intent & Answer Type.\n"
-        "2. Propose multiple plausible theories/mechanisms.\n"
-        "3. Propose concrete entities/phenomena.\n"
-        "4. Propose examples/analogies.\n"
-        "5. Ensure each item is directly useful for retrieval.\n\n"
-        "**Output Format:**\n"
-        "Output a single JSON object. The values will be concatenated to form the next query.\n"
-        "```json\n"
-        "{\n"
-        "  \"Plan\": \"...\",\n"
-        "  \"Possible_Answer_Docs\": {\n"
-        "    \"Theory\": \"...text...\",\n"
-        "    \"Entity\": \"...text...\",\n"
-        "    \"Example\": \"...text...\",\n"
-        "    \"Other\": \"...text...\"\n"
-        "  }\n"
-        "}\n"
-        "```\n\n"
-        "Original Query: {query}\n"
-    ),
-    "pre_flat_rewrite_v1": (
-        "You are rewriting a search query for reasoning-intensive retrieval.\n\n"
-        "Key idea:\n"
-        "- Assume you already have the correct answer to the user query.\n"
-        "- The documents we want are the ones that would be used as core evidence or justification for that answer.\n"
-        "- These evidence documents are often more abstract than the surface query.\n\n"
-        "Task:\n"
-        "- First, write a 1-2 sentence Plan that states the user's core intent and what kind of evidence would justify the answer.\n"
-        "- Produce 2-5 distinct Possible_Answer_Docs that could serve as evidence for the assumed correct answer.\n"
-        "- Avoid near-duplicates; keep each item short and retrieval-friendly.\n"
-        "- Evidence forms may include (not exhaustive): theory/mechanism, entity/fact, analogy/example, method/metric, canonical reference.\n\n"
-        "Output JSON only:\n"
-        "{\n"
-        "  \"Plan\": \"short reasoning\",\n"
-        "  \"Possible_Answer_Docs\": [\n"
-        "    \"...\",\n"
-        "    \"...\",\n"
-        "    \"...\"\n"
-        "  ]\n"
-        "}\n\n"
-        "User Query:\n{query}\n"
-    ),
-    "stepback_json_pre": (
-        "Your goal is to generate answer documents for the query without any retrieved passages.\n"
-        "Each generated document must be strictly relevant: it should either contain the exact answer or "
-        "provide abstractive-level theory, evidence, or background that is necessary for that answer.\n\n"
-        "Output Format:\n"
-        "You must output a single JSON object with the following keys:\n"
-        "- \"Plan\": A detailed string where you analyze availability of information and plan your selection. Follow the planning steps below.\n"
-        "- \"Possible_Answer_Docs\": A JSON object with keys as document types (\"Theory\", \"Entity\", \"Example\", \"Other\") and values as strings representing distinct answer documents.\n\n"
-        "Planning Steps (for the \"Plan\" field):\n"
-        "1. Precisely identify what information the user is seeking "
-        "(e.g., why / how / what / what is this called / which part) and what type of "
-        "answer would satisfy them (e.g., concept name, theory, explanation, concrete "
-        "entity, worked example).\n"
-        "2. If the query is explicitly or implicitly asking 'what is this called?', "
-        "generate diverse hypotheses for the name of the phenomenon, object, or concept.\n"
-        "3. Abstraction: infer which academic terms, scientific theories, mathematical "
-        "models, canonical methods, or standard resources lie behind this question and "
-        "would be cited in a strictly correct answer.\n"
-        "4. Consider alternative ways the answer might be supported: a direct definition, "
-        "background theory, canonical examples, or reference websites.\n"
-        "5. For causal or explanatory questions (why/how), identify multiple theoretical "
-        "frameworks that offer different explanations, including mainstream, alternative, "
-        "and controversial perspectives if mentioned in the query.\n"
-        "6. Anticipate common wrong directions (topic, answer type, or framing) suggested by the query "
-        "and treat them as negative constraints.\n"
-        "Ensure that every generated document contributes directly and strictly to such an answer "
-        "(no loosely related or merely interesting content).\n\n"
-        "Final Answer Requirements (for the \"Answer documents\" field):\n"
-        "Include 3-5 distinct answer-document entries:\n"
-        "- 1: Concept/Theory-focused (academic terms, principles, models).\n"
-        "- 2: Entity/Fact-focused (specific names, objects, or concrete facts).\n"
-        "- 3: Broad Context/Evidence-focused (surveys, experiments, or background "
-        "that support the answer).\n"
-        "- Document 4–5 (optional): Any additional strictly relevant documents that provide "
-        "alternative but correct perspectives or examples.\n\n"
-        "Query: {query}\n\n"
-        "Provide the JSON output.\n"
-        "Example Output Format:\n"
-        "```json\n"
-        "{\n"
-        "  \"Plan\": \"Detailed plan applying Step 6 logic...\",\n"
-        "  \"Possible_Answer_Docs\": {\n"
-        "    \"Theory\": \"...text...\",\n"
-        "    \"Entity\": \"...text...\",\n"
-        "    \"Example\": \"...text...\",\n"
-        "    \"Other\": \"...text...\"\n"
-        "  }\n"
-        "}\n"
-        "```\n"
-    ),
-}
 
 def _format_qe_prompt(template: str, query: str) -> str:
     if "{query}" in template:
@@ -213,60 +107,6 @@ def _parse_rewrite_output(text: str) -> tuple[str, object | None]:
         return cleaned, obj.get("Possible_Answer_Docs")
     return cleaned, None
 
-def _format_schema_prompt(template: str, original_query: str, branch_descs: List[str]) -> str:
-    branch_blob = "\n".join([x for x in branch_descs if x])
-    try:
-        return template.format(
-            original_query=(original_query or ""),
-            branch_descs=branch_blob,
-        )
-    except KeyError:
-        return (
-            template
-            .replace("{original_query}", original_query or "")
-            .replace("{branch_descs}", branch_blob)
-        )
-
-def _parse_schema_output(text: str) -> List[str]:
-    raw = text.split("</think>\n")[-1].strip()
-    if "```" in raw:
-        try:
-            parts = raw.split("```")
-            fenced = [parts[i] for i in range(1, len(parts), 2)]
-            if fenced:
-                raw = fenced[-1].strip()
-        except Exception:
-            pass
-    obj = None
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        try:
-            obj = repair_json(raw, return_objects=True)
-        except Exception:
-            obj = None
-    if not isinstance(obj, dict):
-        return []
-    labels = obj.get("schema_labels")
-    if not isinstance(labels, list):
-        return []
-    cleaned: List[str] = []
-    seen: set[str] = set()
-    for label in labels:
-        if not isinstance(label, str):
-            continue
-        text = label.strip()
-        if not text:
-            continue
-        norm = _normalize_schema_label(text)
-        if norm in seen:
-            continue
-        seen.add(norm)
-        cleaned.append(text)
-        if len(cleaned) >= 5:
-            break
-    return cleaned
-
 def _format_rewrite_prompt(
     template: str,
     original_query: str,
@@ -276,14 +116,22 @@ def _format_rewrite_prompt(
 ) -> str:
     context_blob = "\n".join([x for x in context_descs if x])
     schema_blob = ""
+    schema_kv_template = ""
     if schema_labels:
-        schema_blob = "\n".join([f"- {label}" for label in schema_labels if label])
+        schema_items = [label for label in schema_labels if label]
+        schema_blob = "\n".join([f"- {label}" for label in schema_items])
+        schema_lines = []
+        for idx, label in enumerate(schema_items):
+            comma = "," if idx < len(schema_items) - 1 else ""
+            schema_lines.append(f"    \"{label}\": \"...\"{comma}")
+        schema_kv_template = "\n".join(schema_lines)
     try:
         return template.format(
             gate_descs=context_blob,
             original_query=(original_query or ""),
             previous_rewrite=(previous_rewrite or ""),
             schema_labels=schema_blob,
+            schema_kv_template=schema_kv_template,
         )
     except KeyError:
         # Fallback for templates containing JSON braces without escaping.
@@ -293,21 +141,8 @@ def _format_rewrite_prompt(
             .replace("{original_query}", original_query or "")
             .replace("{previous_rewrite}", previous_rewrite or "")
             .replace("{schema_labels}", schema_blob)
+            .replace("{schema_kv_template}", schema_kv_template)
         )
-
-def _rewrite_cache_key(
-    prefix: str,
-    query: str,
-    context_descs: List[str],
-    iter_idx: int | None = None,
-    schema_labels: List[str] | None = None,
-) -> str:
-    context_blob = "\n".join([x for x in context_descs if x]).strip()
-    schema_blob = "\n".join([x for x in schema_labels if x]).strip() if schema_labels else ""
-    combined_blob = "\n".join([b for b in [context_blob, schema_blob] if b])
-    context_sig = hashlib.md5(combined_blob.encode('utf-8')).hexdigest() if combined_blob else "none"
-    iter_tag = f"||iter={iter_idx}" if iter_idx is not None else ""
-    return f"{prefix}||{query}||{context_sig}{iter_tag}"
 
 def _apply_rewrite(mode: str, base_query: str, rewrite: str) -> str:
     rewrite = (rewrite or "").strip()
@@ -361,84 +196,6 @@ def _hits_to_context_descs(hits: List[object], node_registry: List[object], topk
             return descs
     return descs
 
-def _normalize_schema_label(label: str) -> str:
-    return " ".join((label or "").strip().lower().split())
-
-def _branch_descs_from_hits(hits: List[object], node_registry: List[object]) -> List[str]:
-    descs: List[str] = []
-    seen: set[int] = set()
-    for h in hits:
-        if h.is_leaf:
-            continue
-        ridx = int(h.registry_idx)
-        if ridx in seen:
-            continue
-        seen.add(ridx)
-        desc = node_registry[ridx].desc
-        if desc:
-            descs.append(desc)
-    return descs
-
-def _build_schema_labels_from_hits(
-    hits: List[object],
-    node_registry: List[object],
-    min_k: int,
-    max_k: int,
-    max_desc_len: int | None,
-) -> List[str]:
-    labels: List[str] = []
-    seen: set[str] = set()
-    branch_hits = [h for h in hits if not h.is_leaf]
-    for h in sorted(branch_hits, key=lambda x: x.score, reverse=True):
-        parent = node_registry[int(h.registry_idx)]
-        parent_desc = (parent.desc or "").strip()
-        for child in parent.child:
-            label = (child.desc or "").strip()
-            if not label:
-                continue
-            if parent_desc and parent_desc not in label:
-                label = f"{parent_desc}: {label}"
-            if max_desc_len:
-                label = label[:max_desc_len]
-            norm = _normalize_schema_label(label)
-            if not norm or norm in seen:
-                continue
-            seen.add(norm)
-            labels.append(label)
-            if len(labels) >= max_k:
-                return labels
-    if len(labels) < min_k:
-        for h in sorted(branch_hits, key=lambda x: x.score, reverse=True):
-            parent = node_registry[int(h.registry_idx)]
-            label = (parent.desc or "").strip()
-            if not label:
-                continue
-            if max_desc_len:
-                label = label[:max_desc_len]
-            norm = _normalize_schema_label(label)
-            if not norm or norm in seen:
-                continue
-            seen.add(norm)
-            labels.append(label)
-            if len(labels) >= max_k:
-                return labels
-    if len(labels) < min_k:
-        leaf_hits = [h for h in hits if h.is_leaf]
-        for h in sorted(leaf_hits, key=lambda x: x.score, reverse=True):
-            node = node_registry[int(h.registry_idx)]
-            label = (node.desc or "").strip()
-            if not label:
-                continue
-            if max_desc_len:
-                label = label[:max_desc_len]
-            norm = _normalize_schema_label(label)
-            if not norm or norm in seen:
-                continue
-            seen.add(norm)
-            labels.append(label)
-            if len(labels) >= max_k:
-                return labels
-    return labels[:max_k]
 def _ranked_paths_to_context_descs(
     ranked_paths: List[tuple[tuple[int, ...], float]],
     node_by_path: dict[tuple[int, ...], object],
@@ -455,6 +212,9 @@ def _ranked_paths_to_context_descs(
             desc = desc[:max_desc_len]
         descs.append(desc)
     return descs
+
+def _normalize_schema_label(label: str) -> str:
+    return " ".join((label or "").strip().lower().split())
 
 def _get_rewrite_context(
     sample,
@@ -627,7 +387,7 @@ llm_api_kwargs = {
     'response_mime_type': 'application/json',
     'response_schema': get_traversal_prompt_response_constraint(bool(hp.REASONING_IN_TRAVERSAL_PROMPT)),
     'staggering_delay': hp.LLM_API_STAGGERING_DELAY,
-    # 'temperature': 0.8,
+    'temperature': 0.7,
     'thinking_config': types.ThinkingConfig(thinking_budget=hp.REASONING_IN_TRAVERSAL_PROMPT),
 }
 
@@ -640,14 +400,19 @@ rewrite_enabled = False
 rewrite_map = {}
 schema_cache_map: dict[str, List[str]] = {}
 rewrite_template = None
+qe_enabled = False
+preflat_rewrite_map = {}
 
-if hp.LOAD_EXISTING and os.path.exists(f'{RESULTS_DIR}/all_eval_sample_dicts.pkl'):
-    all_eval_samples, all_eval_metric_dfs = load_exp(RESULTS_DIR, hp, semantic_root_node, node_registry, logger)
-    logger.info(f'Loaded existing experiment with {len(all_eval_samples)} eval samples and {len(all_eval_metric_dfs)} eval metric dfs')
-    if len(all_eval_samples) > 0:
-        eval_metric_df = pd.DataFrame([sample.compute_eval_metrics(k=10) for sample in all_eval_samples])
-        logger.info('; '.join([f'{k}: {eval_metric_df[k].mean():.2f}' for k in eval_metric_df.columns]))
-else: 
+loaded_existing = False
+# if hp.LOAD_EXISTING and os.path.exists(f'{RESULTS_DIR}/all_eval_sample_dicts.pkl'):
+#     all_eval_samples, all_eval_metric_dfs = load_exp(RESULTS_DIR, hp, semantic_root_node, node_registry, logger)
+#     logger.info(f'Loaded existing experiment with {len(all_eval_samples)} eval samples and {len(all_eval_metric_dfs)} eval metric dfs')
+#     if len(all_eval_samples) > 0:
+#         eval_metric_df = pd.DataFrame([sample.compute_eval_metrics(k=10) for sample in all_eval_samples])
+#         logger.info('; '.join([f'{k}: {eval_metric_df[k].mean():.2f}' for k in eval_metric_df.columns]))
+#     loaded_existing = True
+# else: 
+if True:
     all_eval_samples, all_eval_metric_dfs = [], []
     # Optional: load precomputed node embeddings for flat retrieval -> gated traversal
     node_embs = None
@@ -668,6 +433,11 @@ else:
         if node_embs.shape[0] != len(node_registry):
             raise ValueError(f'node_embs rows ({node_embs.shape[0]}) must match node_registry size ({len(node_registry)})')
         retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
+        schema_depth1_indices = [
+            idx for idx, node in enumerate(node_registry)
+            if (len(node.path) == 1 and (not node.is_leaf))
+        ]
+        schema_depth1_embs = node_embs[schema_depth1_indices] if schema_depth1_indices else None
 
         qe_enabled = bool(hp.QE_PROMPT_NAME or hp.QE_CACHE_PATH)
         if hp.PRE_FLAT_REWRITE and qe_enabled:
@@ -688,20 +458,8 @@ else:
                     rewrite_template = f.read()
             if rewrite_template is None and not hp.REWRITE_CACHE_PATH:
                 raise ValueError('--rewrite_prompt_name or --rewrite_prompt_path is required when rewrite is enabled')
-            if hp.REWRITE_CACHE_PATH and os.path.exists(hp.REWRITE_CACHE_PATH) and (not hp.REWRITE_FORCE_REFRESH):
-                with open(hp.REWRITE_CACHE_PATH, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        rec = json.loads(line)
-                        if 'key' in rec and 'rewritten_query' in rec:
-                            rewrite_map[str(rec['key'])] = str(rec['rewritten_query'])
-                        if 'key' in rec and 'schema_labels' in rec:
-                            if str(rec['key']).startswith("schema||"):
-                                labels = rec.get('schema_labels')
-                                if isinstance(labels, list):
-                                    schema_cache_map[str(rec['key'])] = [str(x) for x in labels if str(x).strip()]
+            if hp.REWRITE_CACHE_PATH:
+                rewrite_map, schema_cache_map = load_rewrite_cache(hp.REWRITE_CACHE_PATH, hp.REWRITE_FORCE_REFRESH)
         if qe_enabled:
             logger.info(f'Starting precomputation of query expansions for flat->tree retrieval {hp.QE_CACHE_PATH} {hp.QE_PROMPT_NAME}')
             if hp.QE_CACHE_PATH and os.path.exists(hp.QE_CACHE_PATH) and (not hp.QE_FORCE_REFRESH):
@@ -754,65 +512,21 @@ else:
                             }, ensure_ascii=False) + '\n')
         schema_map: dict[str, List[str]] = {}
         if rewrite_enabled:
-            logger.info('Starting schema generation (LLM) from flat-retrieved branch descriptions.')
             eval_queries = [examples_df.iloc[i]['query'][:hp.MAX_QUERY_CHAR_LEN] for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES))]
-            schema_prompts = []
-            schema_meta = []
-            for q in eval_queries:
-                hits = flat_retrieve_hits(
-                    retriever=retriever,
-                    query=q,
-                    node_embs=node_embs,
-                    node_registry=node_registry,
-                    topk=hp.FLAT_TOPK,
-                )
-                # Schema generation is fixed to branch-only descriptions (not leaf).
-                branch_descs = _branch_descs_from_hits(hits, node_registry)[:10]
-                cache_key = _rewrite_cache_key(
-                    "schema",
-                    q,
-                    branch_descs,
-                    iter_idx=None,
-                )
-                if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in schema_cache_map):
-                    schema_map[q] = schema_cache_map[cache_key]
-                    continue
-                if not branch_descs:
-                    schema_map[q] = []
-                    continue
-                schema_prompts.append(_format_schema_prompt(SCHEMA_PROMPT_TEMPLATE, q, branch_descs))
-                schema_meta.append({
-                    'cache_key': cache_key,
-                    'base_query': q,
-                    'branch_descs': branch_descs,
-                })
-            if schema_prompts:
-                schema_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(schema_loop)
-                try:
-                    schema_outputs = schema_loop.run_until_complete(
-                        llm_api.run_batch(schema_prompts, max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS)
-                    )
-                finally:
-                    schema_loop.close()
-                    asyncio.set_event_loop(None)
-                new_schema_records = []
-                for meta, out in zip(schema_meta, schema_outputs):
-                    labels = _parse_schema_output(out)
-                    schema_map[meta['base_query']] = labels
-                    schema_cache_map[meta['cache_key']] = labels
-                    new_schema_records.append({
-                        'key': meta['cache_key'],
-                        'schema_labels': labels,
-                        'prompt_name': 'schema_branch_v1',
-                        'llm': hp.LLM,
-                        'branch_descs': meta.get('branch_descs', []),
-                    })
-                if hp.REWRITE_CACHE_PATH and new_schema_records:
-                    os.makedirs(os.path.dirname(hp.REWRITE_CACHE_PATH) or '.', exist_ok=True)
-                    with open(hp.REWRITE_CACHE_PATH, 'a', encoding='utf-8') as f:
-                        for rec in new_schema_records:
-                            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            schema_generator = SchemaGenerator(
+                retriever=retriever,
+                node_registry=node_registry,
+                node_embs=node_embs,
+                llm_api=llm_api,
+                cache_path=hp.REWRITE_CACHE_PATH,
+                schema_cache_map=schema_cache_map,
+                max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS,
+                topk=10,
+                depth=1,
+                force_refresh=hp.REWRITE_FORCE_REFRESH,
+                logger=logger,
+            )
+            schema_map = schema_generator.build_schema_map(eval_queries)
         preflat_rewrite_map = {}
         preflat_cache_hits: dict[str, bool] = {}
         if hp.PRE_FLAT_REWRITE:
@@ -894,196 +608,183 @@ else:
                         'possible_answer_docs': possible_docs,
                     })
                 if hp.REWRITE_CACHE_PATH and new_rewrite_records:
-                    os.makedirs(os.path.dirname(hp.REWRITE_CACHE_PATH) or '.', exist_ok=True)
-                    with open(hp.REWRITE_CACHE_PATH, 'a', encoding='utf-8') as f:
-                        for rec in new_rewrite_records:
-                            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+                    append_jsonl(hp.REWRITE_CACHE_PATH, new_rewrite_records)
 
-node_by_path = {tuple(node.path): node for node in node_registry}
-for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
-    gold_paths = [doc_id_to_path[doc_id] for doc_id in examples_df.iloc[i]['gold_ids'] if doc_id in doc_id_to_path]
-    if len(gold_paths) < len(examples_df.iloc[i]['gold_ids']):
-        logger.warning(f"Some gold IDs for example {i} not found in document paths.")
+if not loaded_existing:
+    node_by_path = {tuple(node.path): node for node in node_registry}
+    for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
+        gold_paths = [doc_id_to_path[doc_id] for doc_id in examples_df.iloc[i]['gold_ids'] if doc_id in doc_id_to_path]
+        if len(gold_paths) < len(examples_df.iloc[i]['gold_ids']):
+            logger.warning(f"Some gold IDs for example {i} not found in document paths.")
 
-    query = examples_df.iloc[i]['query'][:hp.MAX_QUERY_CHAR_LEN]
-    allowed_prefixes = None
-    flat_leaf_ranked = None
-    schema_labels: List[str] = []
-    if hp.FLAT_THEN_TREE:
-        if hp.PRE_FLAT_REWRITE:
-            expanded_query = preflat_rewrite_map.get(query, "")
-        elif qe_enabled:
-            expanded_query = qe_map[query]  # raw rewrite output
-        else:
-            expanded_query = ""
-        flat_query = _compose_query(query, expanded_query)
-        hits = flat_retrieve_hits(
-            retriever=retriever,
-            query=flat_query,
-            node_embs=node_embs,
-            node_registry=node_registry,
-            topk=hp.FLAT_TOPK,
-        )
-        if rewrite_enabled:
-            schema_labels = schema_map.get(query, [])
-        else:
-            schema_labels = []
-        if not schema_labels:
-            schema_labels = _build_schema_labels_from_hits(
+        query = examples_df.iloc[i]['query'][:hp.MAX_QUERY_CHAR_LEN]
+        allowed_prefixes = None
+        flat_leaf_ranked = None
+        schema_labels: List[str] = []
+        if hp.FLAT_THEN_TREE:
+            if hp.PRE_FLAT_REWRITE:
+                expanded_query = preflat_rewrite_map.get(query, "")
+            elif qe_enabled:
+                expanded_query = qe_map[query]  # raw rewrite output
+            else:
+                expanded_query = ""
+            flat_query = _compose_query(query, expanded_query)
+            hits = flat_retrieve_hits(
+                retriever=retriever,
+                query=flat_query,
+                node_embs=node_embs,
+                node_registry=node_registry,
+                topk=hp.FLAT_TOPK,
+            )
+            if rewrite_enabled:
+                schema_labels = schema_map.get(query, [])
+            else:
+                schema_labels = []
+            allowed_prefixes, flat_leaf_ranked, gate_scores = build_gates_and_leaf_candidates(
+                hits=hits,
+                gate_branches_topb=hp.GATE_BRANCHES_TOPB,
+            )
+            gate_descs = []
+            if allowed_prefixes:
+                for gate in allowed_prefixes:
+                    node = node_by_path.get(tuple(gate))
+                    if node and node.desc:
+                        gate_descs.append(node.desc)
+            context_descs = _hits_to_context_descs(
                 hits,
                 node_registry,
-                min_k=3,
-                max_k=5,
-                max_desc_len=hp.MAX_DOC_DESC_CHAR_LEN,
+                hp.REWRITE_CONTEXT_TOPK,
+                hp.MAX_DOC_DESC_CHAR_LEN,
             )
-        allowed_prefixes, flat_leaf_ranked, gate_scores = build_gates_and_leaf_candidates(
-            hits=hits,
-            gate_branches_topb=hp.GATE_BRANCHES_TOPB,
-        )
-        gate_descs = []
-        if allowed_prefixes:
-            for gate in allowed_prefixes:
-                node = node_by_path.get(tuple(gate))
-                if node and node.desc:
-                    gate_descs.append(node.desc)
-        context_descs = _hits_to_context_descs(
-            hits,
-            node_registry,
-            hp.REWRITE_CONTEXT_TOPK,
-            hp.MAX_DOC_DESC_CHAR_LEN,
-        )
-        query = flat_query
+            query = flat_query
 
-    sample = InferSample(
-        semantic_root_node,
-        node_registry,
-        hp=hp,
-        logger=logger,
-        query=query,
-        gold_paths=gold_paths,
-        excluded_ids_set=set(examples_df.iloc[i]['excluded_ids']),
-        allowed_prefixes=allowed_prefixes,
-    )
-    sample.original_query = examples_df.iloc[i]['query']
-    sample.last_rewrite_raw = expanded_query if hp.FLAT_THEN_TREE else ""
-    sample.schema_labels = schema_labels if hp.FLAT_THEN_TREE else []
-    if hp.PRE_FLAT_REWRITE:
-        if not hasattr(sample, 'rewrite_history'):
-            sample.rewrite_history = []
-        sample.rewrite_history.append({
-            'iter': None,
-            'phase': 'preflat',
-            'cache_hit': preflat_cache_hits.get(sample.original_query, False),
-            'rewrite': expanded_query,
-            'schema_labels': schema_labels,
-        })
-    if flat_leaf_ranked is not None:
-        sample.flat_leaf_ranked = flat_leaf_ranked
-        sample.flat_gates = allowed_prefixes
-        sample.flat_gate_scores = gate_scores
-        sample.flat_query = flat_query
-        sample.gold_paths_tuples = [tuple(p) for p in gold_paths]
-        sample.flat_retrieved_paths = [h.path for h in hits]
-        sample.gate_descs = gate_descs
-        sample.flat_context_descs = context_descs
-        sample.schema_labels = schema_labels
-    if allowed_prefixes and hp.SEED_FROM_FLAT_GATES:
-        sample.seed_beam_from_gate_paths(allowed_prefixes, gate_scores)
-    all_eval_samples.append(sample)
-if rewrite_enabled and hp.REWRITE_AT_START:
-    start_prompts = []
-    start_meta = []
-    for sample in all_eval_samples:
-        context_descs = _get_rewrite_context(
-            sample,
-            None,
-            hp.REWRITE_CONTEXT_SOURCE,
-            node_by_path,
+        sample = InferSample(
+            semantic_root_node,
             node_registry,
-            hp.REWRITE_CONTEXT_TOPK,
-            hp.MAX_DOC_DESC_CHAR_LEN,
+            hp=hp,
+            logger=logger,
+            query=query,
+            gold_paths=gold_paths,
+            excluded_ids_set=set(examples_df.iloc[i]['excluded_ids']),
+            allowed_prefixes=allowed_prefixes,
         )
-        prev_rewrite = getattr(sample, "last_rewrite_raw", "")
-        schema_labels = getattr(sample, "schema_labels", [])
-        cache_key = _rewrite_cache_key(
-            "start",
-            f"{sample.original_query}||{prev_rewrite}",
-            context_descs,
-            iter_idx=None,
-            schema_labels=schema_labels,
-        )
-        if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
-            rewrite = rewrite_map[cache_key]
-            sample.last_rewrite_raw = rewrite
-            sample.query = _compose_query(sample.original_query, rewrite)
+        sample.original_query = examples_df.iloc[i]['query']
+        sample.last_rewrite_raw = expanded_query if hp.FLAT_THEN_TREE else ""
+        sample.schema_labels = schema_labels if hp.FLAT_THEN_TREE else []
+        if hp.PRE_FLAT_REWRITE:
             if not hasattr(sample, 'rewrite_history'):
                 sample.rewrite_history = []
             sample.rewrite_history.append({
                 'iter': None,
-                'phase': 'start',
-                'cache_hit': True,
-                'rewrite': rewrite,
+                'phase': 'preflat',
+                'cache_hit': preflat_cache_hits.get(sample.original_query, False),
+                'rewrite': expanded_query,
                 'schema_labels': schema_labels,
             })
-            continue
-        if rewrite_template is None:
-            raise ValueError('Rewrite enabled but no prompt template is available.')
-        start_prompts.append(_format_rewrite_prompt(
-            rewrite_template,
-            sample.original_query,
-            prev_rewrite,
-            context_descs,
-            schema_labels,
-        ))
-        start_meta.append({
-            'sample': sample,
-            'cache_key': cache_key,
-            'base_query': sample.original_query,
-            'prev_rewrite': prev_rewrite,
-            'context_descs': context_descs,
-            'schema_labels': schema_labels,
-        })
-    if start_prompts:
-        start_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(start_loop)
-        try:
-            start_outputs = start_loop.run_until_complete(
-                llm_api.run_batch(start_prompts, max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS)
+        if flat_leaf_ranked is not None:
+            sample.flat_leaf_ranked = flat_leaf_ranked
+            sample.flat_gates = allowed_prefixes
+            sample.flat_gate_scores = gate_scores
+            sample.flat_query = flat_query
+            sample.gold_paths_tuples = [tuple(p) for p in gold_paths]
+            sample.flat_retrieved_paths = [h.path for h in hits]
+            sample.gate_descs = gate_descs
+            sample.flat_context_descs = context_descs
+            sample.schema_labels = schema_labels
+        if allowed_prefixes and hp.SEED_FROM_FLAT_GATES:
+            sample.seed_beam_from_gate_paths(allowed_prefixes, gate_scores)
+        all_eval_samples.append(sample)
+    if rewrite_enabled and hp.REWRITE_AT_START:
+        start_prompts = []
+        start_meta = []
+        for sample in all_eval_samples:
+            context_descs = _get_rewrite_context(
+                sample,
+                None,
+                hp.REWRITE_CONTEXT_SOURCE,
+                node_by_path,
+                node_registry,
+                hp.REWRITE_CONTEXT_TOPK,
+                hp.MAX_DOC_DESC_CHAR_LEN,
             )
-        finally:
-            start_loop.close()
-            asyncio.set_event_loop(None)
-        new_rewrite_records = []
-        for meta, out in zip(start_meta, start_outputs):
-            sample = meta['sample']
-            rewrite, possible_docs = _parse_rewrite_output(out)
-            rewrite_map[meta['cache_key']] = rewrite
-            sample.last_rewrite_raw = rewrite
-            sample.query = _compose_query(meta['base_query'], rewrite)
-            if not hasattr(sample, 'rewrite_history'):
-                sample.rewrite_history = []
-            sample.rewrite_history.append({
-                'iter': None,
-                'phase': 'start',
-                'cache_hit': False,
-                'rewrite': rewrite,
-                'schema_labels': meta.get('schema_labels', []),
-                'possible_answer_docs': possible_docs,
+            prev_rewrite = getattr(sample, "last_rewrite_raw", "")
+            schema_labels = getattr(sample, "schema_labels", [])
+            cache_key = _rewrite_cache_key(
+                "start",
+                f"{sample.original_query}||{prev_rewrite}",
+                context_descs,
+                iter_idx=None,
+                schema_labels=schema_labels,
+            )
+            if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
+                rewrite = rewrite_map[cache_key]
+                sample.last_rewrite_raw = rewrite
+                sample.query = _compose_query(sample.original_query, rewrite)
+                if not hasattr(sample, 'rewrite_history'):
+                    sample.rewrite_history = []
+                sample.rewrite_history.append({
+                    'iter': None,
+                    'phase': 'start',
+                    'cache_hit': True,
+                    'rewrite': rewrite,
+                    'schema_labels': schema_labels,
+                })
+                continue
+            if rewrite_template is None:
+                raise ValueError('Rewrite enabled but no prompt template is available.')
+            start_prompts.append(_format_rewrite_prompt(
+                rewrite_template,
+                sample.original_query,
+                prev_rewrite,
+                context_descs,
+                schema_labels,
+            ))
+            start_meta.append({
+                'sample': sample,
+                'cache_key': cache_key,
+                'base_query': sample.original_query,
+                'prev_rewrite': prev_rewrite,
+                'context_descs': context_descs,
+                'schema_labels': schema_labels,
             })
-            new_rewrite_records.append({
-                'key': meta['cache_key'],
-                'rewritten_query': rewrite,
-                'prompt_name': hp.REWRITE_PROMPT_NAME,
-                'llm': hp.LLM,
-                'context_descs': meta.get('context_descs', []),
-                'schema_labels': meta.get('schema_labels', []),
-                'possible_answer_docs': possible_docs,
-            })
-        if hp.REWRITE_CACHE_PATH and new_rewrite_records:
-            os.makedirs(os.path.dirname(hp.REWRITE_CACHE_PATH) or '.', exist_ok=True)
-            with open(hp.REWRITE_CACHE_PATH, 'a', encoding='utf-8') as f:
-                for rec in new_rewrite_records:
-                    f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        if start_prompts:
+            start_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(start_loop)
+            try:
+                start_outputs = start_loop.run_until_complete(
+                    llm_api.run_batch(start_prompts, max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS)
+                )
+            finally:
+                start_loop.close()
+                asyncio.set_event_loop(None)
+            new_rewrite_records = []
+            for meta, out in zip(start_meta, start_outputs):
+                sample = meta['sample']
+                rewrite, possible_docs = _parse_rewrite_output(out)
+                rewrite_map[meta['cache_key']] = rewrite
+                sample.last_rewrite_raw = rewrite
+                sample.query = _compose_query(meta['base_query'], rewrite)
+                if not hasattr(sample, 'rewrite_history'):
+                    sample.rewrite_history = []
+                sample.rewrite_history.append({
+                    'iter': None,
+                    'phase': 'start',
+                    'cache_hit': False,
+                    'rewrite': rewrite,
+                    'schema_labels': meta.get('schema_labels', []),
+                    'possible_answer_docs': possible_docs,
+                })
+                new_rewrite_records.append({
+                    'key': meta['cache_key'],
+                    'rewritten_query': rewrite,
+                    'prompt_name': hp.REWRITE_PROMPT_NAME,
+                    'llm': hp.LLM,
+                    'context_descs': meta.get('context_descs', []),
+                    'schema_labels': meta.get('schema_labels', []),
+                    'possible_answer_docs': possible_docs,
+                })
+            if hp.REWRITE_CACHE_PATH and new_rewrite_records:
+                append_jsonl(hp.REWRITE_CACHE_PATH, new_rewrite_records)
 assert not any([sample.prediction_tree.excluded for sample in tqdm(all_eval_samples)])
   
 logger.info('Hyperparams:\n'+'\n'.join([f'{k}:\t{v}' for k, v in vars(hp).items()]))
@@ -1197,10 +898,7 @@ async def retrieval_loop_step(iter_idx: int):  # Make the function asynchronous
               'possible_answer_docs': possible_docs,
           })
         if hp.REWRITE_CACHE_PATH and new_rewrite_records:
-          os.makedirs(os.path.dirname(hp.REWRITE_CACHE_PATH) or '.', exist_ok=True)
-          with open(hp.REWRITE_CACHE_PATH, 'a', encoding='utf-8') as f:
-            for rec in new_rewrite_records:
-              f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+          append_jsonl(hp.REWRITE_CACHE_PATH, new_rewrite_records)
     return slates
 
 loop = asyncio.new_event_loop()
@@ -1236,6 +934,11 @@ try:
                         row[f'nDCG@10_ctx_{source}'] = compute_ndcg(ranked_paths[:10], gold_paths, k=10)*100
                     else:
                         row[f'nDCG@10_ctx_{source}'] = 0.0
+                traversal_paths = [list(p) for p, _ in traversal_ranked]
+                if traversal_paths:
+                    row['nDCG@10_ctx_treeonly'] = compute_ndcg(traversal_paths[:10], gold_paths, k=10)*100
+                else:
+                    row['nDCG@10_ctx_treeonly'] = 0.0
                 fused_metric_rows.append(row)
             eval_metric_df = pd.DataFrame(fused_metric_rows)
             if leaf_counts_200:
@@ -1250,7 +953,7 @@ try:
                     float(np.median(leaf_counts_10)),
                     zero_10,
                 )
-            ctx_cols = [f'nDCG@10_ctx_{s}' for s in ("flat", "slate", "fused", "mixed") if f'nDCG@10_ctx_{s}' in eval_metric_df.columns]
+            ctx_cols = [f'nDCG@10_ctx_{s}' for s in ("flat", "slate", "fused", "mixed", "treeonly") if f'nDCG@10_ctx_{s}' in eval_metric_df.columns]
             if ctx_cols:
                 ctx_summary = "; ".join([f"{c}={eval_metric_df[c].mean():.2f}" for c in ctx_cols])
                 logger.info(f"Rewrite context nDCG@10: {ctx_summary}")

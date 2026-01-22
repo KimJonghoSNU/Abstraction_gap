@@ -123,22 +123,29 @@ Gate 내부 탐색(Exploit)만으로 충분한지(Router 판단), 아니면 Gate
 ### 6.2 Next claim to validate (TODO. not fixed. still on a discussion)
 interaction rewriting이 `Flat→Gate` 대비 추가 이득을 준다면:
 - abstraction gap의 핵심에는 “정적 1회 보정(QE)”을 넘어선 **동적 bridge 생성(표현 업데이트)** 이 포함되며,
-- 코퍼스가 제공하는 중간 요약 노드를 rewriting 컨텍스트로 주입하는 것이 (B) locality와 hard negative 오염을 완화한다.
+- 코퍼스가 제공하는 중간 요약 노드를 rewriting 컨텍스트로 주입하는 것이 (B) locality와 hard negative 오염을 완화한다. (앗 그런데 현재 상태: psychology같은 경우 중간 요약 노드가 오히려 성능 떨어짐)
 
 언제 rewrite해야할까? 
 - stagnation: 이전 라운드 대비 top-K 노드들의 prefix 다양성이 거의 안 변함
 - low gate confidence: gate 후보들의 score gap이 작음(1등~3등 비슷)
 - poison signal: top-K leaf 간 상호 모순/불일치가 높거나, 질문과의 “논리적 entailment”가 낮음(간단히는 LLM judge 1회)
 
----
 
-## 7. Minimal experiment checklist (for the TODO)
+# # discussion
+-(MT) 고려해야 할 사항
+1. gold document가 유일한가? 다양한 abstraction aspect가 있을 수 있다. apsect ambiguity 제거가 필요하다
+	- e.g. 벌들의 움직임을 관측하는 방법?
+		- 지금 정답: 푸아송 분포. 가능한 다른 정답들: 양봉 커뮤니티 게시글...
+	- 그래서 setting도 중요하게 작용할 것: web인지, domain-focused corpus인지. corpus가 web이면 corpus feedback으로 어떤 aspect가 정답인지 찾는 것은 불가능하기 때문. 이런 경우에는 user persona... 등에 의존해야 함.
+		- -> (JH) 일단 domain-focused corpus에 집중하기로. document environment와 상호작용하면서 abstraction aspect를 줄여나갈 수 있는 세팅.
+2. LLM이 주어진 정보가 쿼리에 대한 답으로 충분한지, 충분하지 않은지 internal knowledge로 알 수 있다면, retrieval 자체가 필요 없는 상황 아니냐?
+	- (MT) LLM이 직접 답을 생성하는 건 못할 수 있음. 세부적인 지식들을 모델이 다 알지는 못함.
+	- (MT) 하지만 지식을 abstraction -> abstraction 카테고리별로 지식이 나눠져 있다면, 카테고리별로 yes/no 판단하는 능력은 모델이 갖고 있다고 전제할 수 있음.
+		- = 카테고리 레벨로 navigate하는건 llm이 모든 세부적인 지식 없이 할 수 있지 않을까
 
-- 조건: baseline / flat→gate / flat→gate + interaction rewrite(예산 제한) 비교
-- 지표: nDCG/Recall + (진단) ancestor/gate hit, rewrite drift 사례
-- 분석: 효과 없는 서브카테고리에서 “fixed level 대신 corpus‑unit conditioning”이 개선을 주는지 확인
+
 
 
 ## 메모
-- flat retrieval을 한다는 아이디어: RAPTOR (ICLR2024)에 이미 있음
+- flat retrieval을 한다는 아이디어: RAPTOR (ICLR2024)에 이미 있음 이 자체는 contribution이 아님
 - 

@@ -38,7 +38,6 @@ COMMON_PARAMS=(
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
     --gate_branches_topb 10
-    --seed_from_flat_gates
 
     # Pre-flat rewrite (leaf-only context)
     --pre_flat_rewrite

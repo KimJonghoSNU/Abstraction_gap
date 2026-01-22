@@ -21,11 +21,11 @@ QE_PROMPT_NAME="pre_flat_rewrite_v1"
 REWRITE_PROMPT_NAME="gate_rewrite_schema_v1"
 QE_CACHE_BASE="${CACHE_BASE_ROOT}/qe_${QE_PROMPT_NAME}"
 REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${REWRITE_PROMPT_NAME}"
-REWRITE_CACHE_TAG="exp1_qe_iter"
+REWRITE_CACHE_TAG="exp1_qe_iter_schema"
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
-    --suffix exp1_qe_iter
+    --suffix exp1_qe_iter_schema_d1
     --reasoning_in_traversal_prompt -1
     --load_existing
     --num_iters 5
@@ -40,7 +40,6 @@ COMMON_PARAMS=(
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
     --gate_branches_topb 10
-    # --seed_from_flat_gates
 
     # QE before flat retrieval
     --qe_prompt_name "$QE_PROMPT_NAME"
@@ -49,7 +48,7 @@ COMMON_PARAMS=(
     --rewrite_prompt_name "$REWRITE_PROMPT_NAME"
     --rewrite_every 1
     --rewrite_context_topk 5
-    --rewrite_context_source fused
+    --rewrite_context_source slate
     --rewrite_mode concat
 )
 

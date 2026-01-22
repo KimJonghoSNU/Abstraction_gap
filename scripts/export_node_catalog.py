@@ -26,9 +26,11 @@ def main() -> None:
         tree_obj = pkl.load(open(args.tree_pkl, "rb"))
     root = SemanticNode().load_dict(tree_obj) if isinstance(tree_obj, dict) else tree_obj
     node_registry = compute_node_registry(root)
-    import pdb; pdb.set_trace()
     os.makedirs(os.path.dirname(args.out_jsonl) or ".", exist_ok=True)
-    with open(args.out_jsonl, "w", encoding="utf-8") as f:
+    depth1_path = os.path.splitext(args.out_jsonl)[0] + "_depth1.jsonl"
+    os.makedirs(os.path.dirname(depth1_path) or ".", exist_ok=True)
+    depth1_count = 0
+    with open(args.out_jsonl, "w", encoding="utf-8") as f, open(depth1_path, "w", encoding="utf-8") as f_depth1:
         for node in node_registry:
             rec = {
                 "registry_idx": int(node.registry_idx),
@@ -41,7 +43,11 @@ def main() -> None:
                 "desc": node.desc,
             }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if rec["depth"] == 1:
+                f_depth1.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                depth1_count += 1
         print(f"Exported {len(node_registry)} nodes to {args.out_jsonl}")
+        print(f"Exported {depth1_count} depth=1 nodes to {depth1_path}")
 
 
 if __name__ == "__main__":

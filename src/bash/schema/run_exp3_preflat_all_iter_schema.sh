@@ -2,14 +2,14 @@
 
 # Create log file with timestamp
 mkdir -p ../logs
-LOG_FILE="../logs/run_exp2_preflat_leaf_noiter_$(date '+%Y_%m_%d').log"
+LOG_FILE="../logs/run_exp3_preflat_leaf_iter_$(date '+%Y_%m_%d').log"
 
 # Function to log with timestamp
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting run_exp2_preflat_leaf_noiter.sh script"
+log "Starting run_exp3_preflat_leaf_iter.sh script"
 
 # Edit these paths for your setup
 RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
@@ -19,11 +19,11 @@ NODE_EMB_BASE="../trees/BRIGHT"
 CACHE_BASE_ROOT="/data4/jongho/Search-o1/data/QA_Datasets/bright/cache"
 REWRITE_PROMPT_NAME="gate_rewrite_schema_v1"
 REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${REWRITE_PROMPT_NAME}"
-REWRITE_CACHE_TAG="exp2_preflat_leaf_noiter_schema"
+REWRITE_CACHE_TAG="exp3_preflat_leaf_iter_schema"
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
-    --suffix exp2_preflat_leaf_noiter_schema_d1
+    --suffix exp3_preflat_leaf_iter_schema_d1
     --reasoning_in_traversal_prompt -1
     --load_existing
     --num_iters 5
@@ -41,11 +41,14 @@ COMMON_PARAMS=(
 
     # Pre-flat rewrite (leaf-only context)
     --pre_flat_rewrite
-    --pre_flat_rewrite_source leaf
+    --pre_flat_rewrite_source all
     --rewrite_prompt_name "$REWRITE_PROMPT_NAME"
 
-    # No rewrite during traversal
-    --rewrite_every 0
+    # Rewrite during traversal
+    --rewrite_every 1
+    --rewrite_context_topk 5
+    --rewrite_context_source fused
+    --rewrite_mode concat
 )
 
 # Define RUNS directly as strings (space-separated args)

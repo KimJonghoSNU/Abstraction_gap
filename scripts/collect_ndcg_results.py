@@ -101,10 +101,12 @@ def collect_ndcg_results(base_dir: str, drop_map: Dict[str, str], exclude_subdir
     records: List[Dict[str, object]] = []
     for metrics_path in tqdm(sorted(_find_metrics_files(base_dir))):
         if any(f"{os.sep}{subdir}{os.sep}" in metrics_path for subdir in exclude_subdirs):
+            print(f"Skipping excluded path: {metrics_path}")
             continue
         try:
             df = pd.read_pickle(metrics_path)
         except Exception:
+            print(f"Warning: Failed to read metrics file: {metrics_path}")
             continue
         category, exp_id = _relative_experiment_id(base_dir, metrics_path, drop_map)
         max_ndcg, max_iter = _extract_max_ndcg(df)
@@ -122,7 +124,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Collect nDCG@10 results for iter 0 and iter 3.")
     parser.add_argument("--base_dir", type=str, default="results/BRIGHT", help="Base results directory")
     parser.add_argument("--out_csv", type=str, default="results/BRIGHT/ndcg_summary.csv", help="Output CSV path")
-    parser.add_argument("--exclude_subdir", action="append", default=["260116"], help="Subdirectory name to exclude")
+    parser.add_argument("--exclude_subdir", action="append", default=["260116", "260121"], help="Subdirectory name to exclude")
     parser.add_argument(
         "--drop_param",
         action="append",

@@ -9,7 +9,7 @@ The current concern is whether **abstraction gap** can be solved by:
 We want a pipeline that reliably jumps to the correct abstraction level without getting trapped by feedback locality.
 
 
-## 2) Current pipeline variants being compared
+## 2) pipeline variants being compared
 
 ### A. Baseline interaction loop (status quo)
 - QE → flat retrieval → traversal
@@ -27,49 +27,50 @@ We want a pipeline that reliably jumps to the correct abstraction level without 
 ### C. Pre-flat rewrite + traversal rewrite
 - Same as B, plus iterative rewrite during traversal
 
-### D. Branch-seeded traversal (new variant)
-- After flat retrieval, use selected branch gates as **initial beam states**
-- run traversal for iter 0 inside those subtrees
-- after iter 0, traverse normally
-- controlled by `--seed_from_flat_gates`
-
-
 ## 3) Observations so far (from ndcg_summary.csv)
 Summary trends:
-- **Pre-flat rewrite (all-nodes) > branch-only** on average.
-- **Leaf-only pre-flat rewrite** looks strongest.
+- **Leaf-only pre-flat rewrite is strongest** on average...
 - **Iterative rewrite on top of branch-only** does not add value and often hurts.
 
 Interpretation:
 - **Branch-only context for rewriting is likely harmful or too abstract**, especially when rewrite drives the retriever into the wrong region.
 - Leaf evidence seems to ground rewrite better than branch summaries.
-- 즉 query rewrite -> Tree traversal 을 더 잘하게 해줌. 하지만 tree의 정보가 query rewrite를 더 잘하게 해주지는 않음.
-
-
-## 4) Current hypothesis alignment
-From `abstraction_gap2.md`, abstraction gap is driven by:
-1) bridge representation bottleneck, and
-2) feedback locality from top‑K → rewrite loops.
+- 즉 query rewrite -> Tree traversal 을 더 잘하게 해줌. 하지만 역방향으로, tree의 정보가 query rewrite를 더 잘하게 해주지는 않음.
 
 The current results suggest:
-- **branch summaries alone are not reliable bridge signals** (may cause “logic poisoning”)
+- **branch summaries alone are not reliable bridge signals**
 - **leaf evidence is a better anchor for rewrite**, at least in the current model + prompt setup
-
-
 
 
 
 # Round 2
 
+## 5) Results (schema_d1 runs in ndcg_summary.csv)
+Scope: schema_d1 experiments (LLM-generated schema from depth=1 branch retrieval).
+
+### Overall trends (mean across biology + psychology)
+- **PreFRS=leaf** is best: ndcg@10 iter0/max = **49.55 / 52.66**
+- **PreFRS=all** is second: **50.40 / 52.19**
+- **PreFRS=branch** is worst: **47.64 / 50.55**
+- **Rewrite_every=0** slightly > **rewrite_every=1** (means: **49.46 / 52.14** vs **48.80 / 51.52**)
+
+### Per-subset trends
+- **Biology**: leaf > all > branch (iter0/max)
+    - leaf **56.74 / 59.77**, all **57.79 / 59.25**, branch **54.22 / 57.17**
+- **Psychology**: leaf > all > branch (iter0/max)
+    - leaf **42.36 / 45.54**, all **43.01 / 45.13**, branch **41.05 / 43.93**
+
+### Interpretation
+- Even with schema (depth=1), **branch-only rewrite context is still weakest**.
+- **Leaf-only remains the safest grounding signal**, schema or not.
+- Iterative rewrite (RE=1) does **not** consistently help; average is slightly worse than RE=0.
+
 ## 5) Implementation Plan (Draft)
 Goal: use tree summaries to define **abstraction schema** (categories) while keeping **rewrite evidence grounded in leaf docs**, based on current results.
 
 ### 5.1 Design choices (default + ablations)
-1) **Schema source**
-    - Default: **LLM-generated schema** from flat-retrieved branch descriptions
-    - Future (not implement now): **hybrid** (tree schema + LLM prune/merge)
 2) **Schema scope**
-    - Default: **intermediate children of flat-retrieved branches** (no breadth cap for now)
+    - Default: **intermediate children of flat-retrieved branches** (using all depth=1 branches)
     - Ablation: **top branches only**
 3) **Schema form**
     - Default: **free-text labels** derived from branch desc/path
@@ -83,8 +84,6 @@ Goal: use tree summaries to define **abstraction schema** (categories) while kee
     - Per-category candidates are generated for **logging only**, but keep code extensible to fuse later
 7) **Iteration policy**
     - Schema is generated **once pre-flat** (not refreshed every iter)
-    - Schema is **logged per iter** for analysis
-    - TODO: ablate **schema refresh every iter**
     - Rewrite timing is still controlled by `rewrite_every` for ablation
 
 ### 5.2 Proposed pipeline (high level)
@@ -94,33 +93,174 @@ Goal: use tree summaries to define **abstraction schema** (categories) while kee
     - schema as structure
     - **leaf-only** evidence from flat results as grounding
 4) **Leaf-only retrieval** (evaluation uses leaf-only)
-5) Optional: **traversal** with `--seed_from_flat_gates` (ablation)
+5) Optional: **traversal** with `--seed_from_flat_gates` (ablation) -> horrible performance. I assume that it is diffcult to mix score of flat retrieval + from tree traversal
 
-### 5.3 Concrete implementation points
-1) `previous/shortcut_reranker/scripts/query_generator.py`
-    - Add optional `schema` input block
-    - Generate single structured rewrite plus per-category candidates (logging)
-2) `src/run.py`
-    - Log schema per iter alongside rewrite cache
-    - Keep leaf-only evidence for rewrite context
-    - No hybrid conflict-resolution logic for now
-3) Prompts
-    - New prompt template: schema-guided rewrite
-    - Separate prompt for schema induction (tree-only vs LLM)
 
 ### 5.4 Risks / critique (why this direction is safer)
 1) Branch-only evidence previously degraded results; schema-only use avoids that
 2) LLM schema can drift from branch evidence; log schema drift + consider hybrid
 3) Too many categories increase noise → keep 3–5 and dynamic per query
 
-### 5.5 TODO (follow-up)
-1) Add hybrid schema prune/merge when ready (tree + LLM)
-2) Add optional per-category fusion into retrieval (currently logging-only)
-3) Add schema-specific metrics/logging (schema drift, per-category support)
-4) Ablate schema refresh every iter
+### Results
+- 전체 branch로 schema rewrite하는 것보다는 성능 오름. 그런데 안쓰느니만 못함.
+- 분석: depth=1에서 제공해주는 내용이 query abstraction과는 맞지 않음. 
+    - LATTICE에서 트리를 만드는 방식: 같은 내용을 묶음. abstraction category (theory, entity..) 로 묶이지 않음.
+    - 그래도 tree 쓰는 거 정당화 가능한지? corpus keyword extraction (rewritten query content 채우기 위해 필요) vs category abstraction 각각의 효과 모두 필요하다?
+
+```
+### LATTICE tree generation
+You are an expert AI analyst and summarizer. Your mission is to create a highly informative and "
+discriminative signpost" for a navigating search agent. This signpost (a summary) must guide the agent to
+the correct cluster of nodes to answer a user’s query.
+You will follow a strict, step-by-step cognitive process. You must analyze the children nodes in a target
+parent node (the "Positive Set").
+Prompt ID: {prompt_id} (ignore, this is just for watermarking purposes).
+## INPUTS
+### POSITIVE SET: Information about the target parent node to be summarized
+{positive_set_descriptions}
+---
+## YOUR TASK & OUTPUT FORMAT
+Your entire output must be a single, valid JSON object. Inside this JSON, you will follow the 3-step
+thinking process outlined below, populating each field as instructed.
+### JSON Structure and Instructions:
+{{
+"detailed_fingerprints": [
+// For EACH children node in the POSITIVE SET (target parent node), extract a structured object of its
+key, queryable facts.
+{{
+"one_line_summary": "...", // write a very information dense and very concise one-line summary for
+the information contained in this node
+"key_entities": ["..."], // List a very few key entities which is central to this node
+"genre_or_category": ["..."], // List a few key genre / categories this node can be classified into
+"name": "...", // Name the node
+}}
+],
+"common_theme": "...", // Reason deeply what are the common themes between the nodes in the POSITIVE SET
+"summary": "...", // Based on step 1 and step 2, write a very information dense description of the target
+node, **make sure to include all key entities**.
+```
+
+### Next Round
+
+- tree -> query rewrite쓰는 효과: 검색 pool이 좁아지는 효과 (1 depth tree로 전부 변경해서 검색한다고 생각하자. flat retrieval -> feedback -> flat retrieval 반복.)
+- Algorithm
+    - flat retrieval -> leaf node들 + 걸리는 모든 branch들의 leaf node들로 ndcg@10 측정 = final metric. branch의 leaf node들은 점수를 어떻게 다시 매길지 고민.
+    - topk leaf node들 (or topk leaf + topk branch 조합. 각각 leaf, branch라고 표시해야할지 고민.)이 query rewriter feedback으로 들어감
+    - 여기서부터가 고민인데, 다음 retriever corpus pool은 이전 flat retrieval 결과와 같은 prefix를 공유하는 노드들에 대해서만 할 지, 아니면 iteration i 마다 depth-i인 노드들을 제외하고 점점 deeper tree node search를 할 지.
+    - 위 내용 반복
 
 
+- rewrite할 때 branch node / leaf node 구분해서 주기 vs leaf node만 주기 ablation
 
+
+## Round 3
+
+
+Phase 1: Initial Observation and Gate Induction
+1. Global Flat Retrieval
+
+Global flat retrieval을 수행한다.
+쿼리는 Query_t를 사용한다.
+Query_t는 Query0와 현재까지 생성된 Q_rewritten을 결합한 것이다.
+인덱스는 leaf와 branch가 함께 있을 수 있다.
+
+2. Output Separation
+
+Top K_anchor 결과에서 leaf와 branch를 분리한다.
+L_init는 Top K_anchor leaf 결과다.
+B_hit는 Top K_anchor 결과 안에 포함된 branch 결과의 prefix 집합이다.
+branch node가 검색되더라도 L_init에는 포함하지 않는다.
+
+3. Active Branches Construction
+
+L_init에 포함된 leaf들의 prefix 전부를 모아 P_leaf로 둔다.
+ActiveBranches B_active는 P_leaf와 B_hit의 합집합이다.
+
+4. Density Check
+
+각 candidate prefix u에 대해 density(u)를 계산한다.
+density(u)는 L_init 중 prefix가 u인 비율이다.
+density는 Phase 2에서 explore와 exploit의 분기 신호로 사용한다.
+density는 Phase 3에서 local과 global fusion 조절 신호로 사용할 수 있다.
+
+TODO drift signal을 정의해서 explore와 exploit 분기를 더 안정화한다.
+TODO conflict signal을 정의해서 local과 global 충돌을 반영한다.
+
+Phase 2: Interaction and Rewriting
+5. Schema Optional Rewrite
+
+입력은 다음으로 구성한다.
+Original Query0.
+Evidence로서 L_init의 leaf 텍스트.
+Optional context로서 B_active의 branch description.
+
+Rewriter는 다음을 출력한다.
+Rewritten Query Q_rewritten.
+Action a는 explore 또는 exploit 중 하나다.
+
+exploit은 현재 B_active가 맞는 지역이라고 보고 구체화를 시도한다.
+explore는 B_active가 불완전하거나 틀렸을 수 있다고 보고 탈출을 시도한다.
+
+Phase 3: Hybrid Retrieval
+6. Dual Path Retrieval
+
+두 개의 경로로 retrieval을 수행한다.
+
+Path A: Local Exploit Search.
+Pool은 B_active의 descendants로 만든다.
+descendants에는 하위 branch와 leaf를 포함한다.
+단 B_active에 속한 branch 노드 자체와 그 상위 노드들은 pool에서 제외한다.
+쿼리는 Query_t를 사용한다.
+
+Depth 제약을 둔다.
+처음 선택된 active branch들의 depth가 d라면, Path A에서 depth d에 해당하는 branch 노드들은 제외한다.
+그 아래 노드들만 대상으로 한다.
+목적은 같은 추상 레벨에서 맴도는 locality를 줄이고 더 구체 레벨로 내려가게 하는 것이다.
+
+Path A 결과 처리 규칙을 둔다.
+Path A의 retrieval 결과에서 branch 노드는 즉시 제거한다.
+leaf 결과만 fusion 단계로 전달한다.
+
+Path B: Global Escape Search.
+Pool은 전체 leaf다.
+쿼리는 Query_t를 사용한다.
+출력은 Top K_global만 유지한다.
+K_global은 10 정도로 둔다.
+
+7. Score Fusion
+
+Path A와 Path B 결과를 RRF로 결합한다.
+결합 결과를 Final Ranked List로 둔다.
+Final Ranked List는 leaf만 포함한다.
+
+density 기반으로 local과 global 중 어느 쪽을 더 믿을지 조절하는 것은 옵션으로 둔다.
+우선은 고정 RRF로 시작한다.
+추후 density를 이용한 가중 fusion은 ablation으로 넣는다.
+
+Phase 4: Evaluation and Looping
+8. Offline Metric Calculation
+
+Final Ranked List의 Top K_eval leaf를 기준으로 ndcg를 계산한다.
+branch 노드는 평가에서 제외한다.
+
+9. Next Round Update
+
+다음 라운드는 Phase 1부터 다시 수행한다.
+gate는 매 라운드 새로 유도된다.
+Query_t는 매 라운드 업데이트된 Q_rewritten을 반영한다.
+
+Action이 exploit이면, 다음 라운드에서도 local이 강하게 작동할 가능성이 있으므로 depth 제약을 유지한다.
+Action이 explore이면 local 신뢰가 낮다고 보고 global 결과가 다음 라운드 B_active 선정에 더 크게 반영되도록 한다.
+구체 규칙은 TODO로 남긴다.
+
+TODO explore에서 B_active 업데이트 규칙을 정량화한다.
+TODO drift signal.
+TODO conflict signal.
+
+
+## Current best setting
+- biology: S=flat_gate_qe_iter-FTT=True-FT=100-GBT=10-QePN=pre_flat_rewrite_v1-QeCP=biology_pre_flat_rewrite-RPN=gate_rewrite_v1-RM=concat-RE=1-RCT=5-RCS=fused-RAtS=True 63.xx
+- psychology: S=flat_gate-FTT=True-FT=100-GBT=10-QeCP=psychology_converted_qe_woplan.log 48.xx
 
 
 
