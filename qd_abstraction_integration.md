@@ -27,6 +27,33 @@ We want a pipeline that reliably jumps to the correct abstraction level without 
 ### C. Pre-flat rewrite + traversal rewrite
 - Same as B, plus iterative rewrite during traversal
 
+## baselines
+### 1) Tree traversal only (no flat, no rewrite)
+    - Goal: isolate pure tree navigation without any flat anchors or query rewriting.
+    - Implementation: `src/run.py` without `--flat_then_tree`, no `--qe_*`, no `--rewrite_*`.
+    - Script: `src/bash/baselines/run_baseline1_tree_only.sh`.
+
+### 1b) Tree traversal + iterative rewrite (leafslate context)
+    - Goal: test per-iteration rewrite in traversal without flat, using leaf hits + branch slate context.
+    - Implementation: `src/run.py` with `--rewrite_prompt_name thinkqe`, `--rewrite_every 1`, and `--rewrite_context_source leafslate`.
+    - Context: traversal leaf hits (if any) + branch nodes from current slates.
+    - Script: `src/bash/baselines/run_baseline1_tree_iter_rewrite.sh`.
+
+### 2) QE-only rewrite, then pure traversal (no flat, no context)
+    - Goal: test context-free query rewriting impact before traversal.
+    - Implementation: `src/run.py` with `--qe_prompt_name thinkqe`, `--flat_then_tree` off, and no traversal rewrite.
+    - Script: `src/bash/baselines/run_baseline2_qe_noctx.sh`.
+
+### 2b) QE-only rewrite (agent_executor_v1), then pure traversal (no flat, no context)
+    - Goal: compare a different no-context QE prompt against thinkqe.
+    - Implementation: `src/run.py` with `--qe_prompt_name agent_executor_v1`, `--flat_then_tree` off, and no traversal rewrite.
+    - Script: `src/bash/baselines/run_baseline2_qe_agent_executor.sh`.
+
+### 3) Leaf-only retrieve ↔ rewrite loop (leaf-only context)
+    - Goal: evaluate iterative rewrite with only leaf evidence (no branch leakage).
+    - Implementation: `src/run_leaf_rank.py` with `--leaf_only_retrieval` and `--rewrite_prompt_name thinkqe`.
+    - Script: `src/bash/baselines/run_baseline3_leaf_only_loop.sh`.
+
 ## 3) Observations so far (from ndcg_summary.csv)
 Summary trends:
 - **Leaf-only pre-flat rewrite is strongest** on average...
@@ -285,6 +312,37 @@ TODO conflict signal.
 - Scripts:
     - `src/bash/run_round3_ablation.sh` (leaf vs leaf_branch ablation)
 
+### Results [WIP]
+
+- Leaf‑only context still wins.
+    round3_leaf > round3_leaf_branch in both biology and psychology.
+    That matches earlier results: branch evidence tends to hurt rewrite quality.
+- Explore‑mode = original is clearly bad.
+    round3_explore_original is the worst in both biology (54.35 max) and psychology (41.76 max).
+    Keeping original for explore seems to prevent escaping bad anchors.
+- Per‑level actions underperform.
+    round3_action_levels_v1 is noticeably worse than single‑action (round3_action_v1) in both domains.
+    Likely too complex for the model right now or PRUNE is dropping useful categories.
+- Psychology stagnates after iter 0.
+    Best psychology runs are effectively iter‑0 best (no improvement across iterations).
+    Biology improves with iterations, psychology doesn’t → rewrite drift or mismatch.
+
+## Round 3 Comparison Table (ndcg_summary.csv)
+Grouped by suffix + prompt + explore_mode (mean across categories).
+| suffix | prompt | explore_mode | ndcg_iter0 | ndcg_max |
+|---|---|---|---:|---:|
+| biology | round3_action_v1 | replace | 57.70 | 61.67 |
+| biology | round3_action_levels_v1 | replace | 54.57 | 58.77 |
+| biology | round3_action_v1 | original | 52.19 | 54.35 |
+| psychology | round3_action_v1 | replace | 43.53 | 43.92 |
+| psychology | round3_action_levels_v1 | replace | 43.41 | 43.81 |
+| psychology | round3_action_v1 | original | 40.95 | 41.76 |
+
+round3_action_v1 explore=replace	58.58,62.87,3	44.17,44.17,0
+round3_action_v1 explore=concat	57.18,61.84,4	41.92,44.73,2
+round3_action_levels_v1 explore=replace	54.57,58.77,6	43.41,43.81,2
+
+
 TODO
 - Per-level action (category별 EXPLORE/EXPLOIT) 적용
 - density 기반 weighted fusion
@@ -305,3 +363,6 @@ TODO
     - Is `--seed_from_flat_gates` consistently better than allowed_prefix-only?
 4) **Final ranking fusion**
     - RRF works, but should we tune k or add learned weighting?
+
+
+## Round 3 Comparison Table (refresh)

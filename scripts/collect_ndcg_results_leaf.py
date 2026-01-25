@@ -1,5 +1,6 @@
 import argparse
 import glob
+import json
 import os
 import re
 import sys
@@ -12,8 +13,27 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 from hyperparams import abbreviate_key  # noqa: E402
 
 
-categories=("biology", "earth_science", "psychology", "leetcode", "economics", "robotics", "stackoverflow", "sustainable_living", "pony", "aops", "theoremqa_questions", "theoremqa_theorems")
+categories = (
+    "biology",
+    "earth_science",
+    "psychology",
+    "leetcode",
+    "economics",
+    "robotics",
+    "stackoverflow",
+    "sustainable_living",
+    "pony",
+    "aops",
+    "theoremqa_questions",
+    "theoremqa_theorems",
+)
 _PARAM_START_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*=")
+
+
+def _normalize_glob_pattern(pattern: str) -> str:
+    if any(ch in pattern for ch in ["*", "?", "["]):
+        return pattern
+    return f"*{pattern}*"
 
 
 def _split_param_tokens(segment: str) -> List[str]:
@@ -30,11 +50,6 @@ def _split_param_tokens(segment: str) -> List[str]:
     tokens.append(segment[start:])
     return [t for t in tokens if t]
 
-def _normalize_glob_pattern(pattern: str) -> str:
-    if any(ch in pattern for ch in ["*", "?", "["]):
-        return pattern
-    return f"*{pattern}*"
-
 
 def _find_metrics_files(base_dir: str, include_dir: Optional[str]) -> List[str]:
     metrics_files: List[str] = []
@@ -50,56 +65,13 @@ def _find_metrics_files(base_dir: str, include_dir: Optional[str]) -> List[str]:
                 continue
             seen_roots.add(root)
             for walk_root, _dirs, files in os.walk(root):
-                if "all_eval_metrics.pkl" in files:
-                    metrics_files.append(os.path.join(walk_root, "all_eval_metrics.pkl"))
-                    continue
-                legacy = [f for f in files if f.startswith("all_eval_metrics-") and f.endswith(".pkl")]
-                for fname in legacy:
-                    metrics_files.append(os.path.join(walk_root, fname))
+                if "leaf_iter_metrics.jsonl" in files:
+                    metrics_files.append(os.path.join(walk_root, "leaf_iter_metrics.jsonl"))
     else:
         for root, _dirs, files in os.walk(base_dir):
-            if "all_eval_metrics.pkl" in files:
-                metrics_files.append(os.path.join(root, "all_eval_metrics.pkl"))
-                continue
-            legacy = [f for f in files if f.startswith("all_eval_metrics-") and f.endswith(".pkl")]
-            for fname in legacy:
-                metrics_files.append(os.path.join(root, fname))
+            if "leaf_iter_metrics.jsonl" in files:
+                metrics_files.append(os.path.join(root, "leaf_iter_metrics.jsonl"))
     return metrics_files
-
-
-def _extract_ndcg_means(df: pd.DataFrame, iter_idx: int) -> Optional[float]:
-    if hasattr(df.columns, "levels"):
-        iter_key = f"Iter {iter_idx}"
-        if iter_key not in df.columns.levels[0]:
-            return None
-        if "nDCG@10" not in df[iter_key].columns:
-            return None
-        return float(df[iter_key]["nDCG@10"].mean())
-    if iter_idx != 0:
-        return None
-    if "nDCG@10" not in df.columns:
-        return None
-    return float(df["nDCG@10"].mean())
-
-
-def _extract_max_ndcg(df: pd.DataFrame) -> Tuple[Optional[float], Optional[int]]:
-    if hasattr(df.columns, "levels"):
-        best_val = None
-        best_iter = None
-        for iter_key in df.columns.levels[0]:
-            if not isinstance(iter_key, str) or not iter_key.startswith("Iter "):
-                continue
-            if "nDCG@10" not in df[iter_key].columns:
-                continue
-            mean_val = float(df[iter_key]["nDCG@10"].mean())
-            iter_idx = int(iter_key.split("Iter ")[-1])
-            if best_val is None or mean_val > best_val:
-                best_val = mean_val
-                best_iter = iter_idx
-        return best_val, best_iter
-    if "nDCG@10" not in df.columns:
-        return None, None
-    return float(df["nDCG@10"].mean()), 0
 
 
 def _build_drop_map(drop_params: List[str]) -> Dict[str, str]:
@@ -134,8 +106,6 @@ def _relative_experiment_id(base_dir: str, metrics_path: str, drop_map: Dict[str
         kept.append(token)
     cleaned = "-".join(kept)
     parts = cleaned.split(os.sep) if cleaned else []
-    # category = parts[0] if parts else "unknown"
-    # category name should be one of predefined categories
     category = "unknown"
     for cat in categories:
         if parts[0].startswith(cat):
@@ -149,6 +119,20 @@ def _relative_experiment_id(base_dir: str, metrics_path: str, drop_map: Dict[str
     return category, cleaned
 
 
+def _load_leaf_metrics(metrics_path: str) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    with open(metrics_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    return pd.DataFrame(rows)
+
+
 def collect_ndcg_results(
     base_dir: str,
     drop_map: Dict[str, str],
@@ -160,17 +144,22 @@ def collect_ndcg_results(
         if any(f"{os.sep}{subdir}{os.sep}" in metrics_path for subdir in exclude_subdirs):
             print(f"Skipping excluded path: {metrics_path}")
             continue
-        try:
-            df = pd.read_pickle(metrics_path)
-        except Exception:
-            print(f"Warning: Failed to read metrics file: {metrics_path}")
+        df = _load_leaf_metrics(metrics_path)
+        if df.empty:
             continue
         category, exp_id = _relative_experiment_id(base_dir, metrics_path, drop_map)
-        max_ndcg, max_iter = _extract_max_ndcg(df)
+        if "iter" not in df.columns or "nDCG@10" not in df.columns:
+            continue
+        grouped = df.groupby("iter")["nDCG@10"].mean()
+        if grouped.empty:
+            continue
+        iter0 = float(grouped.loc[0]) if 0 in grouped.index else None
+        max_iter = int(grouped.idxmax())
+        max_ndcg = float(grouped.loc[max_iter])
         records.append({
             "category": category,
             "experiment": exp_id,
-            "ndcg_iter0": round(_extract_ndcg_means(df, 0), 2),
+            "ndcg_iter0": round(iter0, 2) if iter0 is not None else None,
             "ndcg_max": round(max_ndcg, 2),
             "ndcg_max_iter": max_iter,
         })
@@ -194,11 +183,11 @@ def _format_wide_results(df: pd.DataFrame) -> pd.DataFrame:
     wide = wide.reset_index()
     return wide
 
-
+# python scripts/collect_ndcg_results_leaf.py --include_dir *baseline*
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Collect nDCG@10 results for iter 0 and iter 3.")
+    parser = argparse.ArgumentParser(description="Collect leaf-only nDCG@10 results (run_leaf_rank).")
     parser.add_argument("--base_dir", type=str, default="results/BRIGHT", help="Base results directory")
-    parser.add_argument("--out_csv", type=str, default="results/BRIGHT/ndcg_summary.csv", help="Output CSV path")
+    parser.add_argument("--out_csv", type=str, default="results/BRIGHT/ndcg_summary_leaf.csv", help="Output CSV path")
     parser.add_argument("--exclude_subdir", action="append", default=["260116", "260121"], help="Subdirectory name to exclude")
     parser.add_argument(
         "--include_dir",
@@ -211,7 +200,6 @@ def main() -> None:
         action="append",
         default=[
             "tree_version=bottom-up",
-            "tree_version=top-down",
             "tree_pred_version=5",
             "reasoning_in_traversal_prompt=/1",
             "num_leaf_calib=10",
@@ -236,8 +224,9 @@ def main() -> None:
         base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), base_dir)
     if not os.path.isabs(out_csv):
         out_csv = os.path.join(os.path.dirname(os.path.dirname(__file__)), out_csv)
-    out_csv = out_csv[:-4] + args.include_dir.replace("*", "") + out_csv[-4:] if args.include_dir else out_csv
-    print(f"Collecting nDCG@10 results from {base_dir}...")
+    if args.include_dir:
+        out_csv = out_csv[:-4] + args.include_dir.replace("*", "") + out_csv[-4:]
+    print(f"Collecting leaf-only nDCG@10 results from {base_dir}...")
     drop_map = _build_drop_map(args.drop_param)
     df = collect_ndcg_results(base_dir, drop_map, args.exclude_subdir, args.include_dir)
     wide_df = _format_wide_results(df)

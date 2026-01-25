@@ -37,6 +37,8 @@ class Round3Sample:
     excluded_ids: List[str]
     last_rewrite: str = ""
     last_action: str = "exploit"
+    last_actions: Dict[str, str] = None
+    last_possible_docs: Dict[str, str] = None
     rewrite_history: List[Dict] = None
     iter_records: List[Dict] = None
 
@@ -45,6 +47,10 @@ class Round3Sample:
             self.rewrite_history = []
         if self.iter_records is None:
             self.iter_records = []
+        if self.last_actions is None:
+            self.last_actions = {}
+        if self.last_possible_docs is None:
+            self.last_possible_docs = {}
 
     def to_dict(self) -> Dict:
         return {
@@ -53,26 +59,39 @@ class Round3Sample:
             "excluded_ids": self.excluded_ids,
             "last_rewrite": self.last_rewrite,
             "last_action": self.last_action,
+            "last_actions": self.last_actions,
+            "last_possible_docs": self.last_possible_docs,
             "rewrite_history": self.rewrite_history,
             "iter_records": self.iter_records,
         }
+
+
+CATEGORY_ORDER = ["Theory", "Entity", "Example", "Other"]
 
 
 def _format_action_prompt(
     template: str,
     original_query: str,
     previous_rewrite: str,
+    previous_docs: Dict[str, str],
     leaf_descs: List[str],
     branch_descs: List[str],
 ) -> str:
     leaf_blob = "\n".join([x for x in leaf_descs if x])
     branch_blob = "\n".join([x for x in branch_descs if x])
+    prev_lines = []
+    for key in CATEGORY_ORDER:
+        val = (previous_docs or {}).get(key, "")
+        if val:
+            prev_lines.append(f"- {key}: {val}")
+    prev_blob = "\n".join(prev_lines) if prev_lines else "None"
     if not branch_blob:
         template = template.replace("Branch Context:\n{branch_descs}\n", "")
     try:
         return template.format(
             original_query=(original_query or ""),
             previous_rewrite=(previous_rewrite or ""),
+            previous_docs=prev_blob,
             leaf_descs=leaf_blob,
             branch_descs=branch_blob,
         )
@@ -81,12 +100,20 @@ def _format_action_prompt(
             template
             .replace("{original_query}", original_query or "")
             .replace("{previous_rewrite}", previous_rewrite or "")
+            .replace("{previous_docs}", prev_blob)
             .replace("{leaf_descs}", leaf_blob)
             .replace("{branch_descs}", branch_blob)
         )
 
 
-def _parse_action_rewrite(text: str) -> Tuple[str, str]:
+def _normalize_action(value: object) -> str:
+    action = str(value or "").strip().upper()
+    if action not in {"EXPLORE", "EXPLOIT", "PRUNE"}:
+        return "EXPLOIT"
+    return action
+
+
+def _parse_action_output(text: str) -> Tuple[Dict[str, str] | None, Dict[str, str] | None, str, str]:
     cleaned = text.split("</think>\n")[-1].strip()
     if "```" in cleaned:
         try:
@@ -114,33 +141,64 @@ def _parse_action_rewrite(text: str) -> Tuple[str, str]:
         except Exception:
             obj = None
     if isinstance(obj, dict):
-        action = str(obj.get("action", "exploit")).strip().lower()
-        if action not in {"explore", "exploit"}:
-            action = "exploit"
+        raw_actions = obj.get("Actions") or obj.get("actions") or {}
+        raw_docs = obj.get("Possible_Answer_Docs") or obj.get("possible_answer_docs") or {}
+        actions: Dict[str, str] = {}
+        docs: Dict[str, str] = {}
+        if isinstance(raw_actions, dict) and raw_actions:
+            for key in CATEGORY_ORDER:
+                if key in raw_actions:
+                    actions[key] = _normalize_action(raw_actions.get(key))
+        if isinstance(raw_docs, dict) and raw_docs:
+            for key in CATEGORY_ORDER:
+                val = raw_docs.get(key, "")
+                if isinstance(val, (list, dict)):
+                    val = json.dumps(val, ensure_ascii=False)
+                if isinstance(val, str) and val.strip():
+                    docs[key] = val.strip()
+        if actions:
+            return actions, docs, "", ""
+        action = _normalize_action(obj.get("action") or obj.get("Action") or "EXPLOIT").lower()
+        rewrite = ""
         if "Possible_Answer_Docs" in obj:
             docs_map = obj.get("Possible_Answer_Docs")
             if isinstance(docs_map, dict):
-                flattened = "\n".join([str(v) for v in docs_map.values() if v])
-                return action, flattened.strip()
-            if isinstance(docs_map, list):
-                flattened = "\n".join([str(v) for v in docs_map if v])
-                return action, flattened.strip()
-        rewrite = obj.get("rewrite", "")
-        if isinstance(rewrite, (list, dict)):
-            rewrite = json.dumps(rewrite, ensure_ascii=False)
-        return action, str(rewrite or "").strip()
-    return "exploit", cleaned.strip()
+                rewrite = "\n".join([str(v) for v in docs_map.values() if v]).strip()
+            elif isinstance(docs_map, list):
+                rewrite = "\n".join([str(v) for v in docs_map if v]).strip()
+        if not rewrite:
+            raw_rewrite = obj.get("rewrite") or ""
+            if isinstance(raw_rewrite, (list, dict)):
+                raw_rewrite = json.dumps(raw_rewrite, ensure_ascii=False)
+            rewrite = str(raw_rewrite or "").strip()
+        return None, None, action, rewrite
+    return None, None, "exploit", cleaned.strip()
 
 
-def _apply_action_rewrite(original_query: str, action: str, rewrite: str, explore_mode: str) -> str:
+def _flatten_docs_by_action(docs: Dict[str, str], actions: Dict[str, str]) -> str:
+    pieces: List[str] = []
+    for key in CATEGORY_ORDER:
+        action = actions.get(key, "EXPLOIT")
+        if action == "PRUNE":
+            continue
+        text = docs.get(key, "")
+        if text:
+            pieces.append(text)
+    return "\n".join(pieces).strip()
+
+
+def _compose_query_from_docs(original_query: str, docs: Dict[str, str], actions: Dict[str, str]) -> str:
+    blob = _flatten_docs_by_action(docs, actions)
+    if not blob:
+        return original_query
+    return (original_query + " " + blob).strip()
+
+
+def _apply_action_rewrite(original_query: str, action: str, rewrite: str) -> str:
     rewrite = (rewrite or "").strip()
     if not rewrite:
         return original_query
-    if action == "explore":
-        if explore_mode == "original":
-            return original_query
-        return rewrite
-    return (original_query + " " + rewrite).strip() # action == exploit
+    return (original_query + " " + rewrite).strip()  # always keep original; explore still concatenates
 
 
 def _hits_to_context_descs(
@@ -241,11 +299,12 @@ def _retrieve_hits_subset(
     return hits
 
 
-def _load_rewrite_action_cache(path: str, force_refresh: bool) -> Tuple[Dict[str, str], Dict[str, str]]:
+def _load_rewrite_action_cache(path: str, force_refresh: bool) -> Tuple[Dict[str, str], Dict[str, object], Dict[str, Dict[str, str]]]:
     rewrite_map: Dict[str, str] = {}
-    action_map: Dict[str, str] = {}
+    action_map: Dict[str, object] = {}
+    docs_map: Dict[str, Dict[str, str]] = {}
     if not path or force_refresh or (not os.path.exists(path)):
-        return rewrite_map, action_map
+        return rewrite_map, action_map, docs_map
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -257,9 +316,13 @@ def _load_rewrite_action_cache(path: str, force_refresh: bool) -> Tuple[Dict[str
                 continue
             if "rewritten_query" in rec:
                 rewrite_map[str(key)] = str(rec.get("rewritten_query", ""))
-            if "action" in rec:
+            if "actions" in rec and isinstance(rec.get("actions"), dict):
+                action_map[str(key)] = rec.get("actions")
+            elif "action" in rec:
                 action_map[str(key)] = str(rec.get("action", "exploit")).strip().lower()
-    return rewrite_map, action_map
+            if "possible_answer_docs" in rec and isinstance(rec.get("possible_answer_docs"), dict):
+                docs_map[str(key)] = rec.get("possible_answer_docs")
+    return rewrite_map, action_map, docs_map
 
 
 hp = HyperParams.from_args()
@@ -323,7 +386,7 @@ if hp.REWRITE_PROMPT_PATH:
         raise ValueError(f"--rewrite_prompt_path not found: {hp.REWRITE_PROMPT_PATH}")
     with open(hp.REWRITE_PROMPT_PATH, "r", encoding="utf-8") as f:
         rewrite_template = f.read()
-rewrite_map, action_map = _load_rewrite_action_cache(hp.REWRITE_CACHE_PATH, hp.REWRITE_FORCE_REFRESH)
+rewrite_map, action_map, docs_map = _load_rewrite_action_cache(hp.REWRITE_CACHE_PATH, hp.REWRITE_FORCE_REFRESH)
 
 if rewrite_template is None:
     rewrite_template = REWRITE_PROMPT_TEMPLATES["round3_action_v1"]
@@ -381,7 +444,10 @@ for iter_idx in range(hp.NUM_ITERS):
     for sample in all_eval_samples:
         if iter_idx == 0 and sample is all_eval_samples[0]:
             logger.info("Iter %d: starting anchor retrieval", iter_idx)
-        anchor_query = _apply_action_rewrite(sample.original_query, sample.last_action, sample.last_rewrite, hp.ROUND3_EXPLORE_MODE)
+        if sample.last_possible_docs:
+            anchor_query = _compose_query_from_docs(sample.original_query, sample.last_possible_docs, sample.last_actions)
+        else:
+            anchor_query = _apply_action_rewrite(sample.original_query, sample.last_action, sample.last_rewrite)
         hits = flat_retrieve_hits(
             retriever=retriever,
             query=anchor_query,
@@ -431,21 +497,34 @@ for iter_idx in range(hp.NUM_ITERS):
                 branch_descs = []
 
             cache_descs = [f"LEAF: {d}" for d in leaf_descs] + [f"BRANCH: {d}" for d in branch_descs]
+            prev_blob = "\n".join([f"{k}: {v}" for k, v in sample.last_possible_docs.items() if v])
             cache_key = _rewrite_cache_key(
                 "round3",
-                sample.original_query,
+                f"{sample.original_query}||{prev_blob}",
                 cache_descs,
                 iter_idx=iter_idx,
             )
             if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
                 rewrite = rewrite_map[cache_key]
-                action = action_map.get(cache_key, "exploit")
-                sample.last_rewrite = rewrite
-                sample.last_action = action
+                cached_actions = action_map.get(cache_key)
+                cached_docs = docs_map.get(cache_key, {})
+                if isinstance(cached_actions, dict):
+                    sample.last_actions = cached_actions
+                    sample.last_possible_docs = cached_docs
+                    sample.last_rewrite = rewrite
+                    sample.last_action = "exploit"
+                else:
+                    action = str(cached_actions or "exploit").strip().lower()
+                    sample.last_rewrite = rewrite
+                    sample.last_action = action
+                    sample.last_actions = {}
+                    sample.last_possible_docs = {}
                 sample.rewrite_history.append({
                     "iter": iter_idx,
                     "cache_hit": True,
-                    "action": action,
+                    "action": sample.last_action,
+                    "actions": sample.last_actions,
+                    "possible_docs": sample.last_possible_docs,
                     "rewrite": rewrite,
                 })
             else:
@@ -453,6 +532,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     rewrite_template,
                     sample.original_query,
                     sample.last_rewrite,
+                    sample.last_possible_docs,
                     leaf_descs,
                     branch_descs,
                 )
@@ -478,22 +558,37 @@ for iter_idx in range(hp.NUM_ITERS):
 
         new_records = []
         for meta, out in zip(rewrite_meta, rewrite_outputs):
-            action, rewrite = _parse_action_rewrite(out)
+            actions, docs, action, rewrite = _parse_action_output(out)
             sample = meta["sample"]
-            sample.last_rewrite = rewrite
-            sample.last_action = action
+            if actions:
+                sample.last_actions = actions
+                sample.last_possible_docs = docs or {}
+                sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
+                sample.last_action = "exploit"
+                rewrite = sample.last_rewrite
+            else:
+                sample.last_rewrite = rewrite
+                sample.last_action = action
+                sample.last_actions = {}
+                sample.last_possible_docs = {}
             sample.rewrite_history.append({
                 "iter": iter_idx,
                 "cache_hit": False,
-                "action": action,
+                "action": sample.last_action,
+                "actions": sample.last_actions,
+                "possible_docs": sample.last_possible_docs,
                 "rewrite": rewrite,
             })
             rewrite_map[meta["cache_key"]] = rewrite
-            action_map[meta["cache_key"]] = action
+            action_map[meta["cache_key"]] = sample.last_actions if sample.last_actions else sample.last_action
+            if sample.last_possible_docs:
+                docs_map[meta["cache_key"]] = sample.last_possible_docs
             new_records.append({
                 "key": meta["cache_key"],
                 "rewritten_query": rewrite,
-                "action": action,
+                "action": sample.last_action if not sample.last_actions else None,
+                "actions": sample.last_actions if sample.last_actions else None,
+                "possible_answer_docs": sample.last_possible_docs if sample.last_possible_docs else None,
                 "prompt_name": hp.REWRITE_PROMPT_NAME,
                 "llm": hp.LLM,
                 "leaf_descs": meta.get("leaf_descs", []),
@@ -510,7 +605,10 @@ for iter_idx in range(hp.NUM_ITERS):
         branch_paths_by_sample,
         densities_by_sample,
     ):
-        query_t = _apply_action_rewrite(sample.original_query, sample.last_action, sample.last_rewrite, hp.ROUND3_EXPLORE_MODE)
+        if sample.last_possible_docs:
+            query_t = _compose_query_from_docs(sample.original_query, sample.last_possible_docs, sample.last_actions)
+        else:
+            query_t = _apply_action_rewrite(sample.original_query, sample.last_action, sample.last_rewrite)
         local_leaf_indices = _filter_leaf_indices_by_prefixes(leaf_indices, leaf_paths, active_paths)
         local_leaf_embs = node_embs[local_leaf_indices] if local_leaf_indices else np.zeros((0, node_embs.shape[1]), dtype=node_embs.dtype)
         local_hits = _retrieve_hits_subset(
@@ -549,6 +647,8 @@ for iter_idx in range(hp.NUM_ITERS):
         sample.iter_records.append({
             "iter": iter_idx,
             "action": sample.last_action,
+            "actions": sample.last_actions,
+            "possible_docs": sample.last_possible_docs,
             "rewrite": sample.last_rewrite,
             "query_t": query_t,
             "anchor_leaf_paths": [h.path for h in leaf_hits],

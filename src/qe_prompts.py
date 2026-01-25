@@ -56,4 +56,12 @@ QE_PROMPT_TEMPLATES = {
         "}\n\n"
         "Original Query:\n{query}\n"
     ),
+    "thinkqe": (
+        "Given a query, rewrite it into a better retrieval query that targets the evidence needed to answer it.\n"
+        "- Use your own knowledge to propose abstract evidence (theories, mechanisms, entities, methods).\n"
+        "- Do NOT rely on any retrieved passages (none are provided).\n"
+        "- Output ONLY the rewritten query text.\n\n"
+        "Query:\n{query}\n"
+    )
+
 }

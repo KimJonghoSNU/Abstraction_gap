@@ -2,20 +2,18 @@
 
 # Create log file with timestamp
 mkdir -p ../logs
-LOG_FILE="../logs/run_round3_explore_mode_ablation_$(date '+%Y_%m_%d').log"
+LOG_FILE="../logs/run_round3_action_levels_ablation_$(date '+%Y_%m_%d').log"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting run_round3_explore_mode_ablation.sh script"
+log "Starting run_round3_action_levels_ablation.sh script"
 
 RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
 NODE_EMB_BASE="../trees/BRIGHT"
 
 CACHE_BASE_ROOT="/data4/jongho/Search-o1/data/QA_Datasets/bright/cache"
-REWRITE_PROMPT_NAME="round3_action_v1"
-REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${REWRITE_PROMPT_NAME}"
 
 COMMON_PARAMS=(
     --reasoning_in_traversal_prompt -1
@@ -28,29 +26,47 @@ COMMON_PARAMS=(
     --llm_api_max_retries 3
 
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
-    --flat_topk 100
-    --rewrite_prompt_name "$REWRITE_PROMPT_NAME"
+    --flat_topk 1000
     --rewrite_every 1
     --rewrite_context_topk 5
     --round3_rewrite_context leaf
 )
 
 RUN_SUBSETS=(
-    "biology"
-    "psychology"
+    # "biology"
+    # "psychology"
+    # "leetcode"
+    "theoremqa_theorems"
 )
 
-EXPLORE_MODES=(
-    "replace"
-    "original"
+# subset -> tree_version (from trees/BRIGHT/*)
+declare -A TREE_VERSION_MAP=(
+    ["aops"]="top-down"
+    ["biology"]="bottom-up"
+    ["earth_science"]="bottom-up"
+    ["economics"]="bottom-up"
+    ["leetcode"]="top-down"
+    ["pony"]="bottom-up"
+    ["psychology"]="bottom-up"
+    ["robotics"]="bottom-up"
+    ["stackoverflow"]="bottom-up"
+    ["sustainable_living"]="bottom-up"
+    ["theoremqa_questions"]="top-down"
+    ["theoremqa_theorems"]="top-down"
 )
 
-for subset in "${RUN_SUBSETS[@]}"; do
-    for explore_mode in "${EXPLORE_MODES[@]}"; do
-        suffix="round3_explore_${explore_mode}"
+PROMPTS=(
+    "round3_action_v1"
+    "round3_action_levels_v1"
+)
+
+for prompt in "${PROMPTS[@]}"; do
+    for subset in "${RUN_SUBSETS[@]}"; do
+        suffix="round3_${prompt}"
         NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.diver.npy"
-        REWRITE_CACHE_TAG="round3_explore_${explore_mode}"
-        REWRITE_CACHE_PATH="${REWRITE_CACHE_BASE}/${subset}_${REWRITE_PROMPT_NAME}_${REWRITE_CACHE_TAG}.jsonl"
+        REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${prompt}"
+        REWRITE_CACHE_TAG="round3_${prompt}"
+        REWRITE_CACHE_PATH="${REWRITE_CACHE_BASE}/${subset}_${prompt}_${REWRITE_CACHE_TAG}.jsonl"
 
         final_args=()
         i=0
@@ -67,10 +83,15 @@ for subset in "${RUN_SUBSETS[@]}"; do
 
         final_args+=("--node_emb_path" "$NODE_EMB_PATH")
         final_args+=("--rewrite_cache_path" "$REWRITE_CACHE_PATH")
+        final_args+=("--rewrite_prompt_name" "$prompt")
         final_args+=("--subset" "$subset")
-        final_args+=("--tree_version" "bottom-up")
+        tree_version="${TREE_VERSION_MAP[$subset]}"
+        if [[ -z "$tree_version" ]]; then
+            log "Missing tree version for subset=${subset}"
+            exit 1
+        fi
+        final_args+=("--tree_version" "$tree_version")
         final_args+=("--suffix" "$suffix")
-        final_args+=("--round3_explore_mode" "$explore_mode")
 
         cmd=( python run_round3.py "${final_args[@]}" )
         printf -v cmd_str '%q ' "${cmd[@]}"
@@ -78,11 +99,11 @@ for subset in "${RUN_SUBSETS[@]}"; do
 
         "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
         if [ ${PIPESTATUS[0]} -ne 0 ]; then
-            log "Error in subset=${subset} explore_mode=${explore_mode}"
+            log "Error in subset=${subset} prompt=${prompt}"
             exit 1
         fi
 
-        log "Completed subset=${subset} explore_mode=${explore_mode}"
+        log "Completed subset=${subset} prompt=${prompt}"
         log "---"
     done
 done

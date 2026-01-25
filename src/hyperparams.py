@@ -157,16 +157,18 @@ class HyperParams(argparse.Namespace):
             '--rewrite_context_source',
             type=str,
             default='mixed',
-            choices=['flat', 'slate', 'fused', 'mixed'],
+            choices=['flat', 'slate', 'fused', 'mixed', 'leafslate'],
             help=(
                 "Context source for rewrite: "
                 "flat=topk descriptions from flat retrieval; "
                 "slate=topk descriptions from current traversal slates; "
                 "fused=RRF fusion of flat-retrieval leaf ranks and traversal leaf ranks; "
-                "mixed=RRF fusion of fused (if available) and slate ranks."
+                "mixed=RRF fusion of fused (if available) and slate ranks; "
+                "leafslate=traversal leaf hits (if any) + branch nodes from slates."
             ),
         )
         parser.add_argument('--rewrite_at_start', default=False, action='store_true', help='Run rewrite once before the first traversal iteration')
+        parser.add_argument('--leaf_only_retrieval', default=False, action='store_true', help='Restrict flat retrieval to leaf nodes only (used in run_leaf_rank.py)')
 
         # Round 3 (run_round3.py)
         parser.add_argument('--round3_anchor_topk', type=int, default=None, help='Top-K for anchor flat retrieval (defaults to flat_topk)')
@@ -176,8 +178,6 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--round3_rewrite_context', type=str, default='leaf', choices=['leaf', 'leaf_branch'],
                             help='Rewrite context evidence: leaf=leaf-only; leaf_branch=leaf evidence + branch context')
         parser.add_argument('--round3_rewrite_once', default=False, action='store_true', help='Rewrite only at iter 0 in round3')
-        parser.add_argument('--round3_explore_mode', type=str, default='replace', choices=['replace', 'original'],
-                            help='Round3 explore query: replace=use rewrite only, original=ignore rewrite and use original query')
         
         # Parse arguments
         parsed_args = parser.parse_args(args.split() if args else None)

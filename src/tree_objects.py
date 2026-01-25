@@ -269,6 +269,7 @@ class InferSample(object):
         'num_leaf_calib',
         'excluded_ids_set',
         'rewrite_history',
+        'qe_expanded_query',
     ]
 
   def seed_beam_from_gate_paths(self, gate_paths, gate_scores=None):

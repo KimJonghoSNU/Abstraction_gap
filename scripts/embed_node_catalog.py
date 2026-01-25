@@ -41,6 +41,7 @@ def main() -> None:
     texts = [str(rec.get("desc", "")) for rec in catalog]
     model = DiverEmbeddingModel(args.model_path, local_files_only=True)
     # with torch.infererence_mode():
+    print("Computing embeddings...")
     embs = model.encode_docs(texts, max_length=args.max_length, batch_size=args.batch_size)
 
     os.makedirs(os.path.dirname(args.out_npy) or ".", exist_ok=True)

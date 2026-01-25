@@ -26,103 +26,30 @@ from utils import (
 )
 
 
-# - 초기화: 기존 문서 임베딩 전체를 대상으로 flat retrieval을 수행한다.
+# - 초기화: flat retrieval을 수행한다.
 #   - iter=0 (첫 반복):
-#       - flat retrieval 결과에서 branch 노드만 추려서 rewrite context를 만든다.
+#       - rewrite context는 leaf-only로 구성한다.
 #       - 이 context로 query rewrite를 1회 수행한다.
 #   - iter>=1 (이후 반복):
 #       - 매 iter마다 flat retrieval을 다시 수행한다.
-#       - retrieval 결과 전체(leaf+branch)를 그대로 rewrite context로 사용한다.
+#       - rewrite context는 leaf-only로 구성한다.
 #       - rewrite는 rewrite_every 주기마다 수행한다.
 #   - 평가(nDCG 등):
 #       - retrieval 결과에서 leaf 노드만 필터링해서 평가한다.
-#       - 즉, branch는 rewrite context에는 들어가지만 평가에서는 제외된다.
 #   - 결과 저장:
 #       - iter별로 leaf_iter_metrics.jsonl에 기록한다.
 #       - 요약 로그는 iter 평균을 출력한다.
 
 #   핵심 포인트
 
-#   - 검색 자체는 항상 “전체 노드(flat)” 대상으로 수행한다.
-#   - branch는 “rewrite에만” 쓰이고, 평가는 “leaf만”으로 계산한다.
+#   - 검색은 leaf-only 옵션에 따라 “leaf만” 또는 “전체 노드(flat)” 대상으로 수행한다.
+#   - rewrite context는 leaf-only로 구성한다.
 #   - rewrite cadence는 rewrite_every에 따르고, rewrite_at_start는 사용하지 않는다.
 
 
 QE_PROMPT_TEMPLATES = {}
 
-REWRITE_PROMPT_TEMPLATES = {
-    "gate_rewrite_v1": (
-        "You are rewriting a search query for reasoning-intensive retrieval.\n\n"
-        "Key idea:\n"
-        "- Assume you already have the correct answer to the user query.\n"
-        "- The documents we want are the ones that would be used as core evidence or justification for that answer.\n"
-        "- These evidence documents are often more abstract than the surface query.\n\n"
-        "Task:\n"
-        "- First, write a 1-2 sentence Plan that states the user's core intent and what kind of evidence would justify the answer.\n"
-        "- Use the context summaries only as hints (not ground truth).\n"
-        "- Produce 2-5 distinct Possible_Answer_Docs that could serve as evidence for the assumed correct answer.\n"
-        "- Avoid near-duplicates; keep each item short and retrieval-friendly.\n"
-        "- Evidence forms may include (not exhaustive): theory/mechanism, entity/fact, analogy/example, method/metric, canonical reference.\n\n"
-        "Output JSON only:\n"
-        "{\n"
-        "  \"Plan\": \"short reasoning\",\n"
-        "  \"Possible_Answer_Docs\": [\n"
-        "    \"...\",\n"
-        "    \"...\",\n"
-        "    \"...\"\n"
-        "  ]\n"
-        "}\n\n"
-        "Original Query:\n{original_query}\n\n"
-        "Previous Rewritten Query:\n{previous_rewrite}\n\n"
-        "Context Summaries:\n{gate_descs}\n"
-    ),
-    "stepback_json": (
-        "Given a query, the provided passages (most of which may be incorrect or irrelevant), and the previous round's answer (if any), "
-        "your goal is to analyze the candidate passages retrieved for the query, "
-        "identify which of them are strictly relevant to the user's true intent, "
-        "and then refine the set of answer documents accordingly. "
-        "Each refined document must be strictly relevant: it should either contain the "
-        "exact answer or provide abstractive-level theory, evidence, or background that is "
-        "necessary for that answer.\n\n"
-        "Output Format:\n"
-        "You must output a single JSON object with the following keys:\n"
-        "- \"Plan\": A detailed string where you analyze availability of information and plan your selection. Follow the planning steps below.\n"
-        "- \"Possible_Answer_Docs\": A JSON object with keys as document types (\"Theory\", \"Entity\", \"Example\", \"Other\") and values as strings representing distinct answer documents.\n\n"
-        "Planning Steps (for the \"Plan\" field):\n"
-        "1. Precisely identify what information the user is seeking "
-        "(e.g., why / how / what / what is this called / which part) and what type of "
-        "answer would satisfy them (e.g., concept name, theory, explanation, concrete "
-        "entity, worked example).\n"
-        "2. If the query is explicitly or implicitly asking 'what is this called?', "
-        "generate diverse hypotheses for the name of the phenomenon, object, or concept.\n"
-        "3. Abstraction: infer which academic terms, scientific theories, mathematical "
-        "models, canonical methods, or standard resources lie behind this question and "
-        "would be cited in a strictly correct answer.\n"
-        "4. Consider alternative ways the answer might be supported: a direct definition, "
-        "background theory, canonical examples, or reference websites.\n"
-        "5. For causal or explanatory questions (why/how), identify multiple theoretical "
-        "frameworks that offer different explanations, including mainstream, alternative, "
-        "and controversial perspectives if mentioned in the query.\n"
-        "6. For each Candidate Passage, judge which part of the user's query does the passage address. Then, "
-        "identify the common wrong direction (topic, answer type, or framing) suggested by "
-        "the Candidate Passages, and treat this as a negative constraint. Plan how to "
-        "refine the answer documents to avoid that direction and instead explore a different, more "
-        "plausible interpretation aligned with the user's wording.\n"
-        "Ensure that every generated document contributes directly and strictly to such an "
-        "answer (no loosely related or merely interesting content).\n\n"
-        "Final Answer Requirements (for the \"Answer documents\" field):\n"
-        "Include 3-5 distinct answer-document entries:\n"
-        "- 1: Concept/Theory-focused (academic terms, principles, models).\n"
-        "- 2: Entity/Fact-focused (specific names, objects, or concrete facts).\n"
-        "- 3: Broad Context/Evidence-focused (surveys, experiments, or background "
-        "that support the answer).\n"
-        "- Document 4–5 (optional): Any additional strictly relevant documents that provide "
-        "alternative but correct perspectives or examples.\n\n"
-        "Original Query:\n{original_query}\n\n"
-        "Previous rewritten query (if any):\n{previous_rewrite}\n\n"
-        "Candidate passages:\n{gate_descs}\n"
-    ),
-}
+from rewrite_prompts import REWRITE_PROMPT_TEMPLATES
 
 
 def _clean_qe_text(text: str) -> str:
@@ -246,7 +173,15 @@ else:
 
 tree_dict = pkl.load(open(f"{BASE_DIR}/trees/{hp.DATASET}/{hp.SUBSET}/tree-{hp.TREE_VERSION}.pkl", "rb"))
 semantic_root_node = SemanticNode().load_dict(tree_dict) if isinstance(tree_dict, dict) else tree_dict
-node_registry = compute_node_registry(semantic_root_node)
+full_node_registry = compute_node_registry(semantic_root_node)
+node_registry = full_node_registry
+leaf_registry_indices = None
+if hp.LEAF_ONLY_RETRIEVAL:
+    leaf_registry_indices = [
+        idx for idx, node in enumerate(full_node_registry)
+        if (not node.child) or (len(node.child) == 0)
+    ]
+    node_registry = [full_node_registry[idx] for idx in leaf_registry_indices]
 all_leaf_nodes = get_all_leaf_nodes_with_path(semantic_root_node)
 doc_id_to_path = {get_node_id(leaf.id, docs_df): path for leaf, path in all_leaf_nodes}
 
@@ -304,8 +239,12 @@ if hp.REWRITE_CACHE_PATH and os.path.exists(hp.REWRITE_CACHE_PATH) and (not hp.R
 from retrievers.diver import DiverEmbeddingModel
 
 node_embs = np.load(hp.NODE_EMB_PATH, allow_pickle=False)
-if node_embs.shape[0] != len(node_registry):
-    raise ValueError(f"node_embs rows ({node_embs.shape[0]}) must match node_registry size ({len(node_registry)})")
+if node_embs.shape[0] != len(full_node_registry):
+    raise ValueError(f"node_embs rows ({node_embs.shape[0]}) must match node_registry size ({len(full_node_registry)})")
+if hp.LEAF_ONLY_RETRIEVAL:
+    if not leaf_registry_indices:
+        raise ValueError("leaf-only retrieval requested but no leaf nodes were found.")
+    node_embs = node_embs[leaf_registry_indices]
 retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
 
 samples = []
@@ -327,7 +266,7 @@ logger.info(f"Loaded {len(samples)} eval samples.")
 metrics_path = f"{RESULTS_DIR}/leaf_iter_metrics.jsonl"
 rewrite_records = []
 
-logger.info("Starting initial branch-only rewrite.")
+logger.info("Starting initial rewrite.")
 init_prompts = []
 init_meta = []
 for sample in samples:
@@ -338,8 +277,11 @@ for sample in samples:
         node_registry=node_registry,
         topk=hp.FLAT_TOPK,
     )
-    branch_hits = [h for h in hits if not h.is_leaf]
-    context_descs = _hits_to_context_descs(branch_hits, node_registry, hp.REWRITE_CONTEXT_TOPK, hp.MAX_DOC_DESC_CHAR_LEN)
+    if hp.LEAF_ONLY_RETRIEVAL:
+        rewrite_hits = [h for h in hits if h.is_leaf]
+    else:
+        rewrite_hits = [h for h in hits if not h.is_leaf]
+    context_descs = _hits_to_context_descs(rewrite_hits, node_registry, hp.REWRITE_CONTEXT_TOPK, hp.MAX_DOC_DESC_CHAR_LEN)
     cache_key = _rewrite_cache_key("leaf_init", sample["original_query"], context_descs, iter_idx=None)
     if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
         rewrite = rewrite_map[cache_key]
@@ -425,8 +367,9 @@ for iter_idx in range(hp.NUM_ITERS):
         rewrite_prompts = []
         rewrite_meta = []
         for sample, hits in zip(samples, iter_hits):
+            rewrite_hits = [h for h in hits if h.is_leaf] if hp.LEAF_ONLY_RETRIEVAL else hits
             context_descs = _hits_to_context_descs(
-                hits,
+                rewrite_hits,
                 node_registry,
                 hp.REWRITE_CONTEXT_TOPK,
                 hp.MAX_DOC_DESC_CHAR_LEN,

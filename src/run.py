@@ -264,6 +264,45 @@ def _get_rewrite_context(
                 return context
     if source == "slate" and sample_slates is not None:
         return _slates_to_context_descs(sample_slates, node_registry, topk, max_desc_len)
+    if source == "leafslate":
+        # leaf hits from traversal (if any) + branch nodes from slates
+        descs: List[str] = []
+        seen_paths: set[tuple[int, ...]] = set()
+        seen_registry: set[int] = set()
+        leaf_ranked = [
+            (tuple(x.path), float(s))
+            for x, s in sample.get_top_predictions(200, rel_fn=sample.get_rel_fn(leaf=True))
+        ]
+        for path, _score in leaf_ranked:
+            node = node_by_path.get(tuple(path))
+            if not node:
+                continue
+            path_key = tuple(path)
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            desc = node.desc
+            if max_desc_len:
+                desc = desc[:max_desc_len]
+            descs.append(desc)
+            if len(descs) >= topk:
+                return descs
+        if sample_slates is not None:
+            for slate in sample_slates:
+                for ridx in slate:
+                    if ridx in seen_registry:
+                        continue
+                    node = node_registry[ridx]
+                    if (node.child is None) or (len(node.child) == 0):
+                        continue
+                    seen_registry.add(ridx)
+                    desc = node.desc
+                    if max_desc_len:
+                        desc = desc[:max_desc_len]
+                    descs.append(desc)
+                    if len(descs) >= topk:
+                        return descs
+        return descs
     # fallback
     context = getattr(sample, "flat_context_descs", [])
     if context:
@@ -315,6 +354,21 @@ def _ranked_paths_from_context_source(
                     continue
                 seen.add(ridx)
                 slate_ranked.append((tuple(node_registry[ridx].path), 1.0))
+        return slate_ranked
+    if source == "leafslate":
+        if not sample_slates:
+            return []
+        slate_ranked = []
+        seen = set()
+        for slate in sample_slates:
+            for ridx in slate:
+                if ridx in seen:
+                    continue
+                node = node_registry[ridx]
+                if (node.child is None) or (len(node.child) == 0):
+                    continue
+                seen.add(ridx)
+                slate_ranked.append((tuple(node.path), 1.0))
         return slate_ranked
     if source == "mixed":
         if not sample_slates:
@@ -422,6 +476,7 @@ if True:
     schema_cache_map = {}
     rewrite_template = None
     rewrite_enabled = bool(hp.REWRITE_PROMPT_NAME or hp.REWRITE_PROMPT_PATH or hp.REWRITE_CACHE_PATH)
+    qe_enabled = bool(hp.QE_PROMPT_NAME or hp.QE_CACHE_PATH)
     pending_gate_idx = None
     if hp.FLAT_THEN_TREE:
         if not hp.RETRIEVER_MODEL_PATH:
@@ -439,7 +494,6 @@ if True:
         ]
         schema_depth1_embs = node_embs[schema_depth1_indices] if schema_depth1_indices else None
 
-        qe_enabled = bool(hp.QE_PROMPT_NAME or hp.QE_CACHE_PATH)
         if hp.PRE_FLAT_REWRITE and qe_enabled:
             logger.warning('QE is ignored when --pre_flat_rewrite is set. Using original query for initial flat retrieval.')
             qe_enabled = False
@@ -609,9 +663,53 @@ if True:
                     })
                 if hp.REWRITE_CACHE_PATH and new_rewrite_records:
                     append_jsonl(hp.REWRITE_CACHE_PATH, new_rewrite_records)
+    if (not hp.FLAT_THEN_TREE) and qe_enabled:
+        logger.info(f'Starting precomputation of query expansions for traversal-only retrieval {hp.QE_CACHE_PATH} {hp.QE_PROMPT_NAME}')
+        if hp.QE_CACHE_PATH and os.path.exists(hp.QE_CACHE_PATH) and (not hp.QE_FORCE_REFRESH):
+            with open(hp.QE_CACHE_PATH, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    if 'query' in rec and 'expanded_query' in rec:
+                        qe_map[str(rec['query'])] = str(rec['expanded_query'])
+        eval_queries = [examples_df.iloc[i]['query'][:hp.MAX_QUERY_CHAR_LEN] for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES))]
+        missing = [q for q in eval_queries if (hp.QE_FORCE_REFRESH or (q not in qe_map))]
+        if len(missing) > 0:
+            qe_template = None
+            if hp.QE_PROMPT_NAME:
+                if hp.QE_PROMPT_NAME not in QE_PROMPT_TEMPLATES:
+                    raise ValueError(f'Unknown --qe_prompt_name "{hp.QE_PROMPT_NAME}". Available: {sorted(QE_PROMPT_TEMPLATES.keys())}')
+                qe_template = QE_PROMPT_TEMPLATES[hp.QE_PROMPT_NAME]
+            if qe_template is None:
+                raise ValueError(
+                    f'QE cache is missing {len(missing)} queries. Provide --qe_prompt_name.'
+                )
+            qe_prompts = [_format_qe_prompt(qe_template, q) for q in missing]
+            qe_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(qe_loop)
+            try:
+                qe_outputs = qe_loop.run_until_complete(llm_api.run_batch(qe_prompts, max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS))
+            finally:
+                qe_loop.close()
+                asyncio.set_event_loop(None)
+            for q, out in zip(missing, qe_outputs):
+                qe_map[q] = _clean_qe_text(out)
+            if hp.QE_CACHE_PATH:
+                os.makedirs(os.path.dirname(hp.QE_CACHE_PATH) or '.', exist_ok=True)
+                with open(hp.QE_CACHE_PATH, 'w', encoding='utf-8') as f:
+                    for q, eq in qe_map.items():
+                        f.write(json.dumps({
+                            'query': q,
+                            'expanded_query': eq,
+                            'prompt_name': hp.QE_PROMPT_NAME,
+                            'llm': hp.LLM,
+                        }, ensure_ascii=False) + '\n')
 
 if not loaded_existing:
     node_by_path = {tuple(node.path): node for node in node_registry}
+    qe_log_count = 0
     for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
         gold_paths = [doc_id_to_path[doc_id] for doc_id in examples_df.iloc[i]['gold_ids'] if doc_id in doc_id_to_path]
         if len(gold_paths) < len(examples_df.iloc[i]['gold_ids']):
@@ -657,6 +755,12 @@ if not loaded_existing:
                 hp.MAX_DOC_DESC_CHAR_LEN,
             )
             query = flat_query
+        else:
+            if qe_enabled:
+                expanded_query = qe_map.get(query, "")
+            else:
+                expanded_query = ""
+            query = _compose_query(query, expanded_query)
 
         sample = InferSample(
             semantic_root_node,
@@ -669,6 +773,17 @@ if not loaded_existing:
             allowed_prefixes=allowed_prefixes,
         )
         sample.original_query = examples_df.iloc[i]['query']
+        if qe_enabled:
+            sample.qe_expanded_query = expanded_query
+            if qe_log_count < 3:
+                logger.info(
+                    "QE sample %d | original=%s | expanded=%s | final=%s",
+                    qe_log_count + 1,
+                    sample.original_query,
+                    expanded_query,
+                    query,
+                )
+                qe_log_count += 1
         sample.last_rewrite_raw = expanded_query if hp.FLAT_THEN_TREE else ""
         sample.schema_labels = schema_labels if hp.FLAT_THEN_TREE else []
         if hp.PRE_FLAT_REWRITE:

@@ -1,23 +1,21 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # Create log file with timestamp
 mkdir -p ../logs
-LOG_FILE="../logs/run_flat_$(date '+%Y_%m_%d').log"
+LOG_FILE="../logs/run_baseline1_tree_iter_rewrite_$(date '+%Y_%m_%d').log"
 
 # Function to log with timestamp
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting run_flat.sh script"
-
-# Edit these paths for your setup
-RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
-NODE_EMB_BASE="../trees/BRIGHT"
+log "Starting run_baseline1_tree_iter_rewrite.sh script"
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
-    --suffix flat_gate
+    --suffix baseline1_tree_iter_rewrite
     --reasoning_in_traversal_prompt -1
     --load_existing
     --num_iters 10
@@ -27,11 +25,12 @@ COMMON_PARAMS=(
     --llm_api_timeout 60
     --llm_api_max_retries 3
 
-    # Flat -> Gate -> Traversal
-    --flat_then_tree
-    --retriever_model_path "$RETRIEVER_MODEL_PATH"
-    --flat_topk 100
-    --gate_branches_topb 10
+    # Rewrite during traversal (no flat)
+    --rewrite_prompt_name thinkqe
+    --rewrite_every 1
+    --rewrite_context_topk 5
+    --rewrite_context_source leafslate
+    --rewrite_mode concat
 )
 
 # Define RUNS directly as strings (space-separated args)
@@ -51,20 +50,6 @@ for idx in "${!RUNS[@]}"; do
     iter_def="${RUNS[idx]}"
     read -r -a ITER_ARR <<< "$iter_def"
 
-    # Extract subset for node embedding path
-    subset=""
-    for ((i=0; i<${#ITER_ARR[@]}; i++)); do
-        if [[ "${ITER_ARR[i]}" == "--subset" ]]; then
-            subset="${ITER_ARR[i+1]}"
-            break
-        fi
-    done
-    if [[ -z "$subset" ]]; then
-        log "Missing --subset in RUNS entry: $iter_def"
-        exit 1
-    fi
-    NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.diver.npy"
-
     # Build final args: first common params, then iteration-specific params
     final_args=()
     i=0
@@ -78,9 +63,6 @@ for idx in "${!RUNS[@]}"; do
         fi
         ((i++))
     done
-
-    # Add node embeddings path for this subset
-    final_args+=("--node_emb_path" "$NODE_EMB_PATH")
 
     # Append iteration-specific params
     final_args+=("${ITER_ARR[@]}")
@@ -100,4 +82,3 @@ for idx in "${!RUNS[@]}"; do
 done
 
 log "All RUNS completed successfully!"
-
