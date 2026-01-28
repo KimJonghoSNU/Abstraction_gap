@@ -178,6 +178,22 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--round3_rewrite_context', type=str, default='leaf', choices=['leaf', 'leaf_branch'],
                             help='Rewrite context evidence: leaf=leaf-only; leaf_branch=leaf evidence + branch context')
         parser.add_argument('--round3_rewrite_once', default=False, action='store_true', help='Rewrite only at iter 0 in round3')
+        parser.add_argument('--round3_explore_mode', type=str, default='replace', choices=['replace', 'concat'],
+                            help='How to combine rewrite with the traversal query in round3')
+        parser.add_argument('--round3_action_oracle', default=False, action='store_true',
+                            help='Generate EXPLORE/EXPLOIT rewrites and pick the best per-query; used in run_round3_oracle.py')
+        parser.add_argument(
+            '--round3_anchor_local_rank',
+            type=str,
+            default='none',
+            choices=['none', 'v1', 'v2'],
+            help=(
+                'Local ranking override from anchor order: '
+                'none=default local ranking; '
+                'v1=replace anchor branches with top descendant leaf for local ranking; '
+                'v2=use v1 behavior and also use those leaves as rewrite context'
+            ),
+        )
         
         # Parse arguments
         parsed_args = parser.parse_args(args.split() if args else None)

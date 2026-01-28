@@ -478,6 +478,23 @@ if True:
     rewrite_enabled = bool(hp.REWRITE_PROMPT_NAME or hp.REWRITE_PROMPT_PATH or hp.REWRITE_CACHE_PATH)
     qe_enabled = bool(hp.QE_PROMPT_NAME or hp.QE_CACHE_PATH)
     pending_gate_idx = None
+    if rewrite_enabled:
+        if hp.REWRITE_PROMPT_NAME:
+            if hp.REWRITE_PROMPT_NAME not in REWRITE_PROMPT_TEMPLATES:
+                raise ValueError(
+                    f'Unknown --rewrite_prompt_name "{hp.REWRITE_PROMPT_NAME}". '
+                    f'Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}'
+                )
+            rewrite_template = REWRITE_PROMPT_TEMPLATES[hp.REWRITE_PROMPT_NAME]
+        if hp.REWRITE_PROMPT_PATH:
+            if not os.path.exists(hp.REWRITE_PROMPT_PATH):
+                raise ValueError(f'--rewrite_prompt_path not found: {hp.REWRITE_PROMPT_PATH}')
+            with open(hp.REWRITE_PROMPT_PATH, 'r', encoding='utf-8') as f:
+                rewrite_template = f.read()
+        if rewrite_template is None and not hp.REWRITE_CACHE_PATH:
+            raise ValueError('--rewrite_prompt_name or --rewrite_prompt_path is required when rewrite is enabled')
+        if hp.REWRITE_CACHE_PATH:
+            rewrite_map, schema_cache_map = load_rewrite_cache(hp.REWRITE_CACHE_PATH, hp.REWRITE_FORCE_REFRESH)
     if hp.FLAT_THEN_TREE:
         if not hp.RETRIEVER_MODEL_PATH:
             raise ValueError('--retriever_model_path is required when --flat_then_tree is set')
@@ -497,23 +514,6 @@ if True:
         if hp.PRE_FLAT_REWRITE and qe_enabled:
             logger.warning('QE is ignored when --pre_flat_rewrite is set. Using original query for initial flat retrieval.')
             qe_enabled = False
-        if rewrite_enabled:
-            if hp.REWRITE_PROMPT_NAME:
-                if hp.REWRITE_PROMPT_NAME not in REWRITE_PROMPT_TEMPLATES:
-                    raise ValueError(
-                        f'Unknown --rewrite_prompt_name "{hp.REWRITE_PROMPT_NAME}". '
-                        f'Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}'
-                    )
-                rewrite_template = REWRITE_PROMPT_TEMPLATES[hp.REWRITE_PROMPT_NAME]
-            if hp.REWRITE_PROMPT_PATH:
-                if not os.path.exists(hp.REWRITE_PROMPT_PATH):
-                    raise ValueError(f'--rewrite_prompt_path not found: {hp.REWRITE_PROMPT_PATH}')
-                with open(hp.REWRITE_PROMPT_PATH, 'r', encoding='utf-8') as f:
-                    rewrite_template = f.read()
-            if rewrite_template is None and not hp.REWRITE_CACHE_PATH:
-                raise ValueError('--rewrite_prompt_name or --rewrite_prompt_path is required when rewrite is enabled')
-            if hp.REWRITE_CACHE_PATH:
-                rewrite_map, schema_cache_map = load_rewrite_cache(hp.REWRITE_CACHE_PATH, hp.REWRITE_FORCE_REFRESH)
         if qe_enabled:
             logger.info(f'Starting precomputation of query expansions for flat->tree retrieval {hp.QE_CACHE_PATH} {hp.QE_PROMPT_NAME}')
             if hp.QE_CACHE_PATH and os.path.exists(hp.QE_CACHE_PATH) and (not hp.QE_FORCE_REFRESH):
@@ -930,6 +930,7 @@ async def retrieval_loop_step(iter_idx: int):  # Make the function asynchronous
     if rewrite_enabled and (hp.REWRITE_EVERY > 0) and ((iter_idx + 1) % hp.REWRITE_EVERY == 0):
       rewrite_prompts = []
       rewrite_meta = []
+      rewrite_log_count = 0
       for sample, sample_slates in zip(all_eval_samples, slates):
         context_descs = _get_rewrite_context(
             sample,
@@ -979,7 +980,10 @@ async def retrieval_loop_step(iter_idx: int):  # Make the function asynchronous
             'prev_rewrite': prev_rewrite,
             'context_descs': context_descs,
             'schema_labels': schema_labels,
+            'log': rewrite_log_count < 3,
         })
+        if rewrite_log_count < 3:
+          rewrite_log_count += 1
       if rewrite_prompts:
         rewrite_outputs = await llm_api.run_batch(
             rewrite_prompts,
@@ -1003,6 +1007,15 @@ async def retrieval_loop_step(iter_idx: int):  # Make the function asynchronous
               'schema_labels': meta.get('schema_labels', []),
               'possible_answer_docs': possible_docs,
           })
+          if meta.get('log'):
+            logger.info(
+              "Rewrite sample | iter=%s | original=%s | prev=%s | rewrite=%s | final=%s",
+              iter_idx,
+              meta['base_query'],
+              meta['prev_rewrite'],
+              rewrite,
+              sample.query,
+            )
           new_rewrite_records.append({
               'key': meta['cache_key'],
               'rewritten_query': rewrite,

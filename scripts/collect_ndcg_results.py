@@ -194,7 +194,7 @@ def _format_wide_results(df: pd.DataFrame) -> pd.DataFrame:
     wide = wide.reset_index()
     return wide
 
-
+# python scripts/collect_ndcg_results.py --include_dir round3
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect nDCG@10 results for iter 0 and iter 3.")
     parser.add_argument("--base_dir", type=str, default="results/BRIGHT", help="Base results directory")

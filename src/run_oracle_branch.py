@@ -13,10 +13,10 @@ from json_repair import repair_json
 from tqdm.autonotebook import tqdm
 
 from cache_utils import _rewrite_cache_key, append_jsonl
-from flat_then_tree import FlatHit, flat_retrieve_hits, is_prefix, rrf_fuse_ranked_paths
+from flat_then_tree import FlatHit, gate_hit, is_prefix, rrf_fuse_ranked_paths
 from hyperparams import HyperParams
 from llm_apis import GenAIAPI, VllmAPI
-from retrievers.diver import DiverEmbeddingModel, cosine_topk
+from retrievers.diver import DiverEmbeddingModel
 from rewrite_prompts import REWRITE_PROMPT_TEMPLATES
 from tree_objects import SemanticNode
 from utils import (
@@ -227,6 +227,30 @@ def _hits_to_context_descs(
     return descs
 
 
+def _paths_to_context_descs(
+    paths: Sequence[Tuple[int, ...]],
+    node_by_path: Dict[Tuple[int, ...], object],
+    topk: int,
+    max_desc_len: int | None,
+) -> List[str]:
+    descs: List[str] = []
+    seen: set[Tuple[int, ...]] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        node = node_by_path.get(tuple(path))
+        if not node:
+            continue
+        desc = node.desc
+        if max_desc_len:
+            desc = desc[:max_desc_len]
+        descs.append(desc)
+        if len(descs) >= topk:
+            return descs
+    return descs
+
+
 def _build_active_branches(
     leaf_hits: Sequence[FlatHit],
     branch_hits: Sequence[FlatHit],
@@ -241,7 +265,7 @@ def _build_active_branches(
     for h in branch_hits:
         branch_scores[h.path] = max(branch_scores.get(h.path, float("-inf")), h.score)
 
-    active = set(leaf_prefix_counts.keys()) | set(branch_scores.keys())
+    active = set(branch_scores.keys())
     leaf_total = max(1, len(leaf_hits))
     densities = {p: leaf_prefix_counts.get(p, 0) / float(leaf_total) for p in active}
     return list(active), densities, branch_scores
@@ -281,26 +305,167 @@ def _filter_leaf_indices_by_prefixes(
     return local_indices
 
 
-def _retrieve_hits_subset(
+def _topk_from_scores(scores: np.ndarray, topk: int) -> Tuple[np.ndarray, np.ndarray]:
+    if topk <= 0 or scores.size == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+    k = min(topk, scores.shape[0])
+    idx = np.argpartition(-scores, kth=k - 1)[:k]
+    idx = idx[np.argsort(-scores[idx])]
+    return idx.astype(np.int64, copy=False), scores[idx].astype(np.float32, copy=False)
+
+
+def _hits_from_scores(
     *,
-    retriever: DiverEmbeddingModel,
-    query: str,
-    node_embs: np.ndarray,
-    subset_indices: Sequence[int],
+    scores: np.ndarray,
+    subset_indices: Sequence[int] | None,
     node_registry: Sequence[object],
     topk: int,
 ) -> List[FlatHit]:
-    if node_embs.size == 0 or len(subset_indices) == 0:
-        return []
-    q_emb = retriever.encode_query(query)
-    k = min(topk, node_embs.shape[0])
-    res = cosine_topk(q_emb, node_embs, k)
+    idx, vals = _topk_from_scores(scores, topk)
     hits: List[FlatHit] = []
-    for ridx, score in zip(res.indices.tolist(), res.scores.tolist()):
-        registry_idx = int(subset_indices[int(ridx)])
+    for ridx, score in zip(idx.tolist(), vals.tolist()):
+        registry_idx = int(ridx if subset_indices is None else subset_indices[int(ridx)])
         node = node_registry[registry_idx]
         hits.append(FlatHit(registry_idx=registry_idx, path=tuple(node.path), score=float(score), is_leaf=node.is_leaf))
     return hits
+
+
+def _anchor_ordered_local_hits(
+    anchor_hits: Sequence[FlatHit],
+    anchor_topk: int,
+    scores_all: np.ndarray,
+    node_registry: Sequence[object],
+    leaf_indices_by_prefix: Dict[Tuple[int, ...], List[int]],
+    fallback_hits: Sequence[FlatHit],
+    local_topk: int,
+) -> List[FlatHit]:
+    ordered: List[FlatHit] = []
+    seen: set[int] = set()
+    for h in anchor_hits[:anchor_topk]:
+        if h.is_leaf:
+            if h.registry_idx in seen:
+                continue
+            ordered.append(h)
+            seen.add(h.registry_idx)
+            continue
+        candidate_indices = leaf_indices_by_prefix.get(h.path, [])
+        if not candidate_indices:
+            continue
+        candidate_scores = scores_all[candidate_indices]
+        if candidate_scores.size == 0:
+            continue
+        order = np.argsort(-candidate_scores)
+        for ridx in order.tolist():
+            leaf_idx = int(candidate_indices[int(ridx)])
+            if leaf_idx in seen:
+                continue
+            node = node_registry[leaf_idx]
+            ordered.append(
+                FlatHit(
+                    registry_idx=leaf_idx,
+                    path=tuple(node.path),
+                    score=float(scores_all[leaf_idx]),
+                    is_leaf=True,
+                )
+            )
+            seen.add(leaf_idx)
+            break
+    if len(ordered) < local_topk:
+        for h in sorted(fallback_hits, key=lambda hit: hit.score, reverse=True):
+            if h.registry_idx in seen:
+                continue
+            ordered.append(h)
+            seen.add(h.registry_idx)
+            if len(ordered) >= local_topk:
+                break
+    return ordered[:local_topk]
+
+
+def _anchor_local_context_paths(
+    anchor_hits: Sequence[FlatHit],
+    anchor_topk: int,
+    scores_all: np.ndarray,
+    node_registry: Sequence[object],
+    leaf_indices_by_prefix: Dict[Tuple[int, ...], List[int]],
+    topk: int,
+) -> List[Tuple[int, ...]]:
+    ordered: List[Tuple[int, ...]] = []
+    seen: set[int] = set()
+    for h in anchor_hits[:anchor_topk]:
+        if h.is_leaf:
+            if h.registry_idx in seen:
+                continue
+            ordered.append(tuple(h.path))
+            seen.add(h.registry_idx)
+            if len(ordered) >= topk:
+                return ordered
+            continue
+        candidate_indices = leaf_indices_by_prefix.get(h.path, [])
+        if not candidate_indices:
+            continue
+        candidate_scores = scores_all[candidate_indices]
+        if candidate_scores.size == 0:
+            continue
+        order = np.argsort(-candidate_scores)
+        for ridx in order.tolist():
+            leaf_idx = int(candidate_indices[int(ridx)])
+            if leaf_idx in seen:
+                continue
+            node = node_registry[leaf_idx]
+            ordered.append(tuple(node.path))
+            seen.add(leaf_idx)
+            if len(ordered) >= topk:
+                return ordered
+            break
+    return ordered
+
+
+def _anchor_branch_hit_ratio(
+    anchor_hits: Sequence[FlatHit],
+    gold_paths: Sequence[Tuple[int, ...]],
+    topk: int,
+) -> float:
+    branches = [h for h in anchor_hits[:topk] if not h.is_leaf]
+    if not branches:
+        return 0.0
+    hit_count = 0
+    for h in branches:
+        if any(is_prefix(h.path, gold) for gold in gold_paths):
+            hit_count += 1
+    return hit_count / float(len(branches))
+
+
+def _oracle_paths_from_anchor(
+    anchor_hits: Sequence[FlatHit],
+    gold_scores: Dict[Tuple[int, ...], float],
+    topk: int,
+) -> Tuple[List[List[int]], List[int]]:
+    ordered: List[List[int]] = []
+    hit_branch_depths: List[int] = []
+    seen: set[Tuple[int, ...]] = set()
+    for h in anchor_hits[:topk]:
+        if h.is_leaf:
+            path = tuple(h.path)
+            if path in seen:
+                continue
+            ordered.append(list(path))
+            seen.add(path)
+            continue
+        # Intent: treat branch hits as oracle jumps to the highest-scoring gold leaf, dropping empty branches.
+        best_path: Tuple[int, ...] | None = None
+        best_score: float | None = None
+        for gold_path, score in gold_scores.items():
+            if not is_prefix(h.path, gold_path):
+                continue
+            if best_score is None or score > best_score:
+                best_score = score
+                best_path = gold_path
+        if best_path is None or best_path in seen:
+            continue
+        ordered.append(list(best_path))
+        seen.add(best_path)
+        hit_branch_depths.append(len(h.path))
+    return ordered, hit_branch_depths
 
 
 def _load_rewrite_action_cache(path: str, force_refresh: bool) -> Tuple[Dict[str, str], Dict[str, object], Dict[str, Dict[str, str]]]:
@@ -309,6 +474,7 @@ def _load_rewrite_action_cache(path: str, force_refresh: bool) -> Tuple[Dict[str
     docs_map: Dict[str, Dict[str, str]] = {}
     if not path or force_refresh or (not os.path.exists(path)):
         return rewrite_map, action_map, docs_map
+    logger.info("Loading rewrite/action cache from %s", path)
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -335,10 +501,13 @@ if not hp.REWRITE_PROMPT_NAME and not hp.REWRITE_PROMPT_PATH and not hp.REWRITE_
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 exp_dir_name = str(hp)
 RESULTS_DIR = f"{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/{exp_dir_name}/"
+if os.path.exists(RESULTS_DIR) and os.listdir(RESULTS_DIR):
+    print(f"Results already exist at {RESULTS_DIR}. Skipping run.")
+    raise SystemExit(0)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 log_path = f"{RESULTS_DIR}/run.log"
 os.makedirs(os.path.dirname(log_path), exist_ok=True)
-logger = setup_logger("lattice_runner_round3", log_path, logging.INFO)
+logger = setup_logger("lattice_runner_oracle_branch", log_path, logging.INFO)
 with open(f"{RESULTS_DIR}/hparams.json", "w", encoding="utf-8") as f:
     json.dump(vars(hp), f, indent=2, ensure_ascii=True, sort_keys=True)
 
@@ -358,6 +527,7 @@ node_registry = compute_node_registry(semantic_root_node)
 all_leaf_nodes = get_all_leaf_nodes_with_path(semantic_root_node)
 doc_id_to_path = {get_node_id(leaf.id, docs_df): path for leaf, path in all_leaf_nodes}
 node_by_path = {tuple(node.path): node for node in node_registry}
+path_to_registry_idx = {tuple(node.path): idx for idx, node in enumerate(node_registry)}
 
 if not hp.RETRIEVER_MODEL_PATH:
     raise ValueError("--retriever_model_path is required")
@@ -372,7 +542,11 @@ retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
 
 leaf_indices = [idx for idx, node in enumerate(node_registry) if node.is_leaf]
 leaf_paths = [tuple(node_registry[idx].path) for idx in leaf_indices]
-leaf_embs = node_embs[leaf_indices] if leaf_indices else np.zeros((0, node_embs.shape[1]), dtype=node_embs.dtype)
+leaf_indices_by_prefix: Dict[Tuple[int, ...], List[int]] = {}
+for idx, path in zip(leaf_indices, leaf_paths):
+    for d in range(1, len(path)):
+        prefix = path[:d]
+        leaf_indices_by_prefix.setdefault(prefix, []).append(idx)
 
 rewrite_enabled = True
 rewrite_template = None
@@ -435,6 +609,12 @@ for i in range(num_samples):
 anchor_topk = hp.ROUND3_ANCHOR_TOPK or hp.FLAT_TOPK
 local_topk = hp.ROUND3_LOCAL_TOPK or hp.FLAT_TOPK
 global_topk = hp.ROUND3_GLOBAL_TOPK
+if int(anchor_topk) < 100:
+    logger.info(
+        "Anchor topk (%d) < 100; AnchorBranchHitRatio@100/Oracle_nDCG@10@100 will use top-%d.",
+        int(anchor_topk),
+        int(anchor_topk),
+    )
 
 all_eval_metric_dfs: List[pd.DataFrame] = []
 for iter_idx in range(hp.NUM_ITERS):
@@ -444,11 +624,22 @@ for iter_idx in range(hp.NUM_ITERS):
     rewrite_prompts: List[str] = []
     rewrite_meta: List[Dict] = []
 
+    anchor_topk_logged = max(1, min(10, int(anchor_topk)))
     anchor_hits_by_sample: List[List[FlatHit]] = []
     leaf_hits_by_sample: List[List[FlatHit]] = []
     branch_hits_by_sample: List[List[FlatHit]] = []
+    local_hits_by_sample: List[List[FlatHit]] = []
+    global_hits_by_sample: List[List[FlatHit]] = []
     branch_paths_by_sample: List[List[Tuple[int, ...]]] = []
     densities_by_sample: List[Dict[Tuple[int, ...], float]] = []
+    retrieval_queries_by_sample: List[str] = []
+    gold_scores_by_sample: List[Dict[Tuple[int, ...], float]] = []
+    oracle_paths_by_sample: List[List[Tuple[int, ...]]] = []
+    oracle_paths_100_by_sample: List[List[Tuple[int, ...]]] = []
+    oracle_branch_depths_by_sample: List[List[int]] = []
+    oracle_branch_depths_100_by_sample: List[List[int]] = []
+    oracle_branch_depths_by_sample: List[List[int]] = []
+    oracle_branch_depths_100_by_sample: List[List[int]] = []
 
     # tqdm shows per-iteration retrieval progress in terminal runs.
     for sample in tqdm(
@@ -470,10 +661,11 @@ for iter_idx in range(hp.NUM_ITERS):
                 sample.last_rewrite,
                 hp.ROUND3_EXPLORE_MODE,
             )
-        hits = flat_retrieve_hits(
-            retriever=retriever,
-            query=anchor_query,
-            node_embs=node_embs,
+        q_emb = retriever.encode_query(anchor_query)
+        scores_all = (node_embs @ q_emb).astype(np.float32, copy=False)
+        hits = _hits_from_scores(
+            scores=scores_all,
+            subset_indices=None,
             node_registry=node_registry,
             topk=anchor_topk,
         )
@@ -487,6 +679,86 @@ for iter_idx in range(hp.NUM_ITERS):
         ranked_branches = _rank_branch_paths(active_branches, densities, branch_scores)
         branch_paths_by_sample.append(ranked_branches)
         densities_by_sample.append(densities)
+        retrieval_queries_by_sample.append(anchor_query)
+        gold_scores: Dict[Tuple[int, ...], float] = {}
+        for gold_path in sample.gold_paths:
+            idx = path_to_registry_idx.get(tuple(gold_path))
+            if idx is None:
+                continue
+            gold_scores[tuple(gold_path)] = float(scores_all[idx])
+        gold_scores_by_sample.append(gold_scores)
+        anchor_k = min(int(anchor_topk), len(hits))
+        anchor_k_100 = min(100, len(hits))
+        oracle_paths_k, oracle_depths_k = _oracle_paths_from_anchor(hits, gold_scores, anchor_k)
+        oracle_paths_100, oracle_depths_100 = _oracle_paths_from_anchor(hits, gold_scores, anchor_k_100)
+        oracle_paths_by_sample.append([tuple(p) for p in oracle_paths_k])
+        oracle_paths_100_by_sample.append([tuple(p) for p in oracle_paths_100])
+        oracle_branch_depths_by_sample.append(oracle_depths_k)
+        oracle_branch_depths_100_by_sample.append(oracle_depths_100)
+        oracle_branch_depths_by_sample.append(oracle_depths_k)
+        oracle_branch_depths_100_by_sample.append(oracle_depths_100)
+
+        local_leaf_indices = _filter_leaf_indices_by_prefixes(leaf_indices, leaf_paths, ranked_branches)
+        if local_leaf_indices:
+            local_scores = scores_all[local_leaf_indices]
+            local_hits = _hits_from_scores(
+                scores=local_scores,
+                subset_indices=local_leaf_indices,
+                node_registry=node_registry,
+                topk=local_topk,
+            )
+        else:
+            local_hits = []
+        if hp.ROUND3_ANCHOR_LOCAL_RANK != "none":
+            local_hits = _anchor_ordered_local_hits(
+                anchor_hits=hits,
+                anchor_topk=anchor_topk_logged,
+                scores_all=scores_all,
+                node_registry=node_registry,
+                leaf_indices_by_prefix=leaf_indices_by_prefix,
+                fallback_hits=local_hits,
+                local_topk=local_topk,
+            )
+        elif anchor_topk_logged > 0:
+            anchor_branch_paths = [h.path for h in hits[:anchor_topk_logged] if not h.is_leaf]
+            if anchor_branch_paths:
+                seen_ids = {h.registry_idx for h in local_hits}
+                extra_hits: List[FlatHit] = []
+                for branch_path in anchor_branch_paths:
+                    candidate_indices = leaf_indices_by_prefix.get(branch_path, [])
+                    if not candidate_indices:
+                        continue
+                    candidate_scores = scores_all[candidate_indices]
+                    if candidate_scores.size == 0:
+                        continue
+                    order = np.argsort(-candidate_scores)
+                    for ridx in order.tolist():
+                        leaf_idx = int(candidate_indices[int(ridx)])
+                        if leaf_idx in seen_ids:
+                            continue
+                        node = node_registry[leaf_idx]
+                        extra_hits.append(
+                            FlatHit(
+                                registry_idx=leaf_idx,
+                                path=tuple(node.path),
+                                score=float(scores_all[leaf_idx]),
+                                is_leaf=True,
+                            )
+                        )
+                        seen_ids.add(leaf_idx)
+                        break
+                if extra_hits:
+                    local_hits.extend(extra_hits)
+                    local_hits = sorted(local_hits, key=lambda h: h.score, reverse=True)[:local_topk]
+        global_scores = scores_all[leaf_indices]
+        global_hits = _hits_from_scores(
+            scores=global_scores,
+            subset_indices=leaf_indices,
+            node_registry=node_registry,
+            topk=global_topk,
+        )
+        local_hits_by_sample.append(local_hits)
+        global_hits_by_sample.append(global_hits)
 
         # NOTE: In this dataset, leaf depth is always > 1. If depth-1 leaves appear later,
         # they will not contribute prefixes to B_active.
@@ -497,12 +769,22 @@ for iter_idx in range(hp.NUM_ITERS):
         else:
             do_rewrite = (iter_idx % hp.REWRITE_EVERY == 0) or (not sample.last_rewrite)
         if rewrite_enabled and do_rewrite:
-            leaf_descs = _hits_to_context_descs(
-                leaf_hits,
-                node_registry,
-                hp.REWRITE_CONTEXT_TOPK,
-                hp.MAX_DOC_DESC_CHAR_LEN,
-            )
+            if hp.ROUND3_ANCHOR_LOCAL_RANK == "v2":
+                # Intent: use oracle top-K paths (branch->best-gold leaf) to drive next-iter context.
+                oracle_context_paths = oracle_paths_by_sample[-1][: hp.REWRITE_CONTEXT_TOPK]
+                leaf_descs = _paths_to_context_descs(
+                    oracle_context_paths,
+                    node_by_path,
+                    hp.REWRITE_CONTEXT_TOPK,
+                    hp.MAX_DOC_DESC_CHAR_LEN,
+                )
+            else:
+                leaf_descs = _hits_to_context_descs(
+                    leaf_hits,
+                    node_registry,
+                    hp.REWRITE_CONTEXT_TOPK,
+                    hp.MAX_DOC_DESC_CHAR_LEN,
+                )
             if hp.ROUND3_REWRITE_CONTEXT == "leaf_branch":
                 branch_descs = []
                 for path in ranked_branches:
@@ -625,48 +907,49 @@ for iter_idx in range(hp.NUM_ITERS):
         if hp.REWRITE_CACHE_PATH and new_records:
             append_jsonl(hp.REWRITE_CACHE_PATH, new_records)
 
-    logger.info("Iter %d: starting local/global retrieval", iter_idx)
-    # tqdm shows per-iteration local/global retrieval progress in terminal runs.
-    for sample, leaf_hits, branch_hits, active_paths, densities in tqdm(
+    logger.info("Iter %d: starting local/global scoring", iter_idx)
+    anchor_leaf_counts = [sum(1 for h in hits[:anchor_topk_logged] if h.is_leaf) for hits in anchor_hits_by_sample]
+    anchor_branch_counts = [sum(1 for h in hits[:anchor_topk_logged] if not h.is_leaf) for hits in anchor_hits_by_sample]
+    anchor_branch_hits = []
+    for sample, hits in zip(all_eval_samples, anchor_hits_by_sample):
+        branches = [h.path for h in hits if not h.is_leaf][:anchor_topk_logged]
+        anchor_branch_hits.append(1.0 if gate_hit(branches, sample.gold_paths) else 0.0)
+    if anchor_leaf_counts:
+        logger.info(
+            "Iter %d | Anchor top-%d: leaf=%.2f, branch=%.2f (avg counts)",
+            iter_idx,
+            anchor_topk_logged,
+            float(np.mean(anchor_leaf_counts)),
+            float(np.mean(anchor_branch_counts)),
+        )
+        logger.info(
+            "Iter %d | Anchor AncestorHit@%d=%.2f",
+            iter_idx,
+            anchor_topk_logged,
+            float(np.mean(anchor_branch_hits)) * 100.0,
+        )
+    # tqdm shows per-iteration local/global scoring progress in terminal runs.
+    for sample, anchor_hits, gold_scores, oracle_paths_k, oracle_paths_100, oracle_depths_k, oracle_depths_100, leaf_hits, branch_hits, local_hits, global_hits, active_paths, densities, query_t in tqdm(
         zip(
             all_eval_samples,
+            anchor_hits_by_sample,
+            gold_scores_by_sample,
+            oracle_paths_by_sample,
+            oracle_paths_100_by_sample,
+            oracle_branch_depths_by_sample,
+            oracle_branch_depths_100_by_sample,
             leaf_hits_by_sample,
             branch_hits_by_sample,
+            local_hits_by_sample,
+            global_hits_by_sample,
             branch_paths_by_sample,
             densities_by_sample,
+            retrieval_queries_by_sample,
         ),
-        desc=f"Iter {iter_idx} local/global retrieval",
+        desc=f"Iter {iter_idx} local/global scoring",
         total=len(all_eval_samples),
         leave=False,
     ):
-        if sample.last_possible_docs:
-            query_t = _compose_query_from_docs(sample.original_query, sample.last_possible_docs, sample.last_actions)
-        else:
-            query_t = _apply_action_rewrite(
-                sample.original_query,
-                sample.last_action,
-                sample.last_rewrite,
-                hp.ROUND3_EXPLORE_MODE,
-            )
-        local_leaf_indices = _filter_leaf_indices_by_prefixes(leaf_indices, leaf_paths, active_paths)
-        local_leaf_embs = node_embs[local_leaf_indices] if local_leaf_indices else np.zeros((0, node_embs.shape[1]), dtype=node_embs.dtype)
-        local_hits = _retrieve_hits_subset(
-            retriever=retriever,
-            query=query_t,
-            node_embs=local_leaf_embs,
-            subset_indices=local_leaf_indices,
-            node_registry=node_registry,
-            topk=local_topk,
-        )
-        global_hits = _retrieve_hits_subset(
-            retriever=retriever,
-            query=query_t,
-            node_embs=leaf_embs,
-            subset_indices=leaf_indices,
-            node_registry=node_registry,
-            topk=global_topk,
-        )
-
         local_ranked = [(h.path, h.score) for h in local_hits]
         global_ranked = [(h.path, h.score) for h in global_hits]
         ranked_lists = [lst for lst in (local_ranked, global_ranked) if lst]
@@ -676,12 +959,20 @@ for iter_idx in range(hp.NUM_ITERS):
         local_paths = [list(h.path) for h in local_hits]
         global_paths = [list(h.path) for h in global_hits]
         gold_paths = [list(p) for p in sample.gold_paths]
+        oracle_fused_paths = [list(p) for p in oracle_paths_k] if oracle_paths_k else fused_paths
         rrf_metrics = {
             "nDCG@10": compute_ndcg(fused_paths[:10], gold_paths, k=10) * 100,
             "Recall@10": compute_recall(fused_paths[:10], gold_paths, k=10) * 100,
             "Recall@100": compute_recall(fused_paths[:100], gold_paths, k=100) * 100,
             "Recall@all": compute_recall(fused_paths, gold_paths, k=len(fused_paths)) * 100,
             "Coverage": len(fused_paths),
+        }
+        oracle_rrf_metrics = {
+            "nDCG@10": compute_ndcg(oracle_fused_paths[:10], gold_paths, k=10) * 100,
+            "Recall@10": compute_recall(oracle_fused_paths[:10], gold_paths, k=10) * 100,
+            "Recall@100": compute_recall(oracle_fused_paths[:100], gold_paths, k=100) * 100,
+            "Recall@all": compute_recall(oracle_fused_paths, gold_paths, k=len(oracle_fused_paths)) * 100,
+            "Coverage": len(oracle_fused_paths),
         }
         local_metrics = {
             "nDCG@10": compute_ndcg(local_paths[:10], gold_paths, k=10) * 100,
@@ -697,12 +988,27 @@ for iter_idx in range(hp.NUM_ITERS):
             "Recall@all": compute_recall(global_paths, gold_paths, k=len(global_paths)) * 100,
             "Coverage": len(global_paths),
         }
+        anchor_k = min(int(anchor_topk), len(anchor_hits))
+        anchor_k_100 = min(100, len(anchor_hits))
+        anchor_branch_hit_ratio_k = _anchor_branch_hit_ratio(anchor_hits, sample.gold_paths, anchor_k)
+        anchor_branch_hit_ratio_100 = _anchor_branch_hit_ratio(anchor_hits, sample.gold_paths, anchor_k_100)
+        oracle_ndcg_k = compute_ndcg([list(p) for p in oracle_paths_k[:10]], gold_paths, k=10) * 100
+        oracle_ndcg_100 = compute_ndcg([list(p) for p in oracle_paths_100[:10]], gold_paths, k=10) * 100
+        oracle_depth_mean_k = float(np.mean(oracle_depths_k)) if oracle_depths_k else float("nan")
+        oracle_depth_mean_100 = float(np.mean(oracle_depths_100)) if oracle_depths_100 else float("nan")
+        oracle_depth_hit_k = 1.0 if oracle_depths_k else 0.0
+        oracle_depth_hit_100 = 1.0 if oracle_depths_100 else 0.0
         metrics = {
-            "nDCG@10": rrf_metrics["nDCG@10"],
-            "Recall@10": rrf_metrics["Recall@10"],
-            "Recall@100": rrf_metrics["Recall@100"],
-            "Recall@all": rrf_metrics["Recall@all"],
-            "Coverage": rrf_metrics["Coverage"],
+            "nDCG@10": oracle_rrf_metrics["nDCG@10"],
+            "Recall@10": oracle_rrf_metrics["Recall@10"],
+            "Recall@100": oracle_rrf_metrics["Recall@100"],
+            "Recall@all": oracle_rrf_metrics["Recall@all"],
+            "Coverage": oracle_rrf_metrics["Coverage"],
+            "OracleRRF_nDCG@10": oracle_rrf_metrics["nDCG@10"],
+            "OracleRRF_Recall@10": oracle_rrf_metrics["Recall@10"],
+            "OracleRRF_Recall@100": oracle_rrf_metrics["Recall@100"],
+            "OracleRRF_Recall@all": oracle_rrf_metrics["Recall@all"],
+            "OracleRRF_Coverage": oracle_rrf_metrics["Coverage"],
             "Local_nDCG@10": local_metrics["nDCG@10"],
             "Local_Recall@10": local_metrics["Recall@10"],
             "Local_Recall@100": local_metrics["Recall@100"],
@@ -713,6 +1019,14 @@ for iter_idx in range(hp.NUM_ITERS):
             "Global_Recall@100": global_metrics["Recall@100"],
             "Global_Recall@all": global_metrics["Recall@all"],
             "Global_Coverage": global_metrics["Coverage"],
+            f"AnchorBranchHitRatio@{anchor_topk}": anchor_branch_hit_ratio_k * 100,
+            "AnchorBranchHitRatio@100": anchor_branch_hit_ratio_100 * 100,
+            "Oracle_nDCG@10": oracle_ndcg_k,
+            "Oracle_nDCG@10@100": oracle_ndcg_100,
+            f"OracleBranchDepthMean@{anchor_topk}": oracle_depth_mean_k,
+            "OracleBranchDepthMean@100": oracle_depth_mean_100,
+            f"OracleBranchDepthHit@{anchor_topk}": oracle_depth_hit_k * 100.0,
+            "OracleBranchDepthHit@100": oracle_depth_hit_100 * 100.0,
         }
         iter_rows.append(metrics)
 
@@ -730,9 +1044,24 @@ for iter_idx in range(hp.NUM_ITERS):
             "local_paths": local_paths,
             "global_paths": global_paths,
             "fused_paths": [p for p, _ in fused_ranked[:100]],
+            "oracle_paths_anchor_k": oracle_paths_k,
+            "oracle_paths_100": oracle_paths_100,
+            "oracle_branch_depths_k": oracle_depths_k,
+            "oracle_branch_depths_100": oracle_depths_100,
+            "oracle_metrics": {
+                f"AnchorBranchHitRatio@{anchor_topk}": anchor_branch_hit_ratio_k * 100,
+                "AnchorBranchHitRatio@100": anchor_branch_hit_ratio_100 * 100,
+                "Oracle_nDCG@10": oracle_ndcg_k,
+                "Oracle_nDCG@10@100": oracle_ndcg_100,
+                f"OracleBranchDepthMean@{anchor_topk}": oracle_depth_mean_k,
+                "OracleBranchDepthMean@100": oracle_depth_mean_100,
+                f"OracleBranchDepthHit@{anchor_topk}": oracle_depth_hit_k * 100.0,
+                "OracleBranchDepthHit@100": oracle_depth_hit_100 * 100.0,
+            },
             "local_metrics": local_metrics,
             "global_metrics": global_metrics,
             "rrf_metrics": rrf_metrics,
+            "oracle_rrf_metrics": oracle_rrf_metrics,
         })
 
     iter_df = pd.DataFrame(iter_rows)
@@ -749,6 +1078,25 @@ for iter_idx in range(hp.NUM_ITERS):
             iter_df["Local_Recall@100"].mean(),
             iter_df["Global_Recall@100"].mean(),
         )
+        logger.info(
+            "Iter %d | AnchorBranchHitRatio@%d=%.2f | AnchorBranchHitRatio@100=%.2f | "
+            "Oracle_nDCG@10=%.2f | Oracle_nDCG@10@100=%.2f | OracleRRF nDCG@10=%.2f | "
+            "OracleBranchDepthHit@%d=%.2f | OracleBranchDepthMean@%d=%.2f | "
+            "OracleBranchDepthHit@100=%.2f | OracleBranchDepthMean@100=%.2f",
+            iter_idx,
+            int(anchor_topk),
+            iter_df[f"AnchorBranchHitRatio@{anchor_topk}"].mean(),
+            iter_df["AnchorBranchHitRatio@100"].mean(),
+            iter_df["Oracle_nDCG@10"].mean(),
+            iter_df["Oracle_nDCG@10@100"].mean(),
+            iter_df["OracleRRF_nDCG@10"].mean(),
+            int(anchor_topk),
+            iter_df[f"OracleBranchDepthHit@{anchor_topk}"].mean(),
+            int(anchor_topk),
+            iter_df[f"OracleBranchDepthMean@{anchor_topk}"].mean(),
+            iter_df["OracleBranchDepthHit@100"].mean(),
+            iter_df["OracleBranchDepthMean@100"].mean(),
+        )
     else:
         logger.info(
             "Iter %d | RRF nDCG@10=0.00 | Local nDCG@10=0.00 | Global nDCG@10=0.00 | "
@@ -757,4 +1105,4 @@ for iter_idx in range(hp.NUM_ITERS):
         )
 
 save_exp(RESULTS_DIR, hp, llm_api, all_eval_samples, all_eval_metric_dfs, allow_overwrite=True, save_llm_api_history=True)
-logger.info("Saved Round3 results to %s", RESULTS_DIR)
+logger.info("Saved oracle branch results to %s", RESULTS_DIR)

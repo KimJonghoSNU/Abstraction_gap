@@ -203,6 +203,10 @@ branch node가 검색되더라도 L_init에는 포함하지 않는다.
 L_init에 포함된 leaf들의 prefix 전부를 모아 P_leaf로 둔다.
 ActiveBranches B_active는 P_leaf와 B_hit의 합집합이다.
 
+- anchor = top‑K over all nodes
+- global = top‑K over leaf subset
+- local = top‑K over prefix‑filtered leaf subset
+
 4. Density Check
 
 각 candidate prefix u에 대해 density(u)를 계산한다.
@@ -224,8 +228,6 @@ Optional context로서 B_active의 branch description.
 Rewriter는 다음을 출력한다.
 Rewritten Query Q_rewritten.
 Action a는 explore 또는 exploit 중 하나다.
-
-TODO: per-level action (abstraction category별 action)도 실험 필요. 지금은 global action만.
 
 exploit은 현재 B_active가 맞는 지역이라고 보고 구체화를 시도한다.
 explore는 B_active가 불완전하거나 틀렸을 수 있다고 보고 탈출을 시도한다.
@@ -290,7 +292,7 @@ TODO conflict signal.
 
 - 구현 파일: `src/run_round3.py`
     - traversal 없이 round3 전용 파이프라인만 수행
-    - Query_t = (exploit) original + rewrite, (explore) rewrite-only
+    - Query_t = original + rewrite (explore에서도 concat? replace가 더 성능 잘 나옴)
     - rewrite_every=0이면 **rewrite 비활성화**
     - leaf depth는 현재 > 1 전제 (prefix 누락 가능성 주석 추가)
 - Prompt: `round3_action_v1` in `src/rewrite_prompts.py`
@@ -312,6 +314,14 @@ TODO conflict signal.
 - Scripts:
     - `src/bash/run_round3_ablation.sh` (leaf vs leaf_branch ablation)
 
+### Round 3 (Current Implementation)
+
+- Rewrite는 `Possible_Answer_Docs`를 concat한 문자열로 구성하고, 항상 `original + rewrite`로 검색한다.
+- Action은 prompt에 포함되지만, 현재는 **pool/weight에 영향 없음** (local/global 균형은 고정).
+- Local pool은 `B_active` prefix의 leaf만 대상으로 한다.
+- Depth 제약(같은 depth branch 제외)은 **미구현**.
+- density/drift/conflict signal은 계산/로그만 하고 **행동에 반영되지 않음**.
+
 ### Results [WIP]
 
 - Leaf‑only context still wins.
@@ -327,42 +337,143 @@ TODO conflict signal.
     Best psychology runs are effectively iter‑0 best (no improvement across iterations).
     Biology improves with iterations, psychology doesn’t → rewrite drift or mismatch.
 
-## Round 3 Comparison Table (ndcg_summary.csv)
-Grouped by suffix + prompt + explore_mode (mean across categories).
-| suffix | prompt | explore_mode | ndcg_iter0 | ndcg_max |
-|---|---|---|---:|---:|
-| biology | round3_action_v1 | replace | 57.70 | 61.67 |
-| biology | round3_action_levels_v1 | replace | 54.57 | 58.77 |
-| biology | round3_action_v1 | original | 52.19 | 54.35 |
-| psychology | round3_action_v1 | replace | 43.53 | 43.92 |
-| psychology | round3_action_levels_v1 | replace | 43.41 | 43.81 |
-| psychology | round3_action_v1 | original | 40.95 | 41.76 |
+## Round 3 Comparison Table (ndcg_summaryround3.csv)
 
 round3_action_v1 explore=replace	58.58,62.87,3	44.17,44.17,0
-round3_action_v1 explore=concat	57.18,61.84,4	41.92,44.73,2
+round3_action_v1 explore=concat	57.18,61.56,1	41.92,44.73,2
 round3_action_levels_v1 explore=replace	54.57,58.77,6	43.41,43.81,2
 
+DONE
+- Per-level action (category별 EXPLORE/EXPLOIT) 적용
 
 TODO
-- Per-level action (category별 EXPLORE/EXPLOIT) 적용
 - density 기반 weighted fusion
 
+## Round 3-1 (Missing to Implement)
 
-## Current best setting
+1. Depth constraint in local pool
+    - Active branch depth가 d일 때, local pool에서 depth d의 branch layer는 제외하고 더 아래 depth만 검색.
+2. Action-aware pool balancing
+    - EXPLORE: global 비중 증가 (RRF 가중치 or pool 구성 변경).
+    - EXPLOIT: local 비중 증가.
+3. Action-aware B_active update
+    - EXPLORE일 때 global top-K prefix가 다음 라운드 B_active에 더 크게 반영.
+4. Density/Drift/Conflict signals
+    - density 기반으로 explore/exploit 결정 안정화.
+    - drift/conflict 지표 정의 후 action/weight에 반영.
+5. Weight fusion ablation
+    - density를 이용한 가중 RRF vs 고정 RRF 비교.
+
+
+### Round 3-1 방향 (Round 3와의 차이)
+
+- Rewrite context가 action에 따라 분기됨.
+    - EXPLOIT: local leaf (B_active descendants) top‑K만 사용.
+    - EXPLORE: local leaf top‑K + (global−local) top‑K를 함께 사용.
+    - 두 컨텍스트는 프롬프트에서 라벨로 분리해서 제공.
+- global−local 컨텍스트가 부족하지 않도록 global 후보는 더 크게 뽑고(확장 top‑K),
+  거기서 local을 제외한 상위 K개를 사용.
+- Action 결정은 LLM 출력(action)만 사용. (density/drift/heuristic override 없음)
+- Local/Global fusion은 기존과 동일하게 고정 RRF로 유지. (비중 조절 미적용)
+
+#### --round3_anchor_local_rank
+- 기본: local rank는 local leaf top‑K를 점수 순으로 정렬.
+- 이 옵션을 켜면: **anchor top‑K의 순서를 따라 local rank를 재구성**.
+    - anchor top‑K에 leaf가 있으면 그대로 포함.
+    - anchor top‑K에 branch가 있으면, 그 branch 하위 leaf 중 **점수가 가장 높은 leaf**로 대체.
+    - 중복이면 다음으로 높은 leaf를 선택.
+    - 부족하면 기존 local hits에서 높은 점수 순으로 채움.
+
+#### Oracle branch (run_oracle_branch.py)
+- 목적: `--round3_anchor_local_rank`의 branch→best‑leaf 규칙이 **정확히 작동했을 때** 성능이 얼마나 개선되는지 상한을 측정.
+- 구현 개요:
+    - anchor top‑K에서 **branch는 해당 branch 하위 gold leaf 중 점수가 가장 높은 leaf로 치환**.
+    - branch 하위에 gold가 없으면 **그 branch는 버림**.
+    - 중복 leaf는 제거하고, **anchor 순서를 유지**.
+    - 이 oracle paths 중 **top‑K(`rewrite_context_topk`)가 metric을 계산하는 top-K가 됨. 다음 iteration rewrite context로 사용** (v2일 때만).
+- 보고 지표:
+    - `AnchorBranchHitRatio@K`: top‑K branch 중 gold를 포함하는 비율(샘플 평균).
+    - `Oracle_nDCG@10`: oracle‑치환 리스트의 nDCG@10.
+    - @100 버전도 함께 기록(`AnchorBranchHitRatio@100`, `Oracle_nDCG@10@100`).
+
+#### Oracle (upper bound) variant:
+##### 1: local/global
+    - per‑query로 local/global/rrf 중 nDCG@10이 최대인 리스트를 선택.
+    - 다음 iteration의 rewrite context는 이 oracle‑selected 리스트의 leaf들로 구성.
+    - gate/pool은 기존 anchor 기반 유지 (oracle는 context만 교체).
+##### 2: exploit/explore
+    - (action‑oracle) EXPLOIT/EXPLORE용 rewrite를 각각 생성하고,
+      두 쿼리로 retrieval을 수행한 뒤 nDCG@10이 더 높은 쪽을 선택.
+      선택된 rewrite가 다음 iteration의 context를 결정한다.
+
+### 정리
+
+- explore/exploit 잘 고르면 효과 있음. local/global은 뭐... 그게 그거임
+- branch를 잘 고르기<- 잘 고르면 효과 있는데 어떻게 잘 고를지가 어려운 문제
+
+
+#### query signal로 rewrite를 어떻게 할지 확인
+- branch signal이 explore / exploit과 관련이 있을지 확인
+1) Dmax로 oracle 예측이 되는지 확인
+    - Dmax: L_init에서 가장 많이 나온 prefix의 비율
+    - Density (Dmax): Dmax는 한 라운드에서 나온 **Top K_anchor leaf 결과가 특정 prefix 한 곳에 얼마나 “몰려 있는지”**를 수치로 만든 거
+2) prefix entropy
+    - L_init prefix 분포의 엔트로피
+    - 높을수록 방향이 불안정
+    - oracle explore와 양의 상관이 기대됨
+
+
+
+<memo>
+핵심
+컨트롤러 목표: 현재 라운드 관측이 제대로 된 region에 밀집했는지 아니면 탈출이 필요한지 판단한다
+
+- 왜 corpus tree를 써야 하냐?
+    - locality에서 벗어나기 위한 신호 (branch node + leaf node 같이 제공)
+    - 현재 스캔 중인 문서 풀이 아닌 문서 풀들은 어디 있냐? 에 대한 답
+    - rewrite 할 때는 leaf node만 보여주고 rewrite
+    - anchor (leaf+branch) node의 하위 leaf 노드에 대해서만 retrieval: local search
+    - 전체 leaf 노드에 대해서만 retrieval: global search
+    - (현재는 둘을 RRF 하고있는 상황)
+
+- local / global, explore / exploit 활용법:
+    - 기본 idea: 
+        - explore뜨면 global에서 정보를 더 가져오기?
+        - exploit에서는 local에서 query refine?
+- 사실 지금 3개로 나눠서 봐야 함
+    - local leaf(=anchor에서 leaf node들)
+    - anchor's branch leaf - local leaf (=anchor에서 branch node밑에 딸려 있는 leaf node들)
+    - global leaf - (anchor+local) leaf
+- explore해야 한다고 뜨면, rewrite context를 top anchor leaf에서 받아서 rewrite context로 넣어주기 or global leaf에서 받아서 넣어주기?
+    - top anchor leaf 점수 계산 방법: anchor branch로부터 leaf 까지 path에 등장하는 값들의 평균
+    - 지금 확인한 건, explore, exploit을 개잘하면 성능이 오른다
+
+
+
+
+
+
+
+
+
+
+
+
+<!-- ## Current best setting
 - biology: S=flat_gate_qe_iter-FTT=True-FT=100-GBT=10-QePN=pre_flat_rewrite_v1-QeCP=biology_pre_flat_rewrite-RPN=gate_rewrite_v1-RM=concat-RE=1-RCT=5-RCS=fused-RAtS=True 63.xx
-- psychology: S=flat_gate-FTT=True-FT=100-GBT=10-QeCP=psychology_converted_qe_woplan.log 48.xx
+- psychology: S=flat_gate-FTT=True-FT=100-GBT=10-QeCP=psychology_converted_qe_woplan.log 48.xx -->
 
 
 
-# 6) Open questions / decisions to make
+
+<!-- # 6) Open questions / decisions to make
 1) **Rewrite context choice**
-    - Should rewrite use leaf-only or mixed (leaf + small branch)?
+    - Should rewrite use leaf-only or mixed (leaf + small branch)? -> leaf only
 2) **Rewrite timing**
-    - Should we stop iterating rewrite after pre-flat? (current evidence says yes)
+    - Should we stop iterating rewrite after pre-flat? (current evidence says yes) 
 3) **Gate vs beam seeding**
-    - Is `--seed_from_flat_gates` consistently better than allowed_prefix-only?
+    - Is `--seed_from_flat_gates` consistently better than allowed_prefix-only? -> no
 4) **Final ranking fusion**
-    - RRF works, but should we tune k or add learned weighting?
+    - RRF works, but should we tune k or add learned weighting? -->
 
 
-## Round 3 Comparison Table (refresh)

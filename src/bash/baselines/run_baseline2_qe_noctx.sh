@@ -15,7 +15,7 @@ log "Starting run_baseline2_qe_noctx.sh script"
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
-    --suffix baseline22_qe_noctx
+    --suffix baseline2_qe_noctx
     --reasoning_in_traversal_prompt -1
     --load_existing
     --num_iters 10

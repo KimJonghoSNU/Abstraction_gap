@@ -2,23 +2,21 @@
 
 # Create log file with timestamp
 mkdir -p ../logs
-LOG_FILE="../logs/run_round3_action_levels_ablation_$(date '+%Y_%m_%d').log"
+LOG_FILE="../logs/run_round3_anchor_local_rank_$(date '+%Y_%m_%d').log"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting run_round3_action_levels_ablation.sh script"
+log "Starting run_round3_anchor_local_rank.sh script"
 
 RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
 NODE_EMB_BASE="../trees/BRIGHT"
 
-CACHE_BASE_ROOT="/data4/jongho/Search-o1/data/QA_Datasets/bright/cache"
-
 COMMON_PARAMS=(
     --reasoning_in_traversal_prompt -1
     --load_existing
-    --num_iters 5
+    --num_iters 10
     --llm_api_backend vllm
     --llm /data2/da02/models/Qwen3-4B-Instruct-2507
     --llm_api_staggering_delay 0.02
@@ -30,13 +28,20 @@ COMMON_PARAMS=(
     --rewrite_every 1
     --rewrite_context_topk 5
     --round3_rewrite_context leaf
+    --round3_anchor_local_rank v2
 )
 
 RUN_SUBSETS=(
-    # "biology"
-    # "psychology"
-    # "leetcode"
-    "theoremqa_theorems"
+    "psychology"
+    "economics"
+    "biology"
+    "earth_science"
+    "robotics"
+    "sustainable_living"
+    # "stackoverflow"
+    # "theoremqa_questions"
+    # "theoremqa_theorems"
+    # "pony"
 )
 
 # subset -> tree_version (from trees/BRIGHT/*)
@@ -57,16 +62,15 @@ declare -A TREE_VERSION_MAP=(
 
 PROMPTS=(
     "round3_action_v1"
-    "round3_action_levels_v1"
+    # "round3_action_v2"
 )
+
+ROUND3_EXPLORE_MODE="concat"
 
 for prompt in "${PROMPTS[@]}"; do
     for subset in "${RUN_SUBSETS[@]}"; do
-        suffix="round3_${prompt}"
+        suffix="round3_anchor_local_rank_${prompt}"
         NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.diver.npy"
-        REWRITE_CACHE_BASE="${CACHE_BASE_ROOT}/rewrite_${prompt}"
-        REWRITE_CACHE_TAG="round3_${prompt}"
-        REWRITE_CACHE_PATH="${REWRITE_CACHE_BASE}/${subset}_${prompt}_${REWRITE_CACHE_TAG}.jsonl"
 
         final_args=()
         i=0
@@ -82,8 +86,8 @@ for prompt in "${PROMPTS[@]}"; do
         done
 
         final_args+=("--node_emb_path" "$NODE_EMB_PATH")
-        final_args+=("--rewrite_cache_path" "$REWRITE_CACHE_PATH")
         final_args+=("--rewrite_prompt_name" "$prompt")
+        final_args+=("--round3_explore_mode" "$ROUND3_EXPLORE_MODE")
         final_args+=("--subset" "$subset")
         tree_version="${TREE_VERSION_MAP[$subset]}"
         if [[ -z "$tree_version" ]]; then
@@ -93,7 +97,7 @@ for prompt in "${PROMPTS[@]}"; do
         final_args+=("--tree_version" "$tree_version")
         final_args+=("--suffix" "$suffix")
 
-        cmd=( python run_round3.py "${final_args[@]}" )
+        cmd=( python run_round3_1.py "${final_args[@]}" )
         printf -v cmd_str '%q ' "${cmd[@]}"
         log "Executing: $cmd_str"
 

@@ -33,7 +33,8 @@ COMMON_PARAMS=(
     --leaf_only_retrieval
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
-    --rewrite_prompt_name agent_executor_v1
+    # --rewrite_prompt_name agent_executor_v1
+    --rewrite_prompt_name baseline_round3_action_v1
 )
 
 # Define RUNS directly as strings (space-separated args)
