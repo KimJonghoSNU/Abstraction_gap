@@ -67,39 +67,39 @@ def _find_metrics_files(base_dir: str, include_dir: Optional[str]) -> List[str]:
     return metrics_files
 
 
-def _extract_ndcg_means(df: pd.DataFrame, iter_idx: int) -> Optional[float]:
+def _extract_ndcg_means(df: pd.DataFrame, iter_idx: int, metric: str) -> Optional[float]:
     if hasattr(df.columns, "levels"):
         iter_key = f"Iter {iter_idx}"
         if iter_key not in df.columns.levels[0]:
             return None
-        if "nDCG@10" not in df[iter_key].columns:
+        if metric not in df[iter_key].columns:
             return None
-        return float(df[iter_key]["nDCG@10"].mean())
+        return float(df[iter_key][metric].mean())
     if iter_idx != 0:
         return None
-    if "nDCG@10" not in df.columns:
+    if metric not in df.columns:
         return None
-    return float(df["nDCG@10"].mean())
+    return float(df[metric].mean())
 
 
-def _extract_max_ndcg(df: pd.DataFrame) -> Tuple[Optional[float], Optional[int]]:
+def _extract_max_ndcg(df: pd.DataFrame, metric: str) -> Tuple[Optional[float], Optional[int]]:
     if hasattr(df.columns, "levels"):
         best_val = None
         best_iter = None
         for iter_key in df.columns.levels[0]:
             if not isinstance(iter_key, str) or not iter_key.startswith("Iter "):
                 continue
-            if "nDCG@10" not in df[iter_key].columns:
+            if metric not in df[iter_key].columns:
                 continue
-            mean_val = float(df[iter_key]["nDCG@10"].mean())
+            mean_val = float(df[iter_key][metric].mean())
             iter_idx = int(iter_key.split("Iter ")[-1])
             if best_val is None or mean_val > best_val:
                 best_val = mean_val
                 best_iter = iter_idx
         return best_val, best_iter
-    if "nDCG@10" not in df.columns:
+    if metric not in df.columns:
         return None, None
-    return float(df["nDCG@10"].mean()), 0
+    return float(df[metric].mean()), 0
 
 
 def _build_drop_map(drop_params: List[str]) -> Dict[str, str]:
@@ -154,6 +154,7 @@ def collect_ndcg_results(
     drop_map: Dict[str, str],
     exclude_subdirs: List[str],
     include_dir: Optional[str],
+    metric: str,
 ) -> pd.DataFrame:
     records: List[Dict[str, object]] = []
     for metrics_path in tqdm(sorted(_find_metrics_files(base_dir, include_dir))):
@@ -166,11 +167,11 @@ def collect_ndcg_results(
             print(f"Warning: Failed to read metrics file: {metrics_path}")
             continue
         category, exp_id = _relative_experiment_id(base_dir, metrics_path, drop_map)
-        max_ndcg, max_iter = _extract_max_ndcg(df)
+        max_ndcg, max_iter = _extract_max_ndcg(df, metric)
         records.append({
             "category": category,
             "experiment": exp_id,
-            "ndcg_iter0": round(_extract_ndcg_means(df, 0), 2),
+            "ndcg_iter0": round(_extract_ndcg_means(df, 0, metric), 2),
             "ndcg_max": round(max_ndcg, 2),
             "ndcg_max_iter": max_iter,
         })
@@ -200,6 +201,7 @@ def main() -> None:
     parser.add_argument("--base_dir", type=str, default="results/BRIGHT", help="Base results directory")
     parser.add_argument("--out_csv", type=str, default="results/BRIGHT/ndcg_summary.csv", help="Output CSV path")
     parser.add_argument("--exclude_subdir", action="append", default=["260116", "260121"], help="Subdirectory name to exclude")
+    parser.add_argument("--metric", type=str, default="nDCG@10", help="Metric column to aggregate")
     parser.add_argument(
         "--include_dir",
         type=str,
@@ -237,9 +239,9 @@ def main() -> None:
     if not os.path.isabs(out_csv):
         out_csv = os.path.join(os.path.dirname(os.path.dirname(__file__)), out_csv)
     out_csv = out_csv[:-4] + args.include_dir.replace("*", "") + out_csv[-4:] if args.include_dir else out_csv
-    print(f"Collecting nDCG@10 results from {base_dir}...")
+    print(f"Collecting {args.metric} results from {base_dir}...")
     drop_map = _build_drop_map(args.drop_param)
-    df = collect_ndcg_results(base_dir, drop_map, args.exclude_subdir, args.include_dir)
+    df = collect_ndcg_results(base_dir, drop_map, args.exclude_subdir, args.include_dir, args.metric)
     wide_df = _format_wide_results(df)
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     wide_df.to_csv(out_csv, index=False)

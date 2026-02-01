@@ -406,21 +406,26 @@ TODO
       두 쿼리로 retrieval을 수행한 뒤 nDCG@10이 더 높은 쪽을 선택.
       선택된 rewrite가 다음 iteration의 context를 결정한다.
 
-### 정리
+### 정리, TODO 고민
 
-- explore/exploit 잘 고르면 효과 있음. local/global은 뭐... 그게 그거임
-- branch를 잘 고르기<- 잘 고르면 효과 있는데 어떻게 잘 고를지가 어려운 문제
-
+- explore/exploit 잘 고르면 효과 있음 (44.12 -> 50.71). local/global 중 어떤 걸 더 볼지는 효과 없음 
+- branch를 잘 고르기 <- 잘 고르면 효과 있는데 어떻게 잘 고를지가 어려운 문제 
+- 성능 빠르게 올릴 방법: 
 
 #### query signal로 rewrite를 어떻게 할지 확인
 - branch signal이 explore / exploit과 관련이 있을지 확인
 1) Dmax로 oracle 예측이 되는지 확인
     - Dmax: L_init에서 가장 많이 나온 prefix의 비율
     - Density (Dmax): Dmax는 한 라운드에서 나온 **Top K_anchor leaf 결과가 특정 prefix 한 곳에 얼마나 “몰려 있는지”**를 수치로 만든 거
+    - 결과: 실패 (correlation 0)
 2) prefix entropy
     - L_init prefix 분포의 엔트로피
     - 높을수록 방향이 불안정
     - oracle explore와 양의 상관이 기대됨
+    - 결과: 실패 (correlation 0)
+
+- action별 평균 overlap/drift (explore vs exploit) 를 집계: 구현 중 
+
 
 
 

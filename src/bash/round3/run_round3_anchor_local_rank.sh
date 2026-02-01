@@ -28,7 +28,7 @@ COMMON_PARAMS=(
     --rewrite_every 1
     --rewrite_context_topk 5
     --round3_rewrite_context leaf
-    --round3_anchor_local_rank v2
+    --round3_anchor_local_rank v1
 )
 
 RUN_SUBSETS=(
@@ -37,7 +37,7 @@ RUN_SUBSETS=(
     "biology"
     "earth_science"
     "robotics"
-    "sustainable_living"
+    # "sustainable_living"
     # "stackoverflow"
     # "theoremqa_questions"
     # "theoremqa_theorems"
@@ -62,6 +62,8 @@ declare -A TREE_VERSION_MAP=(
 
 PROMPTS=(
     "round3_action_v1"
+    # "round3_action_v1"
+    # "agent_executor_v1"
     # "round3_action_v2"
 )
 

@@ -16,6 +16,16 @@ from google import genai
 
 PICKLE_ALLOWED_CLASSES = [bool, int, float, complex, str, bytes, bytearray, list, tuple, dict, set, frozenset, np.ndarray]
 
+def normalize_embeddings(embs: np.ndarray) -> np.ndarray:
+    # Intent: enforce cosine similarity by L2-normalizing embeddings at load time.
+    if embs.size == 0:
+        return embs.astype(np.float32, copy=False)
+    embs = embs.astype(np.float32, copy=False)
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    embs /= norms
+    return embs
+
 #region Eval metric functions
 def compute_ndcg(sorted_preds: list, gold: list, k: int = 10) -> float:
     if not sorted_preds or not gold:

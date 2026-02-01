@@ -19,6 +19,11 @@ def _rewrite_cache_key(
     return f"{prefix}||{query}||{context_sig}{iter_tag}"
 
 
+def _prompt_cache_key(prefix: str, prompt: str) -> str:
+    prompt_sig = hashlib.md5((prompt or "").encode("utf-8")).hexdigest() if prompt else "none"
+    return f"{prefix}||prompt={prompt_sig}"
+
+
 def load_jsonl(path: str) -> Iterable[dict]:
     with open(path, "r", encoding="utf-8") as f:
         for line in f:

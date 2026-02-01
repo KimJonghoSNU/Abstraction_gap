@@ -19,7 +19,7 @@ from prompts import get_traversal_prompt_response_constraint, get_reranking_prom
 from rewrite_prompts import REWRITE_PROMPT_TEMPLATES
 from qe_prompts import QE_PROMPT_TEMPLATES
 from rewrite_pipeline import SchemaGenerator
-from cache_utils import _rewrite_cache_key, load_rewrite_cache, append_jsonl
+from cache_utils import _prompt_cache_key, load_rewrite_cache, append_jsonl
 from flat_then_tree import (
     ancestor_hit,
     build_gates_and_leaf_candidates,
@@ -450,6 +450,9 @@ if hp.LLM_API_BACKEND == 'vllm':
     llm_api_kwargs.pop('thinking_config')
     llm_api_kwargs.pop('response_schema') # response_schema not supported in vLLM API
 
+if hp.USE_RETRIEVER_TRAVERSAL and (not hp.RETRIEVER_MODEL_PATH or not hp.NODE_EMB_PATH):
+    raise ValueError('--use_retriever_traversal requires --retriever_model_path and --node_emb_path')
+
 rewrite_enabled = False
 rewrite_map = {}
 schema_cache_map: dict[str, List[str]] = {}
@@ -491,8 +494,8 @@ if True:
                 raise ValueError(f'--rewrite_prompt_path not found: {hp.REWRITE_PROMPT_PATH}')
             with open(hp.REWRITE_PROMPT_PATH, 'r', encoding='utf-8') as f:
                 rewrite_template = f.read()
-        if rewrite_template is None and not hp.REWRITE_CACHE_PATH:
-            raise ValueError('--rewrite_prompt_name or --rewrite_prompt_path is required when rewrite is enabled')
+        if rewrite_template is None:
+            raise ValueError('--rewrite_prompt_name or --rewrite_prompt_path is required when rewrite is enabled (prompt-hash cache)')
         if hp.REWRITE_CACHE_PATH:
             rewrite_map, schema_cache_map = load_rewrite_cache(hp.REWRITE_CACHE_PATH, hp.REWRITE_FORCE_REFRESH)
     if hp.FLAT_THEN_TREE:
@@ -610,26 +613,21 @@ if True:
                     hp.REWRITE_CONTEXT_TOPK,
                     hp.MAX_DOC_DESC_CHAR_LEN,
                 )
-                cache_key = _rewrite_cache_key(
-                    "preflat",
-                    q,
-                    context_descs,
-                    iter_idx=None,
-                    schema_labels=schema_labels,
-                )
-                if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
-                    preflat_rewrite_map[q] = rewrite_map[cache_key]
-                    preflat_cache_hits[q] = True
-                    continue
                 if rewrite_template is None:
                     raise ValueError('Rewrite enabled but no prompt template is available.')
-                preflat_prompts.append(_format_rewrite_prompt(
+                prompt = _format_rewrite_prompt(
                     rewrite_template,
                     q,
                     "",
                     context_descs,
                     schema_labels,
-                ))
+                )
+                cache_key = _prompt_cache_key("preflat", prompt)
+                if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
+                    preflat_rewrite_map[q] = rewrite_map[cache_key]
+                    preflat_cache_hits[q] = True
+                    continue
+                preflat_prompts.append(prompt)
                 preflat_meta.append({
                     'cache_key': cache_key,
                     'base_query': q,
@@ -824,13 +822,16 @@ if not loaded_existing:
             )
             prev_rewrite = getattr(sample, "last_rewrite_raw", "")
             schema_labels = getattr(sample, "schema_labels", [])
-            cache_key = _rewrite_cache_key(
-                "start",
-                f"{sample.original_query}||{prev_rewrite}",
+            if rewrite_template is None:
+                raise ValueError('Rewrite enabled but no prompt template is available.')
+            prompt = _format_rewrite_prompt(
+                rewrite_template,
+                sample.original_query,
+                prev_rewrite,
                 context_descs,
-                iter_idx=None,
-                schema_labels=schema_labels,
+                schema_labels,
             )
+            cache_key = _prompt_cache_key("start", prompt)
             if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
                 rewrite = rewrite_map[cache_key]
                 sample.last_rewrite_raw = rewrite
@@ -845,15 +846,7 @@ if not loaded_existing:
                     'schema_labels': schema_labels,
                 })
                 continue
-            if rewrite_template is None:
-                raise ValueError('Rewrite enabled but no prompt template is available.')
-            start_prompts.append(_format_rewrite_prompt(
-                rewrite_template,
-                sample.original_query,
-                prev_rewrite,
-                context_descs,
-                schema_labels,
-            ))
+            start_prompts.append(prompt)
             start_meta.append({
                 'sample': sample,
                 'cache_key': cache_key,
@@ -943,13 +936,16 @@ async def retrieval_loop_step(iter_idx: int):  # Make the function asynchronous
         )
         prev_rewrite = getattr(sample, "last_rewrite_raw", "")
         schema_labels = getattr(sample, "schema_labels", [])
-        cache_key = _rewrite_cache_key(
-            "iter",
-            f"{sample.original_query}||{prev_rewrite}",
+        if rewrite_template is None:
+          raise ValueError('Rewrite enabled but no prompt template is available.')
+        prompt = _format_rewrite_prompt(
+            rewrite_template,
+            sample.original_query,
+            prev_rewrite,
             context_descs,
-            iter_idx=iter_idx,
-            schema_labels=schema_labels,
+            schema_labels,
         )
+        cache_key = _prompt_cache_key("iter", prompt)
         if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
           rewrite = rewrite_map[cache_key]
           sample.last_rewrite_raw = rewrite
@@ -964,15 +960,7 @@ async def retrieval_loop_step(iter_idx: int):  # Make the function asynchronous
               'schema_labels': schema_labels,
           })
           continue
-        if rewrite_template is None:
-          raise ValueError('Rewrite enabled but no prompt template is available.')
-        rewrite_prompts.append(_format_rewrite_prompt(
-            rewrite_template,
-            sample.original_query,
-            prev_rewrite,
-            context_descs,
-            schema_labels,
-        ))
+        rewrite_prompts.append(prompt)
         rewrite_meta.append({
             'sample': sample,
             'cache_key': cache_key,

@@ -12,7 +12,7 @@ from datasets import load_dataset
 from json_repair import repair_json
 from tqdm.autonotebook import tqdm
 
-from cache_utils import _rewrite_cache_key, append_jsonl
+from cache_utils import _prompt_cache_key, append_jsonl
 from flat_then_tree import FlatHit, flat_retrieve_hits, is_prefix, rrf_fuse_ranked_paths
 from hyperparams import HyperParams
 from llm_apis import GenAIAPI, VllmAPI
@@ -25,6 +25,7 @@ from utils import (
     compute_recall,
     get_all_leaf_nodes_with_path,
     get_node_id,
+    normalize_embeddings,
     save_exp,
     setup_logger,
 )
@@ -367,6 +368,7 @@ if not hp.NODE_EMB_PATH:
 node_embs = np.load(hp.NODE_EMB_PATH, allow_pickle=False)
 if node_embs.shape[0] != len(node_registry):
     raise ValueError(f"node_embs rows ({node_embs.shape[0]}) must match node_registry size ({len(node_registry)})")
+node_embs = normalize_embeddings(node_embs)
 
 retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
 
@@ -518,14 +520,15 @@ for iter_idx in range(hp.NUM_ITERS):
             else:
                 branch_descs = []
 
-            cache_descs = [f"LEAF: {d}" for d in leaf_descs] + [f"BRANCH: {d}" for d in branch_descs]
-            prev_blob = "\n".join([f"{k}: {v}" for k, v in sample.last_possible_docs.items() if v])
-            cache_key = _rewrite_cache_key(
-                "round3",
-                f"{sample.original_query}||{prev_blob}",
-                cache_descs,
-                iter_idx=iter_idx,
+            prompt = _format_action_prompt(
+                rewrite_template,
+                sample.original_query,
+                sample.last_rewrite,
+                sample.last_possible_docs,
+                leaf_descs,
+                branch_descs,
             )
+            cache_key = _prompt_cache_key("round3", prompt)
             if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
                 rewrite = rewrite_map[cache_key]
                 cached_actions = action_map.get(cache_key)
@@ -553,14 +556,6 @@ for iter_idx in range(hp.NUM_ITERS):
                     "rewrite": rewrite,
                 })
             else:
-                prompt = _format_action_prompt(
-                    rewrite_template,
-                    sample.original_query,
-                    sample.last_rewrite,
-                    sample.last_possible_docs,
-                    leaf_descs,
-                    branch_descs,
-                )
                 rewrite_prompts.append(prompt)
                 rewrite_meta.append({
                     "sample": sample,

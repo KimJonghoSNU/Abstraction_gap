@@ -63,7 +63,8 @@ class HyperParams(argparse.Namespace):
         'node_emb_path',
         'rewrite_prompt_path',
         'rewrite_cache_path',
-        # 'qe_cache_path',
+        'round3_router_cache_path',
+        'qe_cache_path',
     ])
 
     def __init__(self, **kwargs):
@@ -169,6 +170,8 @@ class HyperParams(argparse.Namespace):
         )
         parser.add_argument('--rewrite_at_start', default=False, action='store_true', help='Run rewrite once before the first traversal iteration')
         parser.add_argument('--leaf_only_retrieval', default=False, action='store_true', help='Restrict flat retrieval to leaf nodes only (used in run_leaf_rank.py)')
+        parser.add_argument('--use_retriever_traversal', default=False, action='store_true',
+                            help='If set, score traversal slates with retriever embeddings instead of LLM prompts')
 
         # Round 3 (run_round3.py)
         parser.add_argument('--round3_anchor_topk', type=int, default=None, help='Top-K for anchor flat retrieval (defaults to flat_topk)')
@@ -180,8 +183,34 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--round3_rewrite_once', default=False, action='store_true', help='Rewrite only at iter 0 in round3')
         parser.add_argument('--round3_explore_mode', type=str, default='replace', choices=['replace', 'concat'],
                             help='How to combine rewrite with the traversal query in round3')
-        parser.add_argument('--round3_action_oracle', default=False, action='store_true',
-                            help='Generate EXPLORE/EXPLOIT rewrites and pick the best per-query; used in run_round3_oracle.py')
+        parser.add_argument(
+            '--round3_action_oracle',
+            type=str,
+            default='none',
+            choices=['none', 'select', 'rerank', 'ndcg', 'rrf'],
+            help=(
+                'Action-oracle mode in run_round3_oracle.py: '
+                'select=LLM picks explore vs exploit; '
+                'rerank=LLM reranks explore+exploit top-10; '
+                'ndcg=choose by gold nDCG (oracle upper bound); '
+                'rrf=RRF fuse explore/exploit results; '
+                'none=disable'
+            ),
+        )
+        parser.add_argument('--round3_router_prompt_name', type=str, default=None,
+                            help='Optional router prompt name for split explore/exploit decision in run_round3_1.py')
+        parser.add_argument('--round3_router_cache_path', type=str, default=None,
+                            help='Optional JSONL cache for router action results in run_round3_1.py')
+        parser.add_argument('--round3_router_force_refresh', default=False, action='store_true',
+                            help='Ignore router cache and regenerate router actions')
+        parser.add_argument('--round3_router_context', type=str, default='leaf',
+                            choices=['leaf', 'leaf_branch', 'leaf_branch_depth1'],
+                            help=(
+                                'Router context evidence: '
+                                'leaf=leaf-only; '
+                                'leaf_branch=leaf evidence + non-overlap branch context; '
+                                'leaf_branch_depth1=leaf evidence + non-overlap branch context + depth-1 branches'
+                            ))
         parser.add_argument(
             '--round3_anchor_local_rank',
             type=str,

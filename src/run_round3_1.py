@@ -12,8 +12,8 @@ from datasets import load_dataset
 from json_repair import repair_json
 from tqdm.autonotebook import tqdm
 
-from cache_utils import _rewrite_cache_key, append_jsonl
-from flat_then_tree import FlatHit, gate_hit, is_prefix, rrf_fuse_ranked_paths
+from cache_utils import _prompt_cache_key, append_jsonl
+from flat_then_tree import FlatHit, gate_hit, is_prefix
 from hyperparams import HyperParams
 from llm_apis import GenAIAPI, VllmAPI
 from retrievers.diver import DiverEmbeddingModel
@@ -25,6 +25,7 @@ from utils import (
     compute_recall,
     get_all_leaf_nodes_with_path,
     get_node_id,
+    normalize_embeddings,
     save_exp,
     setup_logger,
 )
@@ -446,6 +447,24 @@ def _load_rewrite_action_cache(path: str, force_refresh: bool) -> Tuple[Dict[str
     return rewrite_map, action_map, docs_map
 
 
+def _load_router_action_cache(path: str, force_refresh: bool) -> Dict[str, str]:
+    action_map: Dict[str, str] = {}
+    if not path or force_refresh or (not os.path.exists(path)):
+        return action_map
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            key = rec.get("key")
+            if not key:
+                continue
+            if "action" in rec:
+                action_map[str(key)] = str(rec.get("action", "exploit")).strip().lower()
+    return action_map
+
+
 hp = HyperParams.from_args()
 if not hp.REWRITE_PROMPT_NAME and not hp.REWRITE_PROMPT_PATH and not hp.REWRITE_CACHE_PATH:
     hp.add_param("rewrite_prompt_name", "round3_action_v1")
@@ -501,6 +520,7 @@ if not hp.NODE_EMB_PATH:
 node_embs = np.load(hp.NODE_EMB_PATH, allow_pickle=False)
 if node_embs.shape[0] != len(node_registry):
     raise ValueError(f"node_embs rows ({node_embs.shape[0]}) must match node_registry size ({len(node_registry)})")
+node_embs = normalize_embeddings(node_embs)
 
 retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
 
@@ -516,6 +536,9 @@ rewrite_enabled = True
 rewrite_template = None
 rewrite_map: Dict[str, str] = {}
 action_map: Dict[str, str] = {}
+router_template = None
+router_action_map: Dict[str, str] = {}
+router_enabled = bool(hp.ROUND3_ROUTER_PROMPT_NAME)
 if hp.REWRITE_PROMPT_NAME:
     if hp.REWRITE_PROMPT_NAME not in REWRITE_PROMPT_TEMPLATES:
         raise ValueError(
@@ -534,6 +557,14 @@ if hp.REWRITE_PROMPT_PATH:
     with open(hp.REWRITE_PROMPT_PATH, "r", encoding="utf-8") as f:
         rewrite_template = f.read()
 rewrite_map, action_map, docs_map = _load_rewrite_action_cache(hp.REWRITE_CACHE_PATH, hp.REWRITE_FORCE_REFRESH)
+if router_enabled:
+    if hp.ROUND3_ROUTER_PROMPT_NAME not in REWRITE_PROMPT_TEMPLATES:
+        raise ValueError(
+            f"Unknown --round3_router_prompt_name \"{hp.ROUND3_ROUTER_PROMPT_NAME}\". "
+            f"Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}"
+        )
+    router_template = REWRITE_PROMPT_TEMPLATES[hp.ROUND3_ROUTER_PROMPT_NAME]
+    router_action_map = _load_router_action_cache(hp.ROUND3_ROUTER_CACHE_PATH, hp.ROUND3_ROUTER_FORCE_REFRESH)
 
 if rewrite_template is None:
     rewrite_template = REWRITE_PROMPT_TEMPLATES["round3_action_v1"]
@@ -579,8 +610,7 @@ for iter_idx in range(hp.NUM_ITERS):
     logger.info("Round3 iteration %d", iter_idx)
     iter_rows: List[Dict[str, float]] = []
 
-    rewrite_prompts: List[str] = []
-    rewrite_meta: List[Dict] = []
+    rewrite_candidates: List[Dict] = []
 
     anchor_topk_logged = max(1, min(10, int(anchor_topk)))
     anchor_hits_by_sample: List[List[FlatHit]] = []
@@ -725,7 +755,8 @@ for iter_idx in range(hp.NUM_ITERS):
                     hp.REWRITE_CONTEXT_TOPK,
                     hp.MAX_DOC_DESC_CHAR_LEN,
                 )
-            if hp.ROUND3_REWRITE_CONTEXT == "leaf_branch":
+            needs_branch_descs = hp.ROUND3_REWRITE_CONTEXT == "leaf_branch"
+            if needs_branch_descs:
                 branch_descs = []
                 for path in ranked_branches:
                     node = node_by_path.get(tuple(path))
@@ -740,14 +771,153 @@ for iter_idx in range(hp.NUM_ITERS):
             else:
                 branch_descs = []
 
-            cache_descs = [f"LEAF: {d}" for d in leaf_descs] + [f"BRANCH: {d}" for d in branch_descs]
+            router_leaf_descs: List[str] = []
+            router_branch_descs: List[str] = []
+            if router_enabled:
+                # Intent: router sees current evidence (anchor leaf top-K) and alternative directions (non-overlap branches).
+                router_leaf_paths: List[Tuple[int, ...]] = []
+                for h in hits:
+                    if not h.is_leaf:
+                        continue
+                    node = node_by_path.get(tuple(h.path))
+                    if not node:
+                        continue
+                    desc = node.desc
+                    if hp.MAX_DOC_DESC_CHAR_LEN:
+                        desc = desc[: hp.MAX_DOC_DESC_CHAR_LEN]
+                    router_leaf_descs.append(desc)
+                    router_leaf_paths.append(tuple(h.path))
+                    if len(router_leaf_descs) >= hp.REWRITE_CONTEXT_TOPK:
+                        break
+                if hp.ROUND3_ROUTER_CONTEXT in {"leaf_branch", "leaf_branch_depth1"}:
+                    for h in hits:
+                        if h.is_leaf:
+                            continue
+                        branch_path = tuple(h.path)
+                        if any(is_prefix(branch_path, leaf_path) for leaf_path in router_leaf_paths):
+                            continue
+                        node = node_by_path.get(branch_path)
+                        if not node:
+                            continue
+                        desc = node.desc
+                        if hp.MAX_DOC_DESC_CHAR_LEN:
+                            desc = desc[: hp.MAX_DOC_DESC_CHAR_LEN]
+                        router_branch_descs.append(desc)
+                        if len(router_branch_descs) >= hp.REWRITE_CONTEXT_TOPK:
+                            break
+                if hp.ROUND3_ROUTER_CONTEXT == "leaf_branch_depth1":
+                    # Intent: expose all depth-1 branches to reveal global alternatives.
+                    for node in node_registry:
+                        if (not node.is_leaf) and len(node.path) == 1:
+                            desc = node.desc
+                            if hp.MAX_DOC_DESC_CHAR_LEN:
+                                desc = desc[: hp.MAX_DOC_DESC_CHAR_LEN]
+                            router_branch_descs.append(desc)
+
             prev_blob = "\n".join([f"{k}: {v}" for k, v in sample.last_possible_docs.items() if v])
-            cache_key = _rewrite_cache_key(
-                "round3",
-                f"{sample.original_query}||{prev_blob}",
-                cache_descs,
-                iter_idx=iter_idx,
+            rewrite_candidates.append({
+                "sample": sample,
+                "leaf_descs": leaf_descs,
+                "branch_descs": branch_descs,
+                "router_leaf_descs": router_leaf_descs,
+                "router_branch_descs": router_branch_descs,
+                "prev_blob": prev_blob,
+            })
+
+    if rewrite_candidates:
+        # Intent: split router (action) from executor (rewrite) to keep round3_action_v1 content while decoupling decisions.
+        router_prompts: List[str] = []
+        router_meta: List[Dict] = []
+        if router_enabled:
+            for meta in rewrite_candidates:
+                sample = meta["sample"]
+                router_leaf_descs = meta["router_leaf_descs"]
+                router_branch_descs = meta["router_branch_descs"] if hp.ROUND3_ROUTER_CONTEXT == "leaf_branch" else []
+                prompt = _format_action_prompt(
+                    router_template,
+                    sample.original_query,
+                    sample.last_rewrite,
+                    sample.last_possible_docs,
+                    router_leaf_descs,
+                    router_branch_descs,
+                )
+                router_cache_key = _prompt_cache_key("round3_router", prompt)
+                if (not hp.ROUND3_ROUTER_FORCE_REFRESH) and (router_cache_key in router_action_map):
+                    router_action = router_action_map[router_cache_key]
+                    sample.last_action = router_action
+                    sample.rewrite_history.append({
+                        "iter": iter_idx,
+                        "cache_hit": True,
+                        "phase": "router",
+                        "action": sample.last_action,
+                    })
+                else:
+                    router_prompts.append(prompt)
+                    router_meta.append({
+                        "sample": sample,
+                        "cache_key": router_cache_key,
+                        "leaf_descs": router_leaf_descs,
+                        "branch_descs": router_branch_descs,
+                    })
+            if router_prompts:
+                logger.info("Iter %d: starting router batch (%d prompts)", iter_idx, len(router_prompts))
+                router_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(router_loop)
+                try:
+                    router_outputs = router_loop.run_until_complete(
+                        llm_api.run_batch(router_prompts, **llm_api_kwargs)
+                    )
+                finally:
+                    router_loop.close()
+                    asyncio.set_event_loop(None)
+                router_records = []
+                for meta, out in zip(router_meta, router_outputs):
+                    _, _, action, _ = _parse_action_output(out)
+                    sample = meta["sample"]
+                    sample.last_action = str(action or "exploit").strip().lower()
+                    router_action_map[meta["cache_key"]] = sample.last_action
+                    sample.rewrite_history.append({
+                        "iter": iter_idx,
+                        "cache_hit": False,
+                        "phase": "router",
+                        "action": sample.last_action,
+                    })
+                    router_records.append({
+                        "key": meta["cache_key"],
+                        "action": sample.last_action,
+                        "prompt_name": hp.ROUND3_ROUTER_PROMPT_NAME,
+                        "llm": hp.LLM,
+                        "leaf_descs": meta.get("leaf_descs", []),
+                        "branch_descs": meta.get("branch_descs", []),
+                    })
+                if hp.ROUND3_ROUTER_CACHE_PATH and router_records:
+                    append_jsonl(hp.ROUND3_ROUTER_CACHE_PATH, router_records)
+
+        rewrite_prompts: List[str] = []
+        rewrite_meta: List[Dict] = []
+        for meta in rewrite_candidates:
+            sample = meta["sample"]
+            leaf_descs = meta["leaf_descs"]
+            branch_descs = meta["branch_descs"] if hp.ROUND3_REWRITE_CONTEXT == "leaf_branch" else []
+            if router_enabled:
+                action = str(sample.last_action or "exploit").strip().lower()
+                if action not in {"explore", "exploit"}:
+                    action = "exploit"
+                executor_prompt_name = (
+                    "round3_action_v1_explore" if action == "explore" else "round3_action_v1_exploit"
+                )
+                executor_template = REWRITE_PROMPT_TEMPLATES[executor_prompt_name]
+            else:
+                executor_template = rewrite_template
+            prompt = _format_action_prompt(
+                executor_template,
+                sample.original_query,
+                sample.last_rewrite,
+                sample.last_possible_docs,
+                leaf_descs,
+                branch_descs,
             )
+            cache_key = _prompt_cache_key("round3", prompt)
             if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
                 rewrite = rewrite_map[cache_key]
                 cached_actions = action_map.get(cache_key)
@@ -775,14 +945,6 @@ for iter_idx in range(hp.NUM_ITERS):
                     "rewrite": rewrite,
                 })
             else:
-                prompt = _format_action_prompt(
-                    rewrite_template,
-                    sample.original_query,
-                    sample.last_rewrite,
-                    sample.last_possible_docs,
-                    leaf_descs,
-                    branch_descs,
-                )
                 rewrite_prompts.append(prompt)
                 rewrite_meta.append({
                     "sample": sample,
@@ -791,61 +953,61 @@ for iter_idx in range(hp.NUM_ITERS):
                     "branch_descs": branch_descs,
                 })
 
-    if rewrite_prompts:
-        logger.info("Iter %d: starting rewrite batch (%d prompts)", iter_idx, len(rewrite_prompts))
-        rewrite_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(rewrite_loop)
-        try:
-            rewrite_outputs = rewrite_loop.run_until_complete(
-                llm_api.run_batch(rewrite_prompts, **llm_api_kwargs)
-            )
-        finally:
-            rewrite_loop.close()
-            asyncio.set_event_loop(None)
+        if rewrite_prompts:
+            logger.info("Iter %d: starting rewrite batch (%d prompts)", iter_idx, len(rewrite_prompts))
+            rewrite_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(rewrite_loop)
+            try:
+                rewrite_outputs = rewrite_loop.run_until_complete(
+                    llm_api.run_batch(rewrite_prompts, **llm_api_kwargs)
+                )
+            finally:
+                rewrite_loop.close()
+                asyncio.set_event_loop(None)
 
-        new_records = []
-        for meta, out in zip(rewrite_meta, rewrite_outputs):
-            actions, docs, action, rewrite = _parse_action_output(out)
-            sample = meta["sample"]
-            if actions:
-                sample.last_actions = actions
-                sample.last_possible_docs = docs or {}
-                sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
-                sample.last_action = "exploit"
-                rewrite = sample.last_rewrite
-            else:
-                if action == "hold" and sample.last_rewrite:
+            new_records = []
+            for meta, out in zip(rewrite_meta, rewrite_outputs):
+                actions, docs, action, rewrite = _parse_action_output(out)
+                sample = meta["sample"]
+                if actions:
+                    sample.last_actions = actions
+                    sample.last_possible_docs = docs or {}
+                    sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
+                    sample.last_action = "exploit"
                     rewrite = sample.last_rewrite
                 else:
-                    sample.last_rewrite = rewrite
-                sample.last_action = action
-                sample.last_actions = {}
-                sample.last_possible_docs = {}
-            sample.rewrite_history.append({
-                "iter": iter_idx,
-                "cache_hit": False,
-                "action": sample.last_action,
-                "actions": sample.last_actions,
-                "possible_docs": sample.last_possible_docs,
-                "rewrite": rewrite,
-            })
-            rewrite_map[meta["cache_key"]] = rewrite
-            action_map[meta["cache_key"]] = sample.last_actions if sample.last_actions else sample.last_action
-            if sample.last_possible_docs:
-                docs_map[meta["cache_key"]] = sample.last_possible_docs
-            new_records.append({
-                "key": meta["cache_key"],
-                "rewritten_query": rewrite,
-                "action": sample.last_action if not sample.last_actions else None,
-                "actions": sample.last_actions if sample.last_actions else None,
-                "possible_answer_docs": sample.last_possible_docs if sample.last_possible_docs else None,
-                "prompt_name": hp.REWRITE_PROMPT_NAME,
-                "llm": hp.LLM,
-                "leaf_descs": meta.get("leaf_descs", []),
-                "branch_descs": meta.get("branch_descs", []),
-            })
-        if hp.REWRITE_CACHE_PATH and new_records:
-            append_jsonl(hp.REWRITE_CACHE_PATH, new_records)
+                    if action == "hold" and sample.last_rewrite:
+                        rewrite = sample.last_rewrite
+                    else:
+                        sample.last_rewrite = rewrite
+                    sample.last_action = action
+                    sample.last_actions = {}
+                    sample.last_possible_docs = {}
+                sample.rewrite_history.append({
+                    "iter": iter_idx,
+                    "cache_hit": False,
+                    "action": sample.last_action,
+                    "actions": sample.last_actions,
+                    "possible_docs": sample.last_possible_docs,
+                    "rewrite": rewrite,
+                })
+                rewrite_map[meta["cache_key"]] = rewrite
+                action_map[meta["cache_key"]] = sample.last_actions if sample.last_actions else sample.last_action
+                if sample.last_possible_docs:
+                    docs_map[meta["cache_key"]] = sample.last_possible_docs
+                new_records.append({
+                    "key": meta["cache_key"],
+                    "rewritten_query": rewrite,
+                    "action": sample.last_action if not sample.last_actions else None,
+                    "actions": sample.last_actions if sample.last_actions else None,
+                    "possible_answer_docs": sample.last_possible_docs if sample.last_possible_docs else None,
+                    "prompt_name": hp.REWRITE_PROMPT_NAME,
+                    "llm": hp.LLM,
+                    "leaf_descs": meta.get("leaf_descs", []),
+                    "branch_descs": meta.get("branch_descs", []),
+                })
+            if hp.REWRITE_CACHE_PATH and new_records:
+                append_jsonl(hp.REWRITE_CACHE_PATH, new_records)
 
     logger.info("Iter %d: starting local/global scoring", iter_idx)
     anchor_leaf_counts = [sum(1 for h in hits[:anchor_topk_logged] if h.is_leaf) for hits in anchor_hits_by_sample]

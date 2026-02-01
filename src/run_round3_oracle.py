@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import logging
 import os
 import pickle as pkl
@@ -12,7 +13,7 @@ from datasets import load_dataset
 from json_repair import repair_json
 from tqdm.autonotebook import tqdm
 
-from cache_utils import _rewrite_cache_key, append_jsonl
+from cache_utils import _prompt_cache_key, append_jsonl
 from flat_then_tree import FlatHit, gate_hit, is_prefix, rrf_fuse_ranked_paths
 from hyperparams import HyperParams
 from llm_apis import GenAIAPI, VllmAPI
@@ -25,6 +26,7 @@ from utils import (
     compute_recall,
     get_all_leaf_nodes_with_path,
     get_node_id,
+    normalize_embeddings,
     save_exp,
     setup_logger,
 )
@@ -39,10 +41,9 @@ class Round3Sample:
     last_action: str = "exploit"
     last_actions: Dict[str, str] = None
     last_possible_docs: Dict[str, str] = None
-    oracle_context_paths: List[Tuple[int, ...]] = None
+    mode_context_paths: List[Tuple[int, ...]] = None
     oracle_action_choice: str = ""
-    oracle_action_ndcg: float = 0.0
-    oracle_action_ndcgs: Dict[str, float] = None
+    oracle_action_anchor_top10: Dict[str, List[Tuple[int, ...]]] = None
     rewrite_history: List[Dict] = None
     iter_records: List[Dict] = None
 
@@ -55,10 +56,10 @@ class Round3Sample:
             self.last_actions = {}
         if self.last_possible_docs is None:
             self.last_possible_docs = {}
-        if self.oracle_context_paths is None:
-            self.oracle_context_paths = []
-        if self.oracle_action_ndcgs is None:
-            self.oracle_action_ndcgs = {}
+        if self.mode_context_paths is None:
+            self.mode_context_paths = []
+        if self.oracle_action_anchor_top10 is None:
+            self.oracle_action_anchor_top10 = {}
 
     def to_dict(self) -> Dict:
         return {
@@ -69,10 +70,9 @@ class Round3Sample:
             "last_action": self.last_action,
             "last_actions": self.last_actions,
             "last_possible_docs": self.last_possible_docs,
-            "oracle_context_paths": self.oracle_context_paths,
+            "mode_context_paths": self.mode_context_paths,
             "oracle_action_choice": self.oracle_action_choice,
-            "oracle_action_ndcg": self.oracle_action_ndcg,
-            "oracle_action_ndcgs": self.oracle_action_ndcgs,
+            "oracle_action_anchor_top10": self.oracle_action_anchor_top10,
             "rewrite_history": self.rewrite_history,
             "iter_records": self.iter_records,
         }
@@ -123,6 +123,57 @@ def _normalize_action(value: object) -> str:
     if action not in {"EXPLORE", "EXPLOIT", "PRUNE", "HOLD"}:
         return "EXPLOIT"
     return action
+
+
+def _normalize_oracle_mode(value: object) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"true", "1", "yes"}:
+        return "select"
+    if mode in {"false", "0", "none", ""}:
+        return "none"
+    if mode in {"select", "rerank", "ndcg", "rrf"}:
+        return mode
+    return "none"
+
+
+def _parse_oracle_choice(text: str) -> str:
+    cleaned = text.split("</think>\n")[-1].strip()
+    if "```" in cleaned:
+        try:
+            parts = cleaned.split("```")
+            fenced = [parts[i] for i in range(1, len(parts), 2)]
+            if fenced:
+                cleaned = fenced[-1].strip()
+        except Exception:
+            pass
+    try:
+        parsed = json.loads(repair_json(cleaned))
+        choice = str(parsed.get("choice", "")).strip().lower()
+        if choice in {"explore", "exploit"}:
+            return choice
+    except Exception:
+        pass
+    return "exploit"
+
+
+def _parse_oracle_ranking(text: str) -> List[str]:
+    cleaned = text.split("</think>\n")[-1].strip()
+    if "```" in cleaned:
+        try:
+            parts = cleaned.split("```")
+            fenced = [parts[i] for i in range(1, len(parts), 2)]
+            if fenced:
+                cleaned = fenced[-1].strip()
+        except Exception:
+            pass
+    try:
+        parsed = json.loads(repair_json(cleaned))
+        ranking = parsed.get("ranking", [])
+        if isinstance(ranking, list):
+            return [str(x).strip().upper() for x in ranking if str(x).strip()]
+    except Exception:
+        pass
+    return re.findall(r"[EX][0-9]+", cleaned.upper())
 
 
 def _parse_action_output(text: str) -> Tuple[Dict[str, str] | None, Dict[str, str] | None, str, str]:
@@ -279,7 +330,7 @@ def _eval_query_for_oracle(
     use_anchor_local_rank: bool,
     rrf_k: int,
     gold_paths: Sequence[Tuple[int, ...]],
-) -> Tuple[float, List[Tuple[int, ...]]]:
+) -> Tuple[float, List[Tuple[int, ...]], List[Tuple[int, ...]]]:
     q_emb = retriever.encode_query(query)
     scores_all = (node_embs @ q_emb).astype(np.float32, copy=False)
     hits = _hits_from_scores(
@@ -288,6 +339,7 @@ def _eval_query_for_oracle(
         node_registry=node_registry,
         topk=anchor_topk,
     )
+    anchor_paths = [h.path for h in hits[:anchor_topk_logged]]
     leaf_hits = [h for h in hits if h.is_leaf]
     branch_hits = [h for h in hits if not h.is_leaf]
     active_branches, densities, branch_scores = _build_active_branches(leaf_hits, branch_hits)
@@ -327,7 +379,7 @@ def _eval_query_for_oracle(
     fused_ranked = rrf_fuse_ranked_paths(ranked_lists, k=rrf_k) if ranked_lists else []
     fused_paths = [tuple(p) for p, _ in fused_ranked]
     rrf_ndcg = compute_ndcg([list(p) for p in fused_paths[:10]], [list(p) for p in gold_paths], k=10) * 100
-    return rrf_ndcg, fused_paths
+    return rrf_ndcg, fused_paths, anchor_paths
 
 
 
@@ -490,6 +542,7 @@ def _load_rewrite_action_cache(path: str, force_refresh: bool) -> Tuple[Dict[str
 hp = HyperParams.from_args()
 if not hp.REWRITE_PROMPT_NAME and not hp.REWRITE_PROMPT_PATH and not hp.REWRITE_CACHE_PATH:
     hp.add_param("rewrite_prompt_name", "round3_action_v1")
+oracle_mode = _normalize_oracle_mode(hp.ROUND3_ACTION_ORACLE)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 exp_dir_name = str(hp)
 RESULTS_DIR = f"{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/{exp_dir_name}/"
@@ -507,7 +560,7 @@ if not hp.REWRITE_CACHE_PATH:
     tag_parts = [
         f"REM={hp.ROUND3_EXPLORE_MODE}",
         f"ALR={hp.ROUND3_ANCHOR_LOCAL_RANK}",
-        f"AO={hp.ROUND3_ACTION_ORACLE}",
+        f"AO={oracle_mode}",
     ]
     if hp.SUFFIX:
         tag_parts.append(f"S={hp.SUFFIX}")
@@ -540,6 +593,7 @@ if not hp.NODE_EMB_PATH:
 node_embs = np.load(hp.NODE_EMB_PATH, allow_pickle=False)
 if node_embs.shape[0] != len(node_registry):
     raise ValueError(f"node_embs rows ({node_embs.shape[0]}) must match node_registry size ({len(node_registry)})")
+node_embs = normalize_embeddings(node_embs)
 
 retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
 
@@ -621,6 +675,9 @@ for iter_idx in range(hp.NUM_ITERS):
     rewrite_prompts: List[str] = []
     rewrite_meta: List[Dict] = []
     action_oracle_candidates: List[Dict[str, str]] = [{} for _ in all_eval_samples]
+    action_oracle_fused_paths_by_sample: List[Dict[str, List[Tuple[int, ...]]]] = [{} for _ in all_eval_samples]
+    action_oracle_rewrites_by_sample: List[Dict[str, str]] = [{} for _ in all_eval_samples]
+    action_oracle_ndcgs_by_sample: List[Dict[str, float]] = [{} for _ in all_eval_samples]
     rewrite_flags_by_sample: List[bool] = []
 
     anchor_topk_logged = max(1, min(10, int(anchor_topk)))
@@ -745,9 +802,9 @@ for iter_idx in range(hp.NUM_ITERS):
             do_rewrite = (iter_idx % hp.REWRITE_EVERY == 0) or (not sample.last_rewrite)
         rewrite_flags_by_sample.append(do_rewrite)
         if rewrite_enabled and do_rewrite:
-            if sample.oracle_context_paths:
+            if sample.mode_context_paths:
                 leaf_descs = _paths_to_context_descs(
-                    sample.oracle_context_paths,
+                    sample.mode_context_paths,
                     node_by_path,
                     hp.REWRITE_CONTEXT_TOPK,
                     hp.MAX_DOC_DESC_CHAR_LEN,
@@ -774,9 +831,7 @@ for iter_idx in range(hp.NUM_ITERS):
             else:
                 branch_descs = []
 
-            cache_descs = [f"LEAF: {d}" for d in leaf_descs] + [f"BRANCH: {d}" for d in branch_descs]
-            prev_blob = "\n".join([f"{k}: {v}" for k, v in sample.last_possible_docs.items() if v])
-            if hp.ROUND3_ACTION_ORACLE:
+            if oracle_mode != "none":
                 base_prompt = hp.REWRITE_PROMPT_NAME or "round3_action_v1"
                 prompt_names = {
                     "exploit": f"{base_prompt}_exploit",
@@ -788,15 +843,6 @@ for iter_idx in range(hp.NUM_ITERS):
                             f"Unknown action-oracle prompt \"{prompt_name}\". "
                             f"Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}"
                         )
-                    cache_key = _rewrite_cache_key(
-                        "round3",
-                        f"{sample.original_query}||{prev_blob}||action={action_tag}",
-                        cache_descs,
-                        iter_idx=iter_idx,
-                    )
-                    if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
-                        action_oracle_candidates[sample_idx][action_tag] = rewrite_map[cache_key]
-                        continue
                     prompt = _format_action_prompt(
                         REWRITE_PROMPT_TEMPLATES[prompt_name],
                         sample.original_query,
@@ -805,6 +851,10 @@ for iter_idx in range(hp.NUM_ITERS):
                         leaf_descs,
                         branch_descs,
                     )
+                    cache_key = _prompt_cache_key("round3", prompt)
+                    if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
+                        action_oracle_candidates[sample_idx][action_tag] = rewrite_map[cache_key]
+                        continue
                     rewrite_prompts.append(prompt)
                     rewrite_meta.append({
                         "sample": sample,
@@ -816,12 +866,15 @@ for iter_idx in range(hp.NUM_ITERS):
                         "branch_descs": branch_descs,
                     })
             else:
-                cache_key = _rewrite_cache_key(
-                    "round3",
-                    f"{sample.original_query}||{prev_blob}",
-                    cache_descs,
-                    iter_idx=iter_idx,
+                prompt = _format_action_prompt(
+                    rewrite_template,
+                    sample.original_query,
+                    sample.last_rewrite,
+                    sample.last_possible_docs,
+                    leaf_descs,
+                    branch_descs,
                 )
+                cache_key = _prompt_cache_key("round3", prompt)
                 if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
                     rewrite = rewrite_map[cache_key]
                     cached_actions = action_map.get(cache_key)
@@ -849,14 +902,6 @@ for iter_idx in range(hp.NUM_ITERS):
                         "rewrite": rewrite,
                     })
                 else:
-                    prompt = _format_action_prompt(
-                        rewrite_template,
-                        sample.original_query,
-                        sample.last_rewrite,
-                        sample.last_possible_docs,
-                        leaf_descs,
-                        branch_descs,
-                    )
                     rewrite_prompts.append(prompt)
                     rewrite_meta.append({
                         "sample": sample,
@@ -878,7 +923,7 @@ for iter_idx in range(hp.NUM_ITERS):
             asyncio.set_event_loop(None)
 
         new_records = []
-        if hp.ROUND3_ACTION_ORACLE:
+        if oracle_mode != "none":
             for meta, out in zip(rewrite_meta, rewrite_outputs):
                 _actions, _docs, _action, rewrite = _parse_action_output(out)
                 sample = meta["sample"]
@@ -941,11 +986,10 @@ for iter_idx in range(hp.NUM_ITERS):
         if hp.REWRITE_CACHE_PATH and new_records:
             append_jsonl(hp.REWRITE_CACHE_PATH, new_records)
 
-    if hp.ROUND3_ACTION_ORACLE:
+    if oracle_mode != "none":
         for sample_idx, (sample, do_rewrite) in enumerate(zip(all_eval_samples, rewrite_flags_by_sample)):
             sample.oracle_action_choice = ""
-            sample.oracle_action_ndcg = 0.0
-            sample.oracle_action_ndcgs = {}
+            sample.oracle_action_anchor_top10 = {}
             if not do_rewrite:
                 continue
             candidates = action_oracle_candidates[sample_idx]
@@ -955,6 +999,8 @@ for iter_idx in range(hp.NUM_ITERS):
             best_ndcg = -1.0
             best_paths: List[Tuple[int, ...]] = []
             cand_ndcgs: Dict[str, float] = {}
+            cand_anchor_paths: Dict[str, List[Tuple[int, ...]]] = {}
+            cand_fused_paths: Dict[str, List[Tuple[int, ...]]] = {}
             for action_tag, rewrite in candidates.items():
                 query_t = _apply_action_rewrite(
                     sample.original_query,
@@ -962,7 +1008,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     rewrite,
                     hp.ROUND3_EXPLORE_MODE,
                 )
-                ndcg, fused_paths = _eval_query_for_oracle(
+                ndcg, fused_paths, anchor_paths = _eval_query_for_oracle(
                     query=query_t,
                     retriever=retriever,
                     node_embs=node_embs,
@@ -978,29 +1024,208 @@ for iter_idx in range(hp.NUM_ITERS):
                     rrf_k=hp.ROUND3_RRF_K,
                     gold_paths=sample.gold_paths,
                 )
+                # Decision: store per-action anchor top-10 to compute drift offline.
+                cand_anchor_paths[action_tag] = [tuple(p) for p in anchor_paths[:anchor_topk_logged]]
+                cand_fused_paths[action_tag] = [tuple(p) for p in fused_paths[:10]]
                 cand_ndcgs[action_tag] = ndcg
-                if ndcg > best_ndcg or (ndcg == best_ndcg and action_tag == "exploit"):
-                    best_ndcg = ndcg
-                    best_action = action_tag
-                    best_paths = fused_paths
-            if best_action is None:
-                continue
-            sample.last_rewrite = candidates[best_action]
-            sample.last_action = best_action
-            sample.last_actions = {}
-            sample.last_possible_docs = {}
-            sample.oracle_context_paths = best_paths
-            sample.oracle_action_choice = best_action
-            sample.oracle_action_ndcg = best_ndcg
-            sample.oracle_action_ndcgs = cand_ndcgs
-            sample.rewrite_history.append({
-                "iter": iter_idx,
-                "cache_hit": False,
-                "action_oracle": True,
-                "action": best_action,
-                "rewrite": candidates[best_action],
-                "candidate_ndcgs": cand_ndcgs,
-            })
+            sample.oracle_action_anchor_top10 = cand_anchor_paths
+            action_oracle_fused_paths_by_sample[sample_idx] = cand_fused_paths
+            action_oracle_rewrites_by_sample[sample_idx] = candidates
+            action_oracle_ndcgs_by_sample[sample_idx] = cand_ndcgs
+
+        if oracle_mode in {"select", "rerank"}:
+            judge_prompts: List[str] = []
+            judge_meta: List[Dict[str, object]] = []
+            judge_template = (
+                REWRITE_PROMPT_TEMPLATES["round3_action_oracle_select_v1"]
+                if oracle_mode == "select"
+                else REWRITE_PROMPT_TEMPLATES["round3_action_oracle_rerank_v1"]
+            )
+            for sample_idx, sample in enumerate(all_eval_samples):
+                candidates = action_oracle_rewrites_by_sample[sample_idx]
+                if not candidates:
+                    continue
+                explore_paths = action_oracle_fused_paths_by_sample[sample_idx].get("explore", [])
+                exploit_paths = action_oracle_fused_paths_by_sample[sample_idx].get("exploit", [])
+                explore_descs = _paths_to_context_descs(
+                    explore_paths,
+                    node_by_path,
+                    10,
+                    hp.MAX_DOC_DESC_CHAR_LEN,
+                )
+                exploit_descs = _paths_to_context_descs(
+                    exploit_paths,
+                    node_by_path,
+                    10,
+                    hp.MAX_DOC_DESC_CHAR_LEN,
+                )
+                explore_blob = "\n".join([f"E{i + 1}. {d}" for i, d in enumerate(explore_descs)])
+                exploit_blob = "\n".join([f"X{i + 1}. {d}" for i, d in enumerate(exploit_descs)])
+                prompt = judge_template.format(
+                    original_query=sample.original_query,
+                    explore_rewrite=candidates.get("explore", ""),
+                    exploit_rewrite=candidates.get("exploit", ""),
+                    explore_descs=explore_blob,
+                    exploit_descs=exploit_blob,
+                )
+                judge_prompts.append(prompt)
+                judge_meta.append({
+                    "sample_idx": sample_idx,
+                    "explore_paths": explore_paths,
+                    "exploit_paths": exploit_paths,
+                    "explore_descs": explore_descs,
+                    "exploit_descs": exploit_descs,
+                })
+
+            if judge_prompts:
+                judge_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(judge_loop)
+                try:
+                    judge_outputs = judge_loop.run_until_complete(
+                        llm_api.run_batch(
+                            judge_prompts,
+                            max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS,
+                        )
+                    )
+                finally:
+                    judge_loop.close()
+            else:
+                judge_outputs = []
+
+            for meta, out in zip(judge_meta, judge_outputs):
+                sample = all_eval_samples[meta["sample_idx"]]
+                candidates = action_oracle_rewrites_by_sample[meta["sample_idx"]]
+                cand_ndcgs = action_oracle_ndcgs_by_sample[meta["sample_idx"]]
+                if not candidates:
+                    continue
+                if oracle_mode == "select":
+                    choice = _parse_oracle_choice(out)
+                    best_action = choice if choice in candidates else "exploit"
+                    ranked_paths = meta["exploit_paths"] if best_action == "exploit" else meta["explore_paths"]
+                    ranking_labels = []
+                else:
+                    labels = _parse_oracle_ranking(out)
+                    label_map: Dict[str, Tuple[str, Tuple[int, ...]]] = {}
+                    for idx, path in enumerate(meta["explore_paths"]):
+                        label_map[f"E{idx + 1}"] = ("explore", path)
+                    for idx, path in enumerate(meta["exploit_paths"]):
+                        label_map[f"X{idx + 1}"] = ("exploit", path)
+                    ranked_paths = []
+                    used = set()
+                    counts = {"explore": 0, "exploit": 0}
+                    for label in labels:
+                        if label not in label_map:
+                            continue
+                        action_tag, path = label_map[label]
+                        if path in used:
+                            continue
+                        used.add(path)
+                        ranked_paths.append(path)
+                        counts[action_tag] += 1
+                        if len(ranked_paths) >= 10:
+                            break
+                    if not ranked_paths:
+                        ranked_paths = meta["exploit_paths"]
+                    # Decision: pick the dominant action from reranked top-10 to advance the rewrite.
+                    if counts["explore"] > counts["exploit"]:
+                        best_action = "explore"
+                    else:
+                        best_action = "exploit"
+                    ranking_labels = labels
+                selected_ndcg = compute_ndcg(
+                    [list(p) for p in ranked_paths[:10]],
+                    [list(p) for p in sample.gold_paths],
+                    k=10,
+                ) * 100
+                if oracle_mode == "select":
+                    # Decision: in select mode, reuse the candidate nDCG so it matches the fused-list score.
+                    selected_ndcg = cand_ndcgs.get(best_action, selected_ndcg)
+                sample.last_rewrite = candidates.get(best_action, "")
+                sample.last_action = best_action
+                sample.last_actions = {}
+                sample.last_possible_docs = {}
+                sample.mode_context_paths = ranked_paths
+                sample.oracle_action_choice = best_action
+                sample.rewrite_history.append({
+                    "iter": iter_idx,
+                    "cache_hit": False,
+                    "action_oracle": True,
+                    "oracle_mode": oracle_mode,
+                    "action": best_action,
+                    "rewrite": sample.last_rewrite,
+                    "candidate_ndcgs": cand_ndcgs,
+                    "candidate_anchor_top10": sample.oracle_action_anchor_top10,
+                    "judge_ranking": ranking_labels,
+                })
+        elif oracle_mode == "ndcg":
+            for sample_idx, sample in enumerate(all_eval_samples):
+                candidates = action_oracle_rewrites_by_sample[sample_idx]
+                cand_ndcgs = action_oracle_ndcgs_by_sample[sample_idx]
+                if not candidates:
+                    continue
+                best_action = None
+                best_ndcg = -1.0
+                best_paths: List[Tuple[int, ...]] = []
+                for action_tag, paths in action_oracle_fused_paths_by_sample[sample_idx].items():
+                    ndcg = compute_ndcg(
+                        [list(p) for p in paths[:10]],
+                        [list(p) for p in sample.gold_paths],
+                        k=10,
+                    ) * 100
+                    if ndcg > best_ndcg or (ndcg == best_ndcg and action_tag == "exploit"):
+                        best_ndcg = ndcg
+                        best_action = action_tag
+                        best_paths = paths
+                if best_action is None:
+                    continue
+                # Decision: ndcg oracle chooses action by gold nDCG and uses its top-10 for context.
+                sample.last_rewrite = candidates.get(best_action, "")
+                sample.last_action = best_action
+                sample.last_actions = {}
+                sample.last_possible_docs = {}
+                sample.mode_context_paths = best_paths
+                sample.oracle_action_choice = best_action
+                sample.rewrite_history.append({
+                    "iter": iter_idx,
+                    "cache_hit": False,
+                    "action_oracle": True,
+                    "oracle_mode": oracle_mode,
+                    "action": best_action,
+                    "rewrite": sample.last_rewrite,
+                    "candidate_ndcgs": cand_ndcgs,
+                    "candidate_anchor_top10": sample.oracle_action_anchor_top10,
+                })
+        elif oracle_mode == "rrf":
+            for sample_idx, sample in enumerate(all_eval_samples):
+                candidates = action_oracle_rewrites_by_sample[sample_idx]
+                cand_ndcgs = action_oracle_ndcgs_by_sample[sample_idx]
+                if not candidates:
+                    continue
+                explore_paths = action_oracle_fused_paths_by_sample[sample_idx].get("explore", [])
+                exploit_paths = action_oracle_fused_paths_by_sample[sample_idx].get("exploit", [])
+                ranked_lists = [
+                    [(p, 0.0) for p in explore_paths],
+                    [(p, 0.0) for p in exploit_paths],
+                ]
+                fused_ranked = rrf_fuse_ranked_paths(ranked_lists, k=hp.ROUND3_RRF_K)
+                ranked_paths = [tuple(p) for p, _ in fused_ranked[:10]]
+                # Decision: rrf mode keeps exploit rewrite for next-iter query while using fused paths as context.
+                sample.last_rewrite = candidates.get("exploit", "")
+                sample.last_action = "exploit"
+                sample.last_actions = {}
+                sample.last_possible_docs = {}
+                sample.mode_context_paths = ranked_paths
+                sample.oracle_action_choice = "rrf"
+                sample.rewrite_history.append({
+                    "iter": iter_idx,
+                    "cache_hit": False,
+                    "action_oracle": True,
+                    "oracle_mode": oracle_mode,
+                    "action": "rrf",
+                    "rewrite": sample.last_rewrite,
+                    "candidate_ndcgs": cand_ndcgs,
+                    "candidate_anchor_top10": sample.oracle_action_anchor_top10,
+                })
 
     logger.info("Iter %d: starting local/global scoring", iter_idx)
     anchor_leaf_counts = [sum(1 for h in hits[:anchor_topk_logged] if h.is_leaf) for hits in anchor_hits_by_sample]
@@ -1024,7 +1249,7 @@ for iter_idx in range(hp.NUM_ITERS):
             float(np.mean(anchor_branch_hits)) * 100.0,
         )
     # tqdm shows per-iteration local/global scoring progress in terminal runs.
-    for sample, leaf_hits, branch_hits, local_hits, global_hits, active_paths, densities, query_t in tqdm(
+    for sample_idx, (sample, leaf_hits, branch_hits, local_hits, global_hits, active_paths, densities, query_t) in enumerate(tqdm(
         zip(
             all_eval_samples,
             leaf_hits_by_sample,
@@ -1038,7 +1263,7 @@ for iter_idx in range(hp.NUM_ITERS):
         desc=f"Iter {iter_idx} local/global scoring",
         total=len(all_eval_samples),
         leave=False,
-    ):
+    )):
         local_ranked = [(h.path, h.score) for h in local_hits]
         global_ranked = [(h.path, h.score) for h in global_hits]
         ranked_lists = [lst for lst in (local_ranked, global_ranked) if lst]
@@ -1077,20 +1302,35 @@ for iter_idx in range(hp.NUM_ITERS):
         oracle_order = {"local": 2, "global": 1, "rrf": 0}
         oracle_choice = max(oracle_scores.items(), key=lambda kv: (kv[1], oracle_order[kv[0]]))[0]
         oracle_ndcg = oracle_scores[oracle_choice]
-        if not hp.ROUND3_ACTION_ORACLE:
+        cand_ndcgs = action_oracle_ndcgs_by_sample[sample_idx] if oracle_mode != "none" else {}
+        if cand_ndcgs:
+            # Decision: oracle_nDCG@10 is the best of explore/exploit per sample.
+            oracle_choice = max(cand_ndcgs.items(), key=lambda kv: (kv[1], kv[0] == "exploit"))[0]
+            oracle_ndcg = cand_ndcgs[oracle_choice]
+        if oracle_mode == "none":
             if oracle_choice == "local":
-                sample.oracle_context_paths = [tuple(p) for p in local_paths]
+                sample.mode_context_paths = [tuple(p) for p in local_paths]
             elif oracle_choice == "global":
-                sample.oracle_context_paths = [tuple(p) for p in global_paths]
+                sample.mode_context_paths = [tuple(p) for p in global_paths]
             else:
-                sample.oracle_context_paths = [tuple(p) for p in fused_paths]
+                sample.mode_context_paths = [tuple(p) for p in fused_paths]
+        mode_metrics = rrf_metrics
+        if oracle_mode != "none" and sample.mode_context_paths:
+            mode_paths = [list(p) for p in sample.mode_context_paths]
+            mode_metrics = {
+                "nDCG@10": compute_ndcg(mode_paths[:10], gold_paths, k=10) * 100,
+                "Recall@10": compute_recall(mode_paths[:10], gold_paths, k=10) * 100,
+                "Recall@100": compute_recall(mode_paths[:100], gold_paths, k=100) * 100,
+                "Recall@all": compute_recall(mode_paths, gold_paths, k=len(mode_paths)) * 100,
+                "Coverage": len(mode_paths),
+            }
         metrics = {
-            "nDCG@10": rrf_metrics["nDCG@10"],
+            "nDCG@10": mode_metrics["nDCG@10"],
             "Oracle_nDCG@10": oracle_ndcg,
-            "Recall@10": rrf_metrics["Recall@10"],
-            "Recall@100": rrf_metrics["Recall@100"],
-            "Recall@all": rrf_metrics["Recall@all"],
-            "Coverage": rrf_metrics["Coverage"],
+            "Recall@10": mode_metrics["Recall@10"],
+            "Recall@100": mode_metrics["Recall@100"],
+            "Recall@all": mode_metrics["Recall@all"],
+            "Coverage": mode_metrics["Coverage"],
             "Local_nDCG@10": local_metrics["nDCG@10"],
             "Local_Recall@10": local_metrics["Recall@10"],
             "Local_Recall@100": local_metrics["Recall@100"],
@@ -1102,10 +1342,6 @@ for iter_idx in range(hp.NUM_ITERS):
             "Global_Recall@all": global_metrics["Recall@all"],
             "Global_Coverage": global_metrics["Coverage"],
         }
-        if hp.ROUND3_ACTION_ORACLE:
-            metrics["OracleAction_nDCG@10"] = sample.oracle_action_ndcg
-            metrics["OracleExploit_nDCG@10"] = sample.oracle_action_ndcgs.get("exploit", 0.0)
-            metrics["OracleExplore_nDCG@10"] = sample.oracle_action_ndcgs.get("explore", 0.0)
         iter_rows.append(metrics)
 
         sample.iter_records.append({
@@ -1117,6 +1353,7 @@ for iter_idx in range(hp.NUM_ITERS):
             "query_t": query_t,
             "anchor_leaf_paths": [h.path for h in leaf_hits],
             "anchor_branch_paths": [h.path for h in branch_hits],
+            "anchor_top_paths": [h.path for h in anchor_hits_by_sample[sample_idx][:anchor_topk_logged]],
             "active_branch_paths": active_paths,
             "density": {str(k): v for k, v in densities.items()},
             "local_paths": local_paths,
@@ -1128,26 +1365,20 @@ for iter_idx in range(hp.NUM_ITERS):
             "oracle_ndcg@10": oracle_ndcg,
             "oracle_choice": oracle_choice,
             "oracle_action_choice": sample.oracle_action_choice,
-            "oracle_action_ndcg@10": sample.oracle_action_ndcg,
-            "oracle_exploit_ndcg@10": sample.oracle_action_ndcgs.get("exploit", 0.0),
-            "oracle_explore_ndcg@10": sample.oracle_action_ndcgs.get("explore", 0.0),
+            "oracle_action_anchor_top10": sample.oracle_action_anchor_top10,
         })
 
     iter_df = pd.DataFrame(iter_rows)
     all_eval_metric_dfs.append(iter_df)
     if not iter_df.empty:
-        if hp.ROUND3_ACTION_ORACLE and "OracleAction_nDCG@10" in iter_df:
+        if oracle_mode != "none":
             logger.info(
-                "Iter %d | RRF nDCG@10=%.2f | Oracle nDCG@10=%.2f | OracleAction nDCG@10=%.2f | "
-                "Exploit nDCG@10=%.2f | Explore nDCG@10=%.2f | "
+                "Iter %d | Mode nDCG@10=%.2f | Oracle nDCG@10=%.2f | "
                 "Local nDCG@10=%.2f | Global nDCG@10=%.2f | "
                 "RRF Recall@100=%.2f | Local Recall@100=%.2f | Global Recall@100=%.2f",
                 iter_idx,
                 iter_df["nDCG@10"].mean(),
                 iter_df["Oracle_nDCG@10"].mean(),
-                iter_df["OracleAction_nDCG@10"].mean(),
-                iter_df["OracleExploit_nDCG@10"].mean(),
-                iter_df["OracleExplore_nDCG@10"].mean(),
                 iter_df["Local_nDCG@10"].mean(),
                 iter_df["Global_nDCG@10"].mean(),
                 iter_df["Recall@100"].mean(),
@@ -1168,9 +1399,9 @@ for iter_idx in range(hp.NUM_ITERS):
                 iter_df["Global_Recall@100"].mean(),
             )
     else:
-        if hp.ROUND3_ACTION_ORACLE:
+        if oracle_mode != "none":
             logger.info(
-                "Iter %d | RRF nDCG@10=0.00 | Oracle nDCG@10=0.00 | OracleAction nDCG@10=0.00 | "
+                "Iter %d | Mode nDCG@10=0.00 | Oracle nDCG@10=0.00 | "
                 "Local nDCG@10=0.00 | Global nDCG@10=0.00 | "
                 "RRF Recall@100=0.00 | Local Recall@100=0.00 | Global Recall@100=0.00",
                 iter_idx,
