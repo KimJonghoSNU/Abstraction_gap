@@ -376,6 +376,38 @@ REWRITE_PROMPT_TEMPLATES = {
         "Previous Rewritten Query:\n{previous_rewrite}\n\n"
         "Context Summaries:\n{gate_descs}\n"
     ),
+    "round3_agent_executor_v1": (
+        "You are rewriting a search query for reasoning-intensive retrieval.\n\n"
+        "Plan:\n"
+            "- Write a short Plan that states the user's core intent and what kind of evidence would justify the answer.\n"
+            "\t- Identify the user's intent and answer type.\n"
+            "\t- Assume you already have the correct answer to the user query.\n"
+            "\t- Abstraction: The documents we want are the ones that would be used as core evidence or justification for that answer. Infer which academic terms, theories, models, examples, or canonical methods would be cited as a core evidence.\n"
+        "Task:\n"
+            "- Use the context summaries only as hints (not ground truth).\n"
+            "- Produce 3-5 distinct Possible_Answer_Docs that could serve as evidence for the assumed correct answer.\n"
+            "- Do NOT require lexical overlap with the original query; prioritize abstract evidence.\n"
+        "- Evidence forms may include (not exhaustive):\n"
+            "\t- Propose multiple plausible theories/mechanisms.\n"
+            "\t- Propose concrete entities/phenomena.\n"
+            "\t- Propose examples/analogies.\n"
+            "\t- Propose other possible useful documents.\n"
+        "**Output Format:**\n"
+        "Output JSON only. e.g.:\n"
+        "{\n"
+        "  \"Plan\": \"short reasoning\",\n"
+        "  \"Possible_Answer_Docs\": {\n"
+        "    \"Theory\": \"...\",\n"
+        "    \"Entity\": \"...\",\n"
+        "    \"Example\": \"...\",\n"
+        "    \"Other\": \"...\"\n"
+        "  }\n"
+        "}\n\n"
+        "Original Query:\n{original_query}\n\n"
+        "Previous Rewritten Query:\n{previous_rewrite}\n\n"
+        "Leaf Evidence:\n{leaf_descs}\n\n"
+        "Branch Context:\n{branch_descs}\n"
+    ),
     "baseline_round3_action_v1": (
         "You are rewriting a search query for reasoning-intensive retrieval.\n\n"
         "Goal:\n"
@@ -420,6 +452,17 @@ REWRITE_PROMPT_TEMPLATES = {
         "Original Query:\n{original_query}\n\n"
         "Previous Rewritten Query:\n{previous_rewrite}\n\n"
         "Context Summaries:\n{gate_descs}\n"
+    ),
+    "thinkqe_round3": (
+        "Given a query, the provided passages (most of which may be incorrect or irrelevant), and the previous rewritten query, "
+        "identify helpful information from the passages and refine the prior query.\n"
+        "- Ensure the output directly improves retrieval for the original query.\n"
+        "- Use your own knowledge when needed; do not blindly copy passages.\n"
+        "- Output ONLY the rewritten query text.\n\n"
+        "Original Query:\n{original_query}\n\n"
+        "Previous Rewritten Query:\n{previous_rewrite}\n\n"
+        # Intent: round3 variant explicitly binds context to leaf evidence to avoid gate_descs ambiguity.
+        "Leaf Evidence:\n{leaf_descs}\n"
     ),
     "round3_action_oracle_select_v1": (
         "You are judging which retrieval result (explore vs exploit) is more likely to answer the query.\n\n"

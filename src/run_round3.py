@@ -4,7 +4,7 @@ import logging
 import os
 import pickle as pkl
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,7 +13,7 @@ from json_repair import repair_json
 from tqdm.autonotebook import tqdm
 
 from cache_utils import _prompt_cache_key, append_jsonl
-from flat_then_tree import FlatHit, flat_retrieve_hits, is_prefix, rrf_fuse_ranked_paths
+from flat_then_tree import FlatHit, flat_retrieve_hits, is_prefix
 from hyperparams import HyperParams
 from llm_apis import GenAIAPI, VllmAPI
 from retrievers.diver import DiverEmbeddingModel, cosine_topk
@@ -282,6 +282,132 @@ def _filter_leaf_indices_by_prefixes(
     return local_indices
 
 
+def _greedy_descendant_leaf_path(
+    branch_path: Tuple[int, ...],
+    node_embs: np.ndarray,
+    q_emb: np.ndarray,
+    node_by_path: Dict[Tuple[int, ...], object],
+) -> Optional[Tuple[int, ...]]:
+    node = node_by_path.get(tuple(branch_path))
+    if node is None:
+        return None
+    # Intent: v3 follows the highest-score child at each depth until reaching a leaf.
+    while node.child:
+        best_child = None
+        best_score = float("-inf")
+        for child in node.child:
+            score = float(node_embs[child.registry_idx] @ q_emb)
+            if score > best_score:
+                best_score = score
+                best_child = child
+        if best_child is None:
+            return None
+        node = best_child
+    return tuple(node.path)
+
+
+def _path_avg_score(
+    branch_path: Tuple[int, ...],
+    leaf_path: Tuple[int, ...],
+    node_embs: np.ndarray,
+    q_emb: np.ndarray,
+    node_by_path: Dict[Tuple[int, ...], object],
+) -> float:
+    total = 0.0
+    count = 0
+    for depth in range(len(branch_path), len(leaf_path) + 1):
+        prefix = leaf_path[:depth]
+        node = node_by_path.get(prefix)
+        if node is None:
+            continue
+        total += float(node_embs[node.registry_idx] @ q_emb)
+        count += 1
+    if count == 0:
+        return float("-inf")
+    return total / float(count)
+
+
+def _anchor_local_context_paths(
+    anchor_hits: Sequence[FlatHit],
+    anchor_topk: int,
+    node_embs: np.ndarray,
+    q_emb: np.ndarray,
+    leaf_indices_by_prefix: Dict[Tuple[int, ...], List[int]],
+    node_registry: Sequence[object],
+    topk: int,
+    local_rank_mode: str,
+    node_by_path: Dict[Tuple[int, ...], object],
+) -> List[Tuple[int, ...]]:
+    ordered: List[Tuple[int, ...]] = []
+    seen: set[int] = set()
+    for h in anchor_hits[:anchor_topk]:
+        if h.is_leaf:
+            if h.registry_idx in seen:
+                continue
+            ordered.append(tuple(h.path))
+            seen.add(h.registry_idx)
+            if len(ordered) >= topk:
+                return ordered
+            continue
+        if local_rank_mode == "v3":
+            leaf_path = _greedy_descendant_leaf_path(h.path, node_embs, q_emb, node_by_path)
+            if leaf_path is None:
+                continue
+            leaf_node = node_by_path.get(tuple(leaf_path))
+            if leaf_node is None:
+                continue
+            if leaf_node.registry_idx in seen:
+                continue
+            ordered.append(tuple(leaf_node.path))
+            seen.add(leaf_node.registry_idx)
+            if len(ordered) >= topk:
+                return ordered
+            continue
+        if local_rank_mode == "v4":
+            # Intent: v4 selects the leaf with the best average score along the branch→leaf path.
+            best_leaf_path = None
+            best_score = float("-inf")
+            candidate_indices = leaf_indices_by_prefix.get(h.path, [])
+            if not candidate_indices:
+                continue
+            for leaf_idx in candidate_indices:
+                leaf_node = node_registry[int(leaf_idx)]
+                avg_score = _path_avg_score(h.path, tuple(leaf_node.path), node_embs, q_emb, node_by_path)
+                if avg_score > best_score:
+                    best_score = avg_score
+                    best_leaf_path = tuple(leaf_node.path)
+            if best_leaf_path is None:
+                continue
+            best_node = node_by_path.get(tuple(best_leaf_path))
+            if best_node is None:
+                continue
+            if best_node.registry_idx in seen:
+                continue
+            ordered.append(tuple(best_node.path))
+            seen.add(best_node.registry_idx)
+            if len(ordered) >= topk:
+                return ordered
+            continue
+        candidate_indices = leaf_indices_by_prefix.get(h.path, [])
+        if not candidate_indices:
+            continue
+        candidate_scores = (node_embs[candidate_indices] @ q_emb).astype(np.float32, copy=False)
+        if candidate_scores.size == 0:
+            continue
+        order = np.argsort(-candidate_scores)
+        for ridx in order.tolist():
+            leaf_idx = int(candidate_indices[int(ridx)])
+            if leaf_idx in seen:
+                continue
+            node = node_registry[leaf_idx]
+            ordered.append(tuple(node.path))
+            seen.add(leaf_idx)
+            if len(ordered) >= topk:
+                return ordered
+            break
+    return ordered
+
+
 def _retrieve_hits_subset(
     *,
     retriever: DiverEmbeddingModel,
@@ -359,6 +485,7 @@ node_registry = compute_node_registry(semantic_root_node)
 all_leaf_nodes = get_all_leaf_nodes_with_path(semantic_root_node)
 doc_id_to_path = {get_node_id(leaf.id, docs_df): path for leaf, path in all_leaf_nodes}
 node_by_path = {tuple(node.path): node for node in node_registry}
+node_by_path = {tuple(node.path): node for node in node_registry}
 
 if not hp.RETRIEVER_MODEL_PATH:
     raise ValueError("--retriever_model_path is required")
@@ -374,6 +501,11 @@ retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
 
 leaf_indices = [idx for idx, node in enumerate(node_registry) if node.is_leaf]
 leaf_paths = [tuple(node_registry[idx].path) for idx in leaf_indices]
+leaf_indices_by_prefix: Dict[Tuple[int, ...], List[int]] = {}
+for idx, path in zip(leaf_indices, leaf_paths):
+    for d in range(1, len(path)):
+        prefix = path[:d]
+        leaf_indices_by_prefix.setdefault(prefix, []).append(idx)
 leaf_embs = node_embs[leaf_indices] if leaf_indices else np.zeros((0, node_embs.shape[1]), dtype=node_embs.dtype)
 
 rewrite_enabled = True
@@ -447,6 +579,7 @@ for iter_idx in range(hp.NUM_ITERS):
     rewrite_meta: List[Dict] = []
 
     anchor_hits_by_sample: List[List[FlatHit]] = []
+    anchor_eval_paths_by_sample: List[List[Tuple[int, ...]]] = []
     leaf_hits_by_sample: List[List[FlatHit]] = []
     branch_hits_by_sample: List[List[FlatHit]] = []
     branch_paths_by_sample: List[List[Tuple[int, ...]]] = []
@@ -480,6 +613,23 @@ for iter_idx in range(hp.NUM_ITERS):
             topk=anchor_topk,
         )
         anchor_hits_by_sample.append(hits)
+        if hp.ROUND3_ANCHOR_LOCAL_RANK != "none":
+            q_emb = retriever.encode_query(anchor_query)
+            # Intent: keep flat retrieval order but replace branch hits with best descendant leaves.
+            anchor_eval_paths = _anchor_local_context_paths(
+                anchor_hits=hits,
+                anchor_topk=anchor_topk,
+                node_embs=node_embs,
+                q_emb=q_emb,
+                leaf_indices_by_prefix=leaf_indices_by_prefix,
+                node_registry=node_registry,
+                topk=anchor_topk,
+                local_rank_mode=hp.ROUND3_ANCHOR_LOCAL_RANK,
+                node_by_path=node_by_path,
+            )
+        else:
+            anchor_eval_paths = [h.path for h in hits if h.is_leaf][:anchor_topk]
+        anchor_eval_paths_by_sample.append(anchor_eval_paths)
         leaf_hits = [h for h in hits if h.is_leaf]
         branch_hits = [h for h in hits if not h.is_leaf]
         leaf_hits_by_sample.append(leaf_hits)
@@ -506,17 +656,13 @@ for iter_idx in range(hp.NUM_ITERS):
                 hp.MAX_DOC_DESC_CHAR_LEN,
             )
             if hp.ROUND3_REWRITE_CONTEXT == "leaf_branch":
-                branch_descs = []
-                for path in ranked_branches:
-                    node = node_by_path.get(tuple(path))
-                    if not node:
-                        continue
-                    desc = node.desc
-                    if hp.MAX_DOC_DESC_CHAR_LEN:
-                        desc = desc[: hp.MAX_DOC_DESC_CHAR_LEN]
-                    branch_descs.append(desc)
-                    if len(branch_descs) >= hp.REWRITE_CONTEXT_TOPK:
-                        break
+                # Intent: use flat retrieval branch hits (top-K) for rewrite context.
+                branch_descs = _hits_to_context_descs(
+                    branch_hits,
+                    node_registry,
+                    hp.REWRITE_CONTEXT_TOPK,
+                    hp.MAX_DOC_DESC_CHAR_LEN,
+                )
             else:
                 branch_descs = []
 
@@ -622,9 +768,10 @@ for iter_idx in range(hp.NUM_ITERS):
 
     logger.info("Iter %d: starting local/global retrieval", iter_idx)
     # tqdm shows per-iteration local/global retrieval progress in terminal runs.
-    for sample, leaf_hits, branch_hits, active_paths, densities in tqdm(
+    for sample, anchor_eval_paths, leaf_hits, branch_hits, active_paths, densities in tqdm(
         zip(
             all_eval_samples,
+            anchor_eval_paths_by_sample,
             leaf_hits_by_sample,
             branch_hits_by_sample,
             branch_paths_by_sample,
@@ -662,22 +809,10 @@ for iter_idx in range(hp.NUM_ITERS):
             topk=global_topk,
         )
 
-        local_ranked = [(h.path, h.score) for h in local_hits]
-        global_ranked = [(h.path, h.score) for h in global_hits]
-        ranked_lists = [lst for lst in (local_ranked, global_ranked) if lst]
-        fused_ranked = rrf_fuse_ranked_paths(ranked_lists, k=hp.ROUND3_RRF_K) if ranked_lists else []
-
-        fused_paths = [list(p) for p, _ in fused_ranked]
         local_paths = [list(h.path) for h in local_hits]
         global_paths = [list(h.path) for h in global_hits]
+        anchor_paths = [list(p) for p in anchor_eval_paths]
         gold_paths = [list(p) for p in sample.gold_paths]
-        rrf_metrics = {
-            "nDCG@10": compute_ndcg(fused_paths[:10], gold_paths, k=10) * 100,
-            "Recall@10": compute_recall(fused_paths[:10], gold_paths, k=10) * 100,
-            "Recall@100": compute_recall(fused_paths[:100], gold_paths, k=100) * 100,
-            "Recall@all": compute_recall(fused_paths, gold_paths, k=len(fused_paths)) * 100,
-            "Coverage": len(fused_paths),
-        }
         local_metrics = {
             "nDCG@10": compute_ndcg(local_paths[:10], gold_paths, k=10) * 100,
             "Recall@10": compute_recall(local_paths[:10], gold_paths, k=10) * 100,
@@ -692,12 +827,20 @@ for iter_idx in range(hp.NUM_ITERS):
             "Recall@all": compute_recall(global_paths, gold_paths, k=len(global_paths)) * 100,
             "Coverage": len(global_paths),
         }
+        anchor_metrics = {
+            "nDCG@10": compute_ndcg(anchor_paths[:10], gold_paths, k=10) * 100,
+            "Recall@10": compute_recall(anchor_paths[:10], gold_paths, k=10) * 100,
+            "Recall@100": compute_recall(anchor_paths[:100], gold_paths, k=100) * 100,
+            "Recall@all": compute_recall(anchor_paths, gold_paths, k=len(anchor_paths)) * 100,
+            "Coverage": len(anchor_paths),
+        }
+        # Intent: use anchor(flat retrieval) order as the main evaluation list.
         metrics = {
-            "nDCG@10": rrf_metrics["nDCG@10"],
-            "Recall@10": rrf_metrics["Recall@10"],
-            "Recall@100": rrf_metrics["Recall@100"],
-            "Recall@all": rrf_metrics["Recall@all"],
-            "Coverage": rrf_metrics["Coverage"],
+            "nDCG@10": anchor_metrics["nDCG@10"],
+            "Recall@10": anchor_metrics["Recall@10"],
+            "Recall@100": anchor_metrics["Recall@100"],
+            "Recall@all": anchor_metrics["Recall@all"],
+            "Coverage": anchor_metrics["Coverage"],
             "Local_nDCG@10": local_metrics["nDCG@10"],
             "Local_Recall@10": local_metrics["Recall@10"],
             "Local_Recall@100": local_metrics["Recall@100"],
@@ -724,30 +867,26 @@ for iter_idx in range(hp.NUM_ITERS):
             "density": {str(k): v for k, v in densities.items()},
             "local_paths": local_paths,
             "global_paths": global_paths,
-            "fused_paths": [p for p, _ in fused_ranked[:100]],
             "local_metrics": local_metrics,
             "global_metrics": global_metrics,
-            "rrf_metrics": rrf_metrics,
         })
 
     iter_df = pd.DataFrame(iter_rows)
     all_eval_metric_dfs.append(iter_df)
     if not iter_df.empty:
         logger.info(
-            "Iter %d | RRF nDCG@10=%.2f | Local nDCG@10=%.2f | Global nDCG@10=%.2f | "
-            "RRF Recall@100=%.2f | Local Recall@100=%.2f | Global Recall@100=%.2f",
+            "Iter %d | Anchor nDCG@10=%.2f | Local nDCG@10=%.2f | "
+            "Anchor Recall@100=%.2f | Local Recall@100=%.2f",
             iter_idx,
             iter_df["nDCG@10"].mean(),
             iter_df["Local_nDCG@10"].mean(),
-            iter_df["Global_nDCG@10"].mean(),
             iter_df["Recall@100"].mean(),
             iter_df["Local_Recall@100"].mean(),
-            iter_df["Global_Recall@100"].mean(),
         )
     else:
         logger.info(
-            "Iter %d | RRF nDCG@10=0.00 | Local nDCG@10=0.00 | Global nDCG@10=0.00 | "
-            "RRF Recall@100=0.00 | Local Recall@100=0.00 | Global Recall@100=0.00",
+            "Iter %d | Global nDCG@10=0.00 | Local nDCG@10=0.00 | "
+            "Global Recall@100=0.00 | Local Recall@100=0.00",
             iter_idx,
         )
 

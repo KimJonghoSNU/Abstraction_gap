@@ -22,7 +22,7 @@ COMMON_PARAMS=(
     --suffix baseline3_leaf_only_loop
     --reasoning_in_traversal_prompt -1
     --load_existing
-    --num_iters 3
+    --num_iters 10
     --llm_api_backend vllm
     --llm /data2/da02/models/Qwen3-4B-Instruct-2507
     --llm_api_staggering_delay 0.02
@@ -33,8 +33,8 @@ COMMON_PARAMS=(
     --leaf_only_retrieval
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
-    # --rewrite_prompt_name agent_executor_v1
-    --rewrite_prompt_name baseline_round3_action_v1
+    --rewrite_prompt_name agent_executor_v1
+    # --rewrite_prompt_name baseline_round3_action_v1
 )
 
 # Define RUNS directly as strings (space-separated args)
@@ -44,10 +44,10 @@ RUNS=(
     "--subset earth_science --tree_version bottom-up"
     "--subset psychology --tree_version bottom-up"
     "--subset robotics --tree_version bottom-up"
-    "--subset stackoverflow --tree_version bottom-up"
-    "--subset sustainable_living --tree_version bottom-up"
-    "--subset theoremqa_theorems --tree_version top-down"
-    "--subset pony --tree_version bottom-up"
+    # "--subset stackoverflow --tree_version bottom-up"
+    # "--subset sustainable_living --tree_version bottom-up"
+    # "--subset theoremqa_theorems --tree_version top-down"
+    # "--subset pony --tree_version bottom-up"
 )
 
 for idx in "${!RUNS[@]}"; do

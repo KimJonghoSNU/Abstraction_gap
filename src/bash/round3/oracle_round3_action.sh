@@ -68,7 +68,8 @@ ROUND3_EXPLORE_MODE="concat"
 ORACLE_MODES=(
     # "select"
     # "rerank"
-    "rrf"
+    # "rrf"
+    "ndcg"
 )
 
 for oracle_mode in "${ORACLE_MODES[@]}"; do

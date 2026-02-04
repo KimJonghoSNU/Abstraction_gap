@@ -215,12 +215,14 @@ class HyperParams(argparse.Namespace):
             '--round3_anchor_local_rank',
             type=str,
             default='none',
-            choices=['none', 'v1', 'v2'],
+            choices=['none', 'v1', 'v2', 'v3', 'v4'],
             help=(
                 'Local ranking override from anchor order: '
                 'none=default local ranking; '
                 'v1=replace anchor branches with top descendant leaf for local ranking; '
-                'v2=use v1 behavior and also use those leaves as rewrite context'
+                'v2=use v1 behavior and also use those leaves as rewrite context; '
+                'v3=replace branches by greedy best-child descent to a leaf; '
+                'v4=replace branches by best path-average leaf (branch→leaf mean score)'
             ),
         )
         
