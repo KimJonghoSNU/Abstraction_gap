@@ -101,6 +101,35 @@ def _compute_region_hit_at_k(pred_paths: Sequence[Path], gold_paths: Sequence[Pa
     return float(len(pred_regions & gold_regions) > 0)
 
 
+def _depth1_counts_at_k(paths: Sequence[Path], k: int) -> Dict[Path, int]:
+    counts: Dict[Path, int] = {}
+    for p in paths[:k]:
+        if not p:
+            continue
+        d1 = (p[0],)
+        counts[d1] = counts.get(d1, 0) + 1
+    return counts
+
+
+def _unique_depth1_count_at_k(paths: Sequence[Path], k: int) -> float:
+    return float(len(_depth1_counts_at_k(paths, k)))
+
+
+def _single_depth1_branch_flag_at_k(paths: Sequence[Path], k: int) -> float:
+    counts = _depth1_counts_at_k(paths, k)
+    if not counts:
+        return 0.0
+    return float(len(counts) == 1)
+
+
+def _max_depth1_share_at_k(paths: Sequence[Path], k: int) -> float:
+    counts = _depth1_counts_at_k(paths, k)
+    total = sum(counts.values())
+    if total <= 0:
+        return 0.0
+    return float(max(counts.values())) / float(total)
+
+
 # Disabled (legacy): prefix-ratio helpers were removed from output metrics to keep interpretation simple.
 # def _longest_common_prefix_len(a_path: Path, b_path: Path) -> int:
 #     ...
@@ -116,11 +145,51 @@ def _mean(xs: List[float]) -> float:
     return float(np.mean(np.array(xs, dtype=np.float32)))
 
 
+def _conditional_mean(numerators: Sequence[float], conditioners: Sequence[float]) -> float:
+    num = 0.0
+    den = 0.0
+    for x, c in zip(numerators, conditioners):
+        if c >= 0.5:
+            den += 1.0
+            if x >= 0.5:
+                num += 1.0
+    if den <= 0.0:
+        return 0.0
+    return num / den
+
+
+def _infer_max_gold_depth(sample_dicts: Sequence[Dict]) -> int:
+    max_depth = 0
+    for sample in sample_dicts:
+        for p in sample.get("gold_paths", []):
+            max_depth = max(max_depth, len(p))
+    return max_depth
+
+
+def _parse_region_depths(region_depths_arg: str, baseline_samples: Sequence[Dict], ours_samples: Sequence[Dict]) -> List[int]:
+    if str(region_depths_arg).strip().lower() == "auto":
+        max_depth = max(_infer_max_gold_depth(baseline_samples), _infer_max_gold_depth(ours_samples))
+        max_depth = max(1, int(max_depth))
+        # Intent: auto mode reports every tree depth up to gold leaf depth for parent-level diagnostics.
+        return list(range(1, max_depth + 1))
+    out: List[int] = []
+    for tok in str(region_depths_arg).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.append(int(tok))
+    out = sorted(set([d for d in out if d >= 1]))
+    if not out:
+        raise ValueError("--region_depths must contain at least one positive integer (or use 'auto').")
+    return out
+
+
 def _eval_single_run(
     sample_dicts: List[Dict],
     iter_pre: int,
     iter_post: int,
     eval_k: int,
+    region_depths: Sequence[int],
 ) -> Dict[str, float]:
     # Intent: keep only metrics that directly answer "escape wrong region" vs "preserve already-good cases".
     n_samples = 0
@@ -137,12 +206,22 @@ def _eval_single_run(
     region_hit_l2_post_list: List[float] = []
     region_jaccard_l1_list: List[float] = []
     region_jaccard_l2_list: List[float] = []
+    region_hit_pre_by_depth: Dict[int, List[float]] = {int(d): [] for d in region_depths}
+    region_hit_post_by_depth: Dict[int, List[float]] = {int(d): [] for d in region_depths}
+    region_jaccard_by_depth: Dict[int, List[float]] = {int(d): [] for d in region_depths}
+    unique_depth1_pre_list: List[float] = []
+    unique_depth1_post_list: List[float] = []
+    single_depth1_pre_list: List[float] = []
+    single_depth1_post_list: List[float] = []
+    max_depth1_share_pre_list: List[float] = []
+    max_depth1_share_post_list: List[float] = []
     miss_to_hit_list: List[float] = []
     miss_flags: List[float] = []
     good_flags: List[float] = []
     harm_flags: List[float] = []
     pre_miss_region_hit_l1_deltas: List[float] = []
     pre_miss_region_hit_l2_deltas: List[float] = []
+    pre_miss_region_hit_delta_by_depth: Dict[int, List[float]] = {int(d): [] for d in region_depths}
 
     for sample in sample_dicts:
         rec_pre = _find_iter_record(sample, iter_pre)
@@ -184,6 +263,21 @@ def _eval_single_run(
         region_j_l2 = _prefix_jaccard_at_k(paths_pre, paths_post, eval_k, depth_tokens=2)
         region_jaccard_l1_list.append(region_j_l1)
         region_jaccard_l2_list.append(region_j_l2)
+        for d in region_depths:
+            d = int(d)
+            hit_pre_d = _compute_region_hit_at_k(paths_pre, gold_paths, eval_k, depth_tokens=d)
+            hit_post_d = _compute_region_hit_at_k(paths_post, gold_paths, eval_k, depth_tokens=d)
+            jac_d = _prefix_jaccard_at_k(paths_pre, paths_post, eval_k, depth_tokens=d)
+            region_hit_pre_by_depth[d].append(hit_pre_d)
+            region_hit_post_by_depth[d].append(hit_post_d)
+            region_jaccard_by_depth[d].append(jac_d)
+        # Intent: quantify whether top-k is concentrated into one depth-1 branch or spread across multiple branches.
+        unique_depth1_pre_list.append(_unique_depth1_count_at_k(paths_pre, eval_k))
+        unique_depth1_post_list.append(_unique_depth1_count_at_k(paths_post, eval_k))
+        single_depth1_pre_list.append(_single_depth1_branch_flag_at_k(paths_pre, eval_k))
+        single_depth1_post_list.append(_single_depth1_branch_flag_at_k(paths_post, eval_k))
+        max_depth1_share_pre_list.append(_max_depth1_share_at_k(paths_pre, eval_k))
+        max_depth1_share_post_list.append(_max_depth1_share_at_k(paths_post, eval_k))
 
         miss_flag = float(hit_pre == 0.0)
         miss_flags.append(miss_flag)
@@ -191,6 +285,10 @@ def _eval_single_run(
         if hit_pre == 0.0:
             pre_miss_region_hit_l1_deltas.append(region_hit_l1_post - region_hit_l1_pre)
             pre_miss_region_hit_l2_deltas.append(region_hit_l2_post - region_hit_l2_pre)
+            for d in region_depths:
+                d = int(d)
+                deltas = pre_miss_region_hit_delta_by_depth[d]
+                deltas.append(region_hit_post_by_depth[d][-1] - region_hit_pre_by_depth[d][-1])
         good_flag = float(hit_pre == 1.0)
         good_flags.append(good_flag)
         harm_flags.append(float((hit_pre == 1.0) and (hit_post == 0.0)))
@@ -199,7 +297,7 @@ def _eval_single_run(
     miss_to_hit_count = int(sum(miss_to_hit_list))
     good_count = int(sum(good_flags))
     harm_count = int(sum(harm_flags))
-    return {
+    metrics = {
         # Number of samples that have both iter_pre and iter_post records.
         "n_samples": int(n_samples),
         # Percentage of samples with at least one gold document in top-k before first rewrite.
@@ -244,6 +342,24 @@ def _eval_single_run(
         "RegionJaccardL1@10_pre_vs_post": _mean(region_jaccard_l1_list),
         # Same overlap at level-2 prefixes for finer-grained region transition.
         "RegionJaccardL2@10_pre_vs_post": _mean(region_jaccard_l2_list),
+        # Mean number of unique depth-1 branches covered by top-k before rewrite.
+        "MeanUniqueDepth1Branches@10_pre": _mean(unique_depth1_pre_list),
+        # Mean number of unique depth-1 branches covered by top-k after rewrite.
+        "MeanUniqueDepth1Branches@10_post": _mean(unique_depth1_post_list),
+        # Delta of unique depth-1 branch coverage (positive means more spread after rewrite).
+        "Delta_MeanUniqueDepth1Branches@10": _mean(unique_depth1_post_list) - _mean(unique_depth1_pre_list),
+        # Percentage of samples whose top-k all fall under a single depth-1 branch before rewrite.
+        "SingleDepth1BranchRate@10_pre": _mean(single_depth1_pre_list) * 100.0,
+        # Percentage of samples whose top-k all fall under a single depth-1 branch after rewrite.
+        "SingleDepth1BranchRate@10_post": _mean(single_depth1_post_list) * 100.0,
+        # Delta of single-branch concentration rate (positive means stronger concentration after rewrite).
+        "Delta_SingleDepth1BranchRate@10": (_mean(single_depth1_post_list) - _mean(single_depth1_pre_list)) * 100.0,
+        # Mean share of the dominant depth-1 branch inside top-k before rewrite.
+        "MeanMaxDepth1Share@10_pre": _mean(max_depth1_share_pre_list) * 100.0,
+        # Mean share of the dominant depth-1 branch inside top-k after rewrite.
+        "MeanMaxDepth1Share@10_post": _mean(max_depth1_share_post_list) * 100.0,
+        # Delta of dominant depth-1 branch share (positive means stronger concentration after rewrite).
+        "Delta_MeanMaxDepth1Share@10": (_mean(max_depth1_share_post_list) - _mean(max_depth1_share_pre_list)) * 100.0,
         # [Meaning] "Escape" from initial miss after first rewrite.
         # [Implementation] Count samples with hit_pre=0 and hit_post=1.
         # [Interpretation] Higher means better recovery when the initial retrieval failed.
@@ -267,6 +383,44 @@ def _eval_single_run(
         # Number of Good0 samples that lose hit after rewrite.
         "Harm_count": harm_count,
     }
+    for d in region_depths:
+        d = int(d)
+        metrics[f"RegionHitD{d}@10_pre"] = _mean(region_hit_pre_by_depth[d]) * 100.0
+        metrics[f"RegionHitD{d}@10_post"] = _mean(region_hit_post_by_depth[d]) * 100.0
+        metrics[f"Delta_RegionHitD{d}@10"] = (
+            _mean(region_hit_post_by_depth[d]) - _mean(region_hit_pre_by_depth[d])
+        ) * 100.0
+        metrics[f"RegionJaccardD{d}@10_pre_vs_post"] = _mean(region_jaccard_by_depth[d])
+        metrics[f"Delta_RegionHitD{d}@10_givenPreMiss"] = _mean(pre_miss_region_hit_delta_by_depth[d]) * 100.0
+    sorted_depths = sorted([int(d) for d in region_depths])
+    for d in sorted_depths:
+        d_next = d + 1
+        if d_next not in region_hit_pre_by_depth:
+            continue
+        # Intent: diagnose whether failures come from missing the parent region itself (depth d)
+        # or from failing to distinguish leaf-level descendants inside the matched parent (depth d+1).
+        metrics[f"P_RegionHitD{d_next}@10_given_D{d}_pre"] = (
+            _conditional_mean(region_hit_pre_by_depth[d_next], region_hit_pre_by_depth[d]) * 100.0
+        )
+        metrics[f"P_RegionHitD{d_next}@10_given_D{d}_post"] = (
+            _conditional_mean(region_hit_post_by_depth[d_next], region_hit_post_by_depth[d]) * 100.0
+        )
+        metrics[f"D{d}_Hit_D{d_next}_MissRate@10_pre"] = (
+            _mean([
+                1.0 if (hd >= 0.5 and hd1 < 0.5) else 0.0
+                for hd, hd1 in zip(region_hit_pre_by_depth[d], region_hit_pre_by_depth[d_next])
+            ]) * 100.0
+        )
+        metrics[f"D{d}_Hit_D{d_next}_MissRate@10_post"] = (
+            _mean([
+                1.0 if (hd >= 0.5 and hd1 < 0.5) else 0.0
+                for hd, hd1 in zip(region_hit_post_by_depth[d], region_hit_post_by_depth[d_next])
+            ]) * 100.0
+        )
+        metrics[f"Delta_D{d}_Hit_D{d_next}_MissRate@10"] = (
+            metrics[f"D{d}_Hit_D{d_next}_MissRate@10_post"] - metrics[f"D{d}_Hit_D{d_next}_MissRate@10_pre"]
+        )
+    return metrics
 
 
 def main() -> None:
@@ -276,6 +430,8 @@ def main() -> None:
     parser.add_argument("--iter_pre", type=int, default=0)
     parser.add_argument("--iter_post", type=int, default=1)
     parser.add_argument("--eval_k", type=int, default=10)
+    parser.add_argument("--region_depths", type=str, default="auto",
+                        help="Comma-separated depths (e.g., 1,2,3,4) or 'auto' for 1..max gold depth.")
     parser.add_argument("--output_json", type=str, required=True)
     args = parser.parse_args()
 
@@ -288,18 +444,21 @@ def main() -> None:
 
     baseline_samples = pkl.load(open(baseline_pkl, "rb"))
     ours_samples = pkl.load(open(ours_pkl, "rb"))
+    region_depths = _parse_region_depths(args.region_depths, baseline_samples, ours_samples)
 
     baseline_metrics = _eval_single_run(
         sample_dicts=baseline_samples,
         iter_pre=args.iter_pre,
         iter_post=args.iter_post,
         eval_k=args.eval_k,
+        region_depths=region_depths,
     )
     ours_metrics = _eval_single_run(
         sample_dicts=ours_samples,
         iter_pre=args.iter_pre,
         iter_post=args.iter_post,
         eval_k=args.eval_k,
+        region_depths=region_depths,
     )
 
     # Intent: this isolates first-rewrite effect as a difference-in-differences delta.
@@ -324,6 +483,18 @@ def main() -> None:
         "DeltaPrompt_RetainedCount@10_pre_vs_post": (
             ours_metrics["RetainedCount@10_pre_vs_post"] - baseline_metrics["RetainedCount@10_pre_vs_post"]
         ),
+        # Prompt-attributed gain in spread across depth-1 branches after rewrite.
+        "DeltaPrompt_Delta_MeanUniqueDepth1Branches@10": (
+            ours_metrics["Delta_MeanUniqueDepth1Branches@10"] - baseline_metrics["Delta_MeanUniqueDepth1Branches@10"]
+        ),
+        # Prompt-attributed change in single depth-1 branch concentration rate.
+        "DeltaPrompt_Delta_SingleDepth1BranchRate@10": (
+            ours_metrics["Delta_SingleDepth1BranchRate@10"] - baseline_metrics["Delta_SingleDepth1BranchRate@10"]
+        ),
+        # Prompt-attributed change in dominant depth-1 branch share.
+        "DeltaPrompt_Delta_MeanMaxDepth1Share@10": (
+            ours_metrics["Delta_MeanMaxDepth1Share@10"] - baseline_metrics["Delta_MeanMaxDepth1Share@10"]
+        ),
         # Prompt-attributed gain in Bad0 level-1 region-hit recovery.
         "DeltaPrompt_Delta_RegionHitL1@10_givenPreMiss": (
             ours_metrics["Delta_RegionHitL1@10_givenPreMiss"] - baseline_metrics["Delta_RegionHitL1@10_givenPreMiss"]
@@ -342,12 +513,30 @@ def main() -> None:
             - (baseline_metrics["MissToHit@10_givenPreMiss"] - baseline_metrics["HarmRate@10_givenGood0"])
         ),
     }
+    for d in region_depths:
+        d = int(d)
+        did[f"DeltaPrompt_Delta_RegionHitD{d}@10"] = (
+            ours_metrics[f"Delta_RegionHitD{d}@10"] - baseline_metrics[f"Delta_RegionHitD{d}@10"]
+        )
+        did[f"DeltaPrompt_Delta_RegionHitD{d}@10_givenPreMiss"] = (
+            ours_metrics[f"Delta_RegionHitD{d}@10_givenPreMiss"] - baseline_metrics[f"Delta_RegionHitD{d}@10_givenPreMiss"]
+        )
+    sorted_depths = sorted([int(d) for d in region_depths])
+    for d in sorted_depths:
+        d_next = d + 1
+        k_post = f"P_RegionHitD{d_next}@10_given_D{d}_post"
+        k_miss = f"Delta_D{d}_Hit_D{d_next}_MissRate@10"
+        if k_post in baseline_metrics and k_post in ours_metrics:
+            did[f"DeltaPrompt_{k_post}"] = ours_metrics[k_post] - baseline_metrics[k_post]
+        if k_miss in baseline_metrics and k_miss in ours_metrics:
+            did[f"DeltaPrompt_{k_miss}"] = ours_metrics[k_miss] - baseline_metrics[k_miss]
 
     report = {
         "meta": {
             "iter_pre": args.iter_pre,
             "iter_post": args.iter_post,
             "eval_k": args.eval_k,
+            "region_depths": list(region_depths),
             "note": "Compare original-query retrieval (iter_pre) vs first-rewrite retrieval (iter_post).",
         },
         "baseline": {

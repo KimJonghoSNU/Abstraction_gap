@@ -31,15 +31,13 @@ for subset in "${SUBSETS[@]}"; do
 
     baseline_candidates=$(
         find "results/BRIGHT/${subset}" -type f -name "all_eval_sample_dicts.pkl" \
-        | grep "RPN=thinkqe_round3" \
-        | grep -v "RALR=" || true
+        | grep "S=round3_anchor_local_rank_none_thinkqe_round3-" || true
     )
 
 
     ours_candidates=$(
         find "results/BRIGHT/${subset}" -type f -name "all_eval_sample_dicts.pkl" \
-        | grep "RPN=round3_action_v1" \
-        | grep -v "RALR=" || true
+        | grep "S=round3_anchor_local_rank_none_round3_action_v1-" || true
     )
 
     baseline_pkl=$(pick_single_or_fail "baseline(${subset})" "${baseline_candidates}")

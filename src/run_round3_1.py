@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import pickle as pkl
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -14,6 +15,7 @@ from tqdm.autonotebook import tqdm
 
 from cache_utils import _prompt_cache_key, append_jsonl
 from flat_then_tree import FlatHit, gate_hit, is_prefix
+from history_prompts import build_retrieval_history_block, prepend_history_to_prompt
 from hyperparams import HyperParams
 from llm_apis import GenAIAPI, VllmAPI
 from retrievers.diver import DiverEmbeddingModel
@@ -77,6 +79,7 @@ def _format_action_prompt(
     previous_docs: Dict[str, str],
     leaf_descs: List[str],
     branch_descs: List[str],
+    retrieval_history: str = "",
 ) -> str:
     leaf_blob = "\n".join([x for x in leaf_descs if x])
     branch_blob = "\n".join([x for x in branch_descs if x])
@@ -90,7 +93,7 @@ def _format_action_prompt(
     if not branch_blob:
         template = template.replace("Branch Context:\n{branch_descs}\n", "")
     try:
-        return template.format(
+        prompt = template.format(
             original_query=(original_query or ""),
             previous_rewrite=(previous_rewrite or ""),
             previous_docs=prev_blob,
@@ -98,8 +101,9 @@ def _format_action_prompt(
             branch_descs=branch_blob,
             gate_descs=gate_blob,
         )
+        return prepend_history_to_prompt(prompt, retrieval_history)
     except KeyError:
-        return (
+        prompt = (
             template
             .replace("{original_query}", original_query or "")
             .replace("{previous_rewrite}", previous_rewrite or "")
@@ -108,6 +112,7 @@ def _format_action_prompt(
             .replace("{branch_descs}", branch_blob)
             .replace("{gate_descs}", gate_blob)
         )
+        return prepend_history_to_prompt(prompt, retrieval_history)
 
 
 def _normalize_action(value: object) -> str:
@@ -179,6 +184,114 @@ def _parse_action_output(text: str) -> Tuple[Dict[str, str] | None, Dict[str, st
     return None, None, "exploit", cleaned.strip()
 
 
+def _format_v5_rerank_prompt(
+    query: str,
+    candidates: Sequence[Dict[str, str]],
+) -> str:
+    lines = [
+        "You are given a query and retrieved documents.\n",
+        "The documents we want are the ones that would be used as core evidence or justification for that answer to the query. Infer which academic terms, theories, models, examples, or canonical methods would be cited as a core evidence.\n",
+        "Reorder the retrieved documents (do remove non-relevant ones).",
+        "The results should be sorted in descending order of relevance.",
+        "Output format:",
+        "{",
+        "\"ranks\": [\"[doc_idx]\", \"[doc_idx]\", ...],",
+        "\"reason\": \"<reason for this action>\"",
+        "}",
+        "",
+        f"Query:\n{query}",
+        "",
+        "Retrieved documents:",
+    ]
+    for i, cand in enumerate(candidates, start=1):
+        doc_id = str(cand.get("doc_id", "")).strip()
+        desc = str(cand.get("desc", "")).strip().replace("\n", " ")
+        lines.append(f"[{i}]. summary={doc_id} {desc}")
+    return "\n".join(lines)
+
+
+def _parse_v5_rerank_output(text: str) -> Tuple[List[int], str]:
+    cleaned = text.split("</think>\n")[-1].strip()
+    if "```" in cleaned:
+        try:
+            parts = cleaned.split("```")
+            fenced = [parts[i] for i in range(1, len(parts), 2)]
+            if fenced:
+                cleaned = fenced[-1].strip()
+        except Exception:
+            pass
+    obj = None
+    try:
+        obj = json.loads(cleaned)
+    except Exception:
+        try:
+            obj = repair_json(cleaned, return_objects=True)
+        except Exception:
+            obj = None
+    if not isinstance(obj, dict):
+        return [], ""
+    raw_ranks = obj.get("ranks", [])
+    ranks: List[int] = []
+    if isinstance(raw_ranks, list):
+        for x in raw_ranks:
+            s = str(x or "").strip()
+            if not s:
+                continue
+            if s.startswith("[") and s.endswith("]"):
+                s = s[1:-1].strip()
+            try:
+                ranks.append(int(s))
+            except Exception:
+                continue
+    reason = str(obj.get("reason", obj.get("reason ", "")) or "").strip()
+    return ranks, reason
+
+
+def _apply_v5_rerank_to_candidates(
+    ranked_indices: Sequence[int],
+    candidate_paths: Sequence[Tuple[int, ...]],
+    path_to_doc_id: Dict[Tuple[int, ...], str],
+    topk: int,
+) -> Tuple[List[Tuple[int, ...]], List[str]]:
+    topk = max(1, int(topk))
+    selected_paths: List[Tuple[int, ...]] = []
+    selected_doc_ids: List[str] = []
+    seen_paths: set[Tuple[int, ...]] = set()
+    for rank_idx in ranked_indices:
+        cand_pos = int(rank_idx) - 1
+        if cand_pos < 0 or cand_pos >= len(candidate_paths):
+            continue
+        path = tuple(candidate_paths[cand_pos])
+        if path in seen_paths:
+            continue
+        selected_paths.append(path)
+        selected_doc_ids.append(str(path_to_doc_id.get(path, "")).strip() or f"path:{path}")
+        seen_paths.add(path)
+        if len(selected_paths) >= topk:
+            break
+    # Intent: if LLM returns fewer than top-k indices, backfill by the original candidate order.
+    for path in candidate_paths:
+        path_t = tuple(path)
+        if path_t in seen_paths:
+            continue
+        doc_id = str(path_to_doc_id.get(path_t, "")).strip()
+        selected_paths.append(path_t)
+        selected_doc_ids.append(doc_id or f"path:{path_t}")
+        seen_paths.add(path_t)
+        if len(selected_paths) >= topk:
+            break
+    return selected_paths[:topk], selected_doc_ids[:topk]
+
+
+def _truncate_text_words(text: str, max_words: int) -> str:
+    if max_words <= 0:
+        return ""
+    words = str(text or "").split()
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words])
+
+
 def _flatten_docs_by_action(docs: Dict[str, str], actions: Dict[str, str]) -> str:
     pieces: List[str] = []
     for key in CATEGORY_ORDER:
@@ -207,6 +320,21 @@ def _apply_action_rewrite(original_query: str, action: str, rewrite: str, explor
             return (original_query + " " + rewrite).strip()
         return rewrite
     return (original_query + " " + rewrite).strip()
+
+
+def _strip_original_query_prefix(original_query: str, query_t: str) -> str:
+    original = (original_query or "").strip()
+    query = (query_t or "").strip()
+    if not original:
+        return query
+    # Intent: history should focus on iterative rewrite deltas, not repeated original-query prefix.
+    if query == original:
+        return ""
+    if query.startswith(original + " "):
+        return query[len(original):].strip()
+    if query.startswith(original):
+        return query[len(original):].strip()
+    return query
 
 
 def _hits_to_context_descs(
@@ -359,6 +487,150 @@ def _topk_from_scores(scores: np.ndarray, topk: int) -> Tuple[np.ndarray, np.nda
     idx = np.argpartition(-scores, kth=k - 1)[:k]
     idx = idx[np.argsort(-scores[idx])]
     return idx.astype(np.int64, copy=False), scores[idx].astype(np.float32, copy=False)
+
+
+def _anchor_leaf_only_paths(anchor_hits: Sequence[FlatHit], topk: int) -> List[Tuple[int, ...]]:
+    paths: List[Tuple[int, ...]] = []
+    seen_paths: set[Tuple[int, ...]] = set()
+    for h in anchor_hits:
+        if not h.is_leaf:
+            continue
+        path_t = tuple(h.path)
+        if path_t in seen_paths:
+            continue
+        paths.append(path_t)
+        seen_paths.add(path_t)
+        if len(paths) >= topk:
+            break
+    return paths
+
+
+def _doc_id_prefix(doc_id: str) -> str:
+    text = str(doc_id or "").strip()
+    if not text:
+        return ""
+    if text.endswith(".txt"):
+        text = text[:-4]
+    return re.sub(r"_\d+$", "", text)
+
+
+def _build_v6_candidate_paths(
+    anchor_hits: Sequence[FlatHit],
+    node_embs: np.ndarray,
+    node_registry: Sequence[object],
+    path_to_doc_id: Dict[Tuple[int, ...], str],
+    leaf_indices: Sequence[int],
+    base_topk: int,
+    candidate_topk: int,
+    leaf_knn_indices: Optional[np.ndarray],
+    leaf_knn_scores: Optional[np.ndarray],
+    leaf_knn_row_by_registry: Optional[Dict[int, int]],
+) -> List[Tuple[int, ...]]:
+    base_paths = _anchor_leaf_only_paths(anchor_hits, topk=base_topk)
+    if len(base_paths) >= candidate_topk:
+        return list(base_paths[:candidate_topk])
+
+    seed_leaf_indices: List[int] = []
+    seen_seed_paths: set[Tuple[int, ...]] = set()
+    for h in anchor_hits:
+        if not h.is_leaf:
+            continue
+        path_t = tuple(h.path)
+        if path_t in seen_seed_paths:
+            continue
+        seed_leaf_indices.append(int(h.registry_idx))
+        seen_seed_paths.add(path_t)
+        if len(seed_leaf_indices) >= base_topk:
+            break
+
+    if not seed_leaf_indices:
+        return list(base_paths)
+
+    seed_set = set(seed_leaf_indices)
+    seen_paths: set[Tuple[int, ...]] = {tuple(p) for p in base_paths}
+    base_prefixes = {
+        _doc_id_prefix(path_to_doc_id.get(tuple(path), ""))
+        for path in base_paths
+    }
+    base_prefixes.discard("")
+    extra_needed = max(0, int(candidate_topk) - len(base_paths))
+    if extra_needed <= 0:
+        return list(base_paths[:candidate_topk])
+
+    if leaf_knn_indices is not None and leaf_knn_scores is not None and leaf_knn_row_by_registry:
+        score_by_registry_idx: Dict[int, float] = {}
+        for seed_idx in seed_leaf_indices:
+            row = leaf_knn_row_by_registry.get(int(seed_idx))
+            if row is None:
+                continue
+            neigh_idx_row = leaf_knn_indices[int(row)]
+            neigh_score_row = leaf_knn_scores[int(row)]
+            for neigh_idx, neigh_score in zip(neigh_idx_row.tolist(), neigh_score_row.tolist()):
+                neigh_idx = int(neigh_idx)
+                if neigh_idx < 0 or neigh_idx >= len(node_registry):
+                    continue
+                if neigh_idx in seed_set:
+                    continue
+                path_t = tuple(node_registry[neigh_idx].path)
+                if path_t in seen_paths:
+                    continue
+                doc_prefix = _doc_id_prefix(path_to_doc_id.get(path_t, ""))
+                if doc_prefix in base_prefixes:
+                    continue
+                prev = score_by_registry_idx.get(neigh_idx, float("-inf"))
+                if float(neigh_score) > prev:
+                    score_by_registry_idx[neigh_idx] = float(neigh_score)
+        if score_by_registry_idx:
+            ranked = sorted(score_by_registry_idx.items(), key=lambda x: x[1], reverse=True)
+            extra_paths: List[Tuple[int, ...]] = []
+            for reg_idx, _ in ranked:
+                path_t = tuple(node_registry[int(reg_idx)].path)
+                if path_t in seen_paths:
+                    continue
+                extra_paths.append(path_t)
+                seen_paths.add(path_t)
+                if len(extra_paths) >= extra_needed:
+                    break
+            if len(extra_paths) >= extra_needed:
+                # Intent: precomputed leaf-kNN graph accelerates v6 without changing seed-prefix filtering logic.
+                return list(base_paths) + extra_paths[:extra_needed]
+
+    candidate_indices: List[int] = []
+    candidate_paths: List[Tuple[int, ...]] = []
+
+    for leaf_idx in leaf_indices:
+        leaf_idx = int(leaf_idx)
+        if leaf_idx in seed_set:
+            continue
+        leaf_node = node_registry[leaf_idx]
+        path_t = tuple(leaf_node.path)
+        doc_prefix = _doc_id_prefix(path_to_doc_id.get(path_t, ""))
+        if doc_prefix in base_prefixes:
+            continue
+        candidate_indices.append(leaf_idx)
+        candidate_paths.append(path_t)
+
+    if not candidate_indices:
+        return list(base_paths)
+
+    # Intent: v6 extra docs are chosen by max cosine similarity to any seed leaf, not by query scores.
+    seed_embs = node_embs[np.array(seed_leaf_indices, dtype=np.int64)]
+    cand_embs = node_embs[np.array(candidate_indices, dtype=np.int64)]
+    sim_matrix = cand_embs @ seed_embs.T
+    cand_scores = sim_matrix.max(axis=1)
+    order = np.argsort(-cand_scores)
+
+    extra_paths: List[Tuple[int, ...]] = []
+    for ridx in order.tolist():
+        path_t = candidate_paths[int(ridx)]
+        if path_t in seen_paths:
+            continue
+        extra_paths.append(path_t)
+        seen_paths.add(path_t)
+        if len(extra_paths) >= extra_needed:
+            break
+
+    return list(base_paths) + extra_paths
 
 
 def _hits_from_scores(
@@ -646,6 +918,7 @@ semantic_root_node = SemanticNode().load_dict(tree_dict) if isinstance(tree_dict
 node_registry = compute_node_registry(semantic_root_node)
 all_leaf_nodes = get_all_leaf_nodes_with_path(semantic_root_node)
 doc_id_to_path = {get_node_id(leaf.id, docs_df): path for leaf, path in all_leaf_nodes}
+path_to_doc_id = {tuple(path): str(doc_id) for doc_id, path in doc_id_to_path.items()}
 node_by_path = {tuple(node.path): node for node in node_registry}
 
 if not hp.RETRIEVER_MODEL_PATH:
@@ -667,6 +940,28 @@ for idx, path in zip(leaf_indices, leaf_paths):
     for d in range(1, len(path)):
         prefix = path[:d]
         leaf_indices_by_prefix.setdefault(prefix, []).append(idx)
+
+v6_leaf_knn_indices: Optional[np.ndarray] = None
+v6_leaf_knn_scores: Optional[np.ndarray] = None
+v6_leaf_knn_row_by_registry: Optional[Dict[int, int]] = None
+if hp.ROUND3_ANCHOR_LOCAL_RANK == "v6" and hp.ROUND3_V6_LEAF_KNN_PATH:
+    if not os.path.exists(hp.ROUND3_V6_LEAF_KNN_PATH):
+        raise FileNotFoundError(f"--round3_v6_leaf_knn_path not found: {hp.ROUND3_V6_LEAF_KNN_PATH}")
+    knn_pack = np.load(hp.ROUND3_V6_LEAF_KNN_PATH, allow_pickle=False)
+    leaf_registry_indices = knn_pack["leaf_registry_indices"].astype(np.int64, copy=False)
+    v6_leaf_knn_indices = knn_pack["neighbor_registry_indices"].astype(np.int64, copy=False)
+    v6_leaf_knn_scores = knn_pack["neighbor_scores"].astype(np.float32, copy=False)
+    if v6_leaf_knn_indices.shape != v6_leaf_knn_scores.shape:
+        raise ValueError("neighbor_registry_indices and neighbor_scores must have the same shape")
+    if v6_leaf_knn_indices.shape[0] != leaf_registry_indices.shape[0]:
+        raise ValueError("leaf_registry_indices and neighbor arrays row counts must match")
+    v6_leaf_knn_row_by_registry = {int(reg_idx): row for row, reg_idx in enumerate(leaf_registry_indices.tolist())}
+    logger.info(
+        "Loaded v6 leaf-kNN graph: rows=%d, topk=%d, path=%s",
+        v6_leaf_knn_indices.shape[0],
+        v6_leaf_knn_indices.shape[1] if v6_leaf_knn_indices.ndim == 2 else -1,
+        hp.ROUND3_V6_LEAF_KNN_PATH,
+    )
 
 rewrite_enabled = True
 rewrite_template = None
@@ -758,21 +1053,44 @@ for iter_idx in range(hp.NUM_ITERS):
     branch_paths_by_sample: List[List[Tuple[int, ...]]] = []
     densities_by_sample: List[Dict[Tuple[int, ...], float]] = []
     retrieval_queries_by_sample: List[str] = []
+    retrieval_query_actions_by_sample: List[str] = []
+    retrieval_query_actions_map_by_sample: List[Dict[str, str]] = []
+    retrieval_query_docs_by_sample: List[Dict[str, str]] = []
+    rewrite_candidate_idx_by_sample: Dict[int, int] = {}
+
+    v5_enabled = hp.ROUND3_ANCHOR_LOCAL_RANK in {"v5", "v6"}
+    v5_mode = hp.ROUND3_ANCHOR_LOCAL_RANK
+    v5_candidate_topk = 20
+    v5_output_topk = 10
+    v5_rerank_prompts: List[str] = []
+    v5_rerank_meta: List[Dict] = []
+    v5_rerank_doc_ids_by_sample: List[List[str]] = [[] for _ in all_eval_samples]
+    v5_rerank_reason_by_sample: List[str] = ["" for _ in all_eval_samples]
+    v6_seed_top10_recall_by_sample: List[float] = []
+    v6_seed_top20_recall_by_sample: List[float] = []
+    v6_expanded_top20_recall_by_sample: List[float] = []
 
     # tqdm shows per-iteration retrieval progress in terminal runs.
-    for sample in tqdm(
+    for sample_idx, sample in enumerate(tqdm(
         all_eval_samples,
         desc=f"Iter {iter_idx} anchor retrieval",
         total=len(all_eval_samples),
         leave=False,
-    ):
+    )):
         if iter_idx == 0 and sample is all_eval_samples[0]:
             logger.info("Iter %d: starting anchor retrieval", iter_idx)
         #   - Single‑action mode → _apply_action_rewrite is used every iter.
         #   - Per‑level actions mode → _compose_query_from_docs is used instead, once last_possible_docs is filled.
         if sample.last_possible_docs:
+            # Intent: snapshot the exact query-control state used for this retrieval before rewrite updates it.
+            query_action_t = "multi"
+            query_actions_t = dict(sample.last_actions or {})
+            query_docs_t = dict(sample.last_possible_docs or {})
             anchor_query = _compose_query_from_docs(sample.original_query, sample.last_possible_docs, sample.last_actions)
         else:
+            query_action_t = str(sample.last_action or "exploit").strip().lower()
+            query_actions_t = {}
+            query_docs_t = {}
             anchor_query = _apply_action_rewrite(
                 sample.original_query,
                 sample.last_action,
@@ -788,7 +1106,67 @@ for iter_idx in range(hp.NUM_ITERS):
             topk=anchor_topk,
         )
         anchor_hits_by_sample.append(hits)
-        if hp.ROUND3_ANCHOR_LOCAL_RANK != "none":
+        if v5_enabled:
+            # Intent: v5/v6 first expands to top-20 candidates, then reranks to top-10 with LLM.
+            if v5_mode == "v6":
+                v6_seed_top10_paths = _anchor_leaf_only_paths(hits, topk=10)
+                v6_seed_top20_paths = _anchor_leaf_only_paths(hits, topk=20)
+                v5_candidate_paths = _build_v6_candidate_paths(
+                    anchor_hits=hits,
+                    node_embs=node_embs,
+                    node_registry=node_registry,
+                    path_to_doc_id=path_to_doc_id,
+                    leaf_indices=leaf_indices,
+                    base_topk=10,
+                    candidate_topk=v5_candidate_topk,
+                    leaf_knn_indices=v6_leaf_knn_indices,
+                    leaf_knn_scores=v6_leaf_knn_scores,
+                    leaf_knn_row_by_registry=v6_leaf_knn_row_by_registry,
+                )
+                v6_seed_top10_recall = compute_recall(
+                    [list(p) for p in v6_seed_top10_paths[:10]],
+                    [list(p) for p in sample.gold_paths],
+                    k=10,
+                ) * 100.0
+                v6_seed_top20_recall = compute_recall(
+                    [list(p) for p in v6_seed_top20_paths[:20]],
+                    [list(p) for p in sample.gold_paths],
+                    k=20,
+                ) * 100.0
+                v6_expanded_top20_recall = compute_recall(
+                    [list(p) for p in v5_candidate_paths[:20]],
+                    [list(p) for p in sample.gold_paths],
+                    k=20,
+                ) * 100.0
+                # Intent: compare v6 expansion against leaf-only baselines before LLM rerank.
+                v6_seed_top10_recall_by_sample.append(float(v6_seed_top10_recall))
+                v6_seed_top20_recall_by_sample.append(float(v6_seed_top20_recall))
+                v6_expanded_top20_recall_by_sample.append(float(v6_expanded_top20_recall))
+            else:
+                # Intent: v5 seed candidates should follow anchor_local_rank=none behavior (leaf-only from anchor order).
+                v5_candidate_paths = _anchor_leaf_only_paths(hits, topk=v5_candidate_topk)
+            candidate_docs: List[Dict[str, str]] = []
+            for path in v5_candidate_paths:
+                node = node_by_path.get(tuple(path))
+                if not node:
+                    continue
+                doc_id = str(path_to_doc_id.get(tuple(path), "")).strip()
+                if not doc_id:
+                    doc_id = f"path:{tuple(path)}"
+                desc = node.desc
+                if hp.MAX_DOC_DESC_CHAR_LEN:
+                    desc = desc[: hp.MAX_DOC_DESC_CHAR_LEN]
+                # Intent: cap rerank evidence length per document to control prompt latency and timeout risk.
+                desc = _truncate_text_words(desc, 1024)
+                candidate_docs.append({"doc_id": doc_id, "desc": desc})
+            rerank_prompt = _format_v5_rerank_prompt(anchor_query, candidate_docs)
+            v5_rerank_prompts.append(rerank_prompt)
+            v5_rerank_meta.append({
+                "sample_idx": sample_idx,
+                "candidate_paths": v5_candidate_paths,
+            })
+            anchor_eval_paths = list(v5_candidate_paths)
+        elif hp.ROUND3_ANCHOR_LOCAL_RANK != "none":
             anchor_eval_paths = _anchor_local_context_paths(
                 anchor_hits=hits,
                 anchor_topk=anchor_topk,
@@ -812,6 +1190,9 @@ for iter_idx in range(hp.NUM_ITERS):
         branch_paths_by_sample.append(ranked_branches)
         densities_by_sample.append(densities)
         retrieval_queries_by_sample.append(anchor_query)
+        retrieval_query_actions_by_sample.append(query_action_t)
+        retrieval_query_actions_map_by_sample.append(query_actions_t)
+        retrieval_query_docs_by_sample.append(query_docs_t)
 
         local_leaf_indices = _filter_leaf_indices_by_prefixes(leaf_indices, leaf_paths, ranked_branches)
         if local_leaf_indices:
@@ -967,6 +1348,14 @@ for iter_idx in range(hp.NUM_ITERS):
                             router_branch_descs.append(desc)
 
             prev_blob = "\n".join([f"{k}: {v}" for k, v in sample.last_possible_docs.items() if v])
+            if hp.ROUND3_REWRITE_USE_HISTORY:
+                retrieval_history = build_retrieval_history_block(
+                    sample.iter_records,
+                    path_to_doc_id,
+                    topk=hp.ROUND3_REWRITE_HISTORY_TOPK,
+                )
+            else:
+                retrieval_history = ""
             rewrite_candidates.append({
                 "sample": sample,
                 "leaf_descs": leaf_descs,
@@ -974,7 +1363,52 @@ for iter_idx in range(hp.NUM_ITERS):
                 "router_leaf_descs": router_leaf_descs,
                 "router_branch_descs": router_branch_descs,
                 "prev_blob": prev_blob,
+                "retrieval_history": retrieval_history,
             })
+            rewrite_candidate_idx_by_sample[sample_idx] = len(rewrite_candidates) - 1
+
+    if v5_enabled and v5_rerank_prompts:
+        v5_llm_kwargs = dict(llm_api_kwargs)
+        v5_llm_kwargs["temperature"] = 0.0
+        logger.info("Iter %d: starting %s rerank batch (%d prompts)", iter_idx, v5_mode, len(v5_rerank_prompts))
+        v5_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(v5_loop)
+        try:
+            v5_outputs = v5_loop.run_until_complete(
+                llm_api.run_batch(v5_rerank_prompts, **v5_llm_kwargs)
+            )
+        finally:
+            v5_loop.close()
+            asyncio.set_event_loop(None)
+        for meta, out in zip(v5_rerank_meta, v5_outputs):
+            sample_idx = int(meta["sample_idx"])
+            candidate_paths = [tuple(p) for p in meta.get("candidate_paths", [])]
+            ranked_indices, reason = _parse_v5_rerank_output(out)
+            top_paths, selected_doc_ids = _apply_v5_rerank_to_candidates(
+                ranked_indices=ranked_indices,
+                candidate_paths=candidate_paths,
+                path_to_doc_id=path_to_doc_id,
+                topk=v5_output_topk,
+            )
+            seen_paths: set[Tuple[int, ...]] = set(top_paths)
+            tail_paths: List[Tuple[int, ...]] = []
+            for path in candidate_paths:
+                path_t = tuple(path)
+                if path_t in seen_paths:
+                    continue
+                tail_paths.append(path_t)
+            anchor_eval_paths_by_sample[sample_idx] = list(top_paths) + tail_paths
+            v5_rerank_doc_ids_by_sample[sample_idx] = selected_doc_ids
+            v5_rerank_reason_by_sample[sample_idx] = reason
+            if sample_idx in rewrite_candidate_idx_by_sample:
+                # Intent: next rewrite context should follow v5 reranked top documents.
+                idx = rewrite_candidate_idx_by_sample[sample_idx]
+                rewrite_candidates[idx]["leaf_descs"] = _paths_to_context_descs(
+                    top_paths,
+                    node_by_path,
+                    hp.REWRITE_CONTEXT_TOPK,
+                    hp.MAX_DOC_DESC_CHAR_LEN,
+                )
 
     if rewrite_candidates:
         # Intent: split router (action) from executor (rewrite) to keep round3_action_v1 content while decoupling decisions.
@@ -985,6 +1419,7 @@ for iter_idx in range(hp.NUM_ITERS):
                 sample = meta["sample"]
                 router_leaf_descs = meta["router_leaf_descs"]
                 router_branch_descs = meta["router_branch_descs"] if hp.ROUND3_ROUTER_CONTEXT == "leaf_branch" else []
+                retrieval_history = meta.get("retrieval_history", "")
                 prompt = _format_action_prompt(
                     router_template,
                     sample.original_query,
@@ -992,6 +1427,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     sample.last_possible_docs,
                     router_leaf_descs,
                     router_branch_descs,
+                    retrieval_history=retrieval_history,
                 )
                 router_cache_key = _prompt_cache_key("round3_router", prompt)
                 if (not hp.ROUND3_ROUTER_FORCE_REFRESH) and (router_cache_key in router_action_map):
@@ -1010,6 +1446,7 @@ for iter_idx in range(hp.NUM_ITERS):
                         "cache_key": router_cache_key,
                         "leaf_descs": router_leaf_descs,
                         "branch_descs": router_branch_descs,
+                        "retrieval_history": retrieval_history,
                     })
             if router_prompts:
                 logger.info("Iter %d: starting router batch (%d prompts)", iter_idx, len(router_prompts))
@@ -1041,6 +1478,7 @@ for iter_idx in range(hp.NUM_ITERS):
                         "llm": hp.LLM,
                         "leaf_descs": meta.get("leaf_descs", []),
                         "branch_descs": meta.get("branch_descs", []),
+                        "retrieval_history": meta.get("retrieval_history", ""),
                     })
                 if hp.ROUND3_ROUTER_CACHE_PATH and router_records:
                     append_jsonl(hp.ROUND3_ROUTER_CACHE_PATH, router_records)
@@ -1051,6 +1489,7 @@ for iter_idx in range(hp.NUM_ITERS):
             sample = meta["sample"]
             leaf_descs = meta["leaf_descs"]
             branch_descs = meta["branch_descs"] if hp.ROUND3_REWRITE_CONTEXT == "leaf_branch" else []
+            retrieval_history = meta.get("retrieval_history", "")
             if router_enabled:
                 action = str(sample.last_action or "exploit").strip().lower()
                 if action not in {"explore", "exploit"}:
@@ -1068,6 +1507,7 @@ for iter_idx in range(hp.NUM_ITERS):
                 sample.last_possible_docs,
                 leaf_descs,
                 branch_descs,
+                retrieval_history=retrieval_history,
             )
             cache_key = _prompt_cache_key("round3", prompt)
             if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
@@ -1103,6 +1543,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     "cache_key": cache_key,
                     "leaf_descs": leaf_descs,
                     "branch_descs": branch_descs,
+                    "retrieval_history": retrieval_history,
                 })
 
         if rewrite_prompts:
@@ -1157,6 +1598,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     "llm": hp.LLM,
                     "leaf_descs": meta.get("leaf_descs", []),
                     "branch_descs": meta.get("branch_descs", []),
+                    "retrieval_history": meta.get("retrieval_history", ""),
                 })
             if hp.REWRITE_CACHE_PATH and new_records:
                 append_jsonl(hp.REWRITE_CACHE_PATH, new_records)
@@ -1183,7 +1625,7 @@ for iter_idx in range(hp.NUM_ITERS):
             float(np.mean(anchor_branch_hits)) * 100.0,
         )
     # tqdm shows per-iteration local/global scoring progress in terminal runs.
-    for sample, anchor_eval_paths, leaf_hits, branch_hits, local_hits, global_hits, active_paths, densities, query_t in tqdm(
+    for sample, anchor_eval_paths, leaf_hits, branch_hits, local_hits, global_hits, active_paths, densities, query_t, query_action_t, query_actions_t, query_docs_t, v5_doc_ids_t, v5_reason_t in tqdm(
         zip(
             all_eval_samples,
             anchor_eval_paths_by_sample,
@@ -1194,6 +1636,11 @@ for iter_idx in range(hp.NUM_ITERS):
             branch_paths_by_sample,
             densities_by_sample,
             retrieval_queries_by_sample,
+            retrieval_query_actions_by_sample,
+            retrieval_query_actions_map_by_sample,
+            retrieval_query_docs_by_sample,
+            v5_rerank_doc_ids_by_sample,
+            v5_rerank_reason_by_sample,
         ),
         desc=f"Iter {iter_idx} local/global scoring",
         total=len(all_eval_samples),
@@ -1251,6 +1698,13 @@ for iter_idx in range(hp.NUM_ITERS):
             "possible_docs": sample.last_possible_docs,
             "rewrite": sample.last_rewrite,
             "query_t": query_t,
+            "query_t_history": _strip_original_query_prefix(sample.original_query, query_t),
+            "query_action": query_action_t,
+            "query_actions": query_actions_t,
+            "query_possible_docs": query_docs_t,
+            "v5_rerank_doc_ids": v5_doc_ids_t,
+            "v5_rerank_reason": v5_reason_t,
+            "anchor_eval_paths": anchor_paths,
             "anchor_leaf_paths": [h.path for h in leaf_hits],
             "anchor_branch_paths": [h.path for h in branch_hits],
             "active_branch_paths": active_paths,
@@ -1273,6 +1727,33 @@ for iter_idx in range(hp.NUM_ITERS):
             iter_df["Recall@100"].mean(),
             iter_df["Local_Recall@100"].mean(),
         )
+        if (
+            v5_mode == "v6"
+            and v6_seed_top10_recall_by_sample
+            and v6_seed_top20_recall_by_sample
+            and v6_expanded_top20_recall_by_sample
+        ):
+            seed10_mean = float(np.mean(v6_seed_top10_recall_by_sample))
+            seed20_mean = float(np.mean(v6_seed_top20_recall_by_sample))
+            expanded20_mean = float(np.mean(v6_expanded_top20_recall_by_sample))
+            delta_vs_seed20 = expanded20_mean - seed20_mean
+            improved_ratio = float(
+                np.mean(
+                    [
+                        1.0 if exp > seed else 0.0
+                        for seed, exp in zip(v6_seed_top20_recall_by_sample, v6_expanded_top20_recall_by_sample)
+                    ]
+                )
+            ) * 100.0
+            logger.info(
+                "Iter %d | V6 pre-rerank recall: SeedTop10@10=%.2f | SeedTop20@20=%.2f | ExpandedTop20@20=%.2f (DeltaVsSeed20=%.2f, ImprovedVsSeed20=%.2f%%)",
+                iter_idx,
+                seed10_mean,
+                seed20_mean,
+                expanded20_mean,
+                delta_vs_seed20,
+                improved_ratio,
+            )
     else:
         logger.info(
             "Iter %d | Anchor nDCG@10=0.00 | Local nDCG@10=0.00 | "

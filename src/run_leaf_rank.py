@@ -266,70 +266,74 @@ logger.info(f"Loaded {len(samples)} eval samples.")
 metrics_path = f"{RESULTS_DIR}/leaf_iter_metrics.jsonl"
 rewrite_records = []
 
-logger.info("Starting initial rewrite.")
-init_prompts = []
-init_meta = []
-for sample in samples:
-    hits = flat_retrieve_hits(
-        retriever=retriever,
-        query=sample["original_query"],
-        node_embs=node_embs,
-        node_registry=node_registry,
-        topk=hp.FLAT_TOPK,
-    )
-    if hp.LEAF_ONLY_RETRIEVAL:
-        rewrite_hits = [h for h in hits if h.is_leaf]
-    else:
-        rewrite_hits = [h for h in hits if not h.is_leaf]
-    context_descs = _hits_to_context_descs(rewrite_hits, node_registry, hp.REWRITE_CONTEXT_TOPK, hp.MAX_DOC_DESC_CHAR_LEN)
-    cache_key = _rewrite_cache_key("leaf_init", sample["original_query"], context_descs, iter_idx=None)
-    if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
-        rewrite = rewrite_map[cache_key]
-        sample["last_rewrite"] = rewrite
-        sample["current_query"] = _apply_rewrite(hp.REWRITE_MODE, sample["original_query"], rewrite)
-        continue
-    if rewrite_template is None:
-        raise ValueError("Rewrite enabled but no prompt template is available.")
-    init_prompts.append(_format_rewrite_prompt(
-        rewrite_template,
-        sample["original_query"],
-        "",
-        context_descs,
-    ))
-    init_meta.append({
-        "sample": sample,
-        "cache_key": cache_key,
-        "context_descs": context_descs,
-    })
-
-if init_prompts:
-    init_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(init_loop)
-    try:
-        init_outputs = init_loop.run_until_complete(
-            llm_api.run_batch(init_prompts, max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS)
+# Intent: preserve legacy behavior by default, while allowing no-initial-rewrite ablation via a flag.
+if hp.LEAF_NO_INITIAL_REWRITE:
+    logger.info("Skipping initial rewrite due to --leaf_no_initial_rewrite.")
+else:
+    logger.info("Starting initial rewrite.")
+    init_prompts = []
+    init_meta = []
+    for sample in samples:
+        hits = flat_retrieve_hits(
+            retriever=retriever,
+            query=sample["original_query"],
+            node_embs=node_embs,
+            node_registry=node_registry,
+            topk=hp.FLAT_TOPK,
         )
-    finally:
-        init_loop.close()
-        asyncio.set_event_loop(None)
-    for meta, out in zip(init_meta, init_outputs):
-        rewrite = _clean_qe_text(out)
-        rewrite_map[meta["cache_key"]] = rewrite
-        meta["sample"]["last_rewrite"] = rewrite
-        meta["sample"]["current_query"] = _apply_rewrite(hp.REWRITE_MODE, meta["sample"]["original_query"], rewrite)
-        rewrite_records.append({
-            "key": meta["cache_key"],
-            "rewritten_query": rewrite,
-            "prompt_name": hp.REWRITE_PROMPT_NAME,
-            "llm": hp.LLM,
-            "context_descs": meta.get("context_descs", []),
+        if hp.LEAF_ONLY_RETRIEVAL:
+            rewrite_hits = [h for h in hits if h.is_leaf]
+        else:
+            rewrite_hits = [h for h in hits if not h.is_leaf]
+        context_descs = _hits_to_context_descs(rewrite_hits, node_registry, hp.REWRITE_CONTEXT_TOPK, hp.MAX_DOC_DESC_CHAR_LEN)
+        cache_key = _rewrite_cache_key("leaf_init", sample["original_query"], context_descs, iter_idx=None)
+        if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
+            rewrite = rewrite_map[cache_key]
+            sample["last_rewrite"] = rewrite
+            sample["current_query"] = _apply_rewrite(hp.REWRITE_MODE, sample["original_query"], rewrite)
+            continue
+        if rewrite_template is None:
+            raise ValueError("Rewrite enabled but no prompt template is available.")
+        init_prompts.append(_format_rewrite_prompt(
+            rewrite_template,
+            sample["original_query"],
+            "",
+            context_descs,
+        ))
+        init_meta.append({
+            "sample": sample,
+            "cache_key": cache_key,
+            "context_descs": context_descs,
         })
 
-if hp.REWRITE_CACHE_PATH and rewrite_records:
-    os.makedirs(os.path.dirname(hp.REWRITE_CACHE_PATH) or ".", exist_ok=True)
-    with open(hp.REWRITE_CACHE_PATH, "a", encoding="utf-8") as f:
-        for rec in rewrite_records:
-            f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+    if init_prompts:
+        init_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(init_loop)
+        try:
+            init_outputs = init_loop.run_until_complete(
+                llm_api.run_batch(init_prompts, max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS)
+            )
+        finally:
+            init_loop.close()
+            asyncio.set_event_loop(None)
+        for meta, out in zip(init_meta, init_outputs):
+            rewrite = _clean_qe_text(out)
+            rewrite_map[meta["cache_key"]] = rewrite
+            meta["sample"]["last_rewrite"] = rewrite
+            meta["sample"]["current_query"] = _apply_rewrite(hp.REWRITE_MODE, meta["sample"]["original_query"], rewrite)
+            rewrite_records.append({
+                "key": meta["cache_key"],
+                "rewritten_query": rewrite,
+                "prompt_name": hp.REWRITE_PROMPT_NAME,
+                "llm": hp.LLM,
+                "context_descs": meta.get("context_descs", []),
+            })
+
+    if hp.REWRITE_CACHE_PATH and rewrite_records:
+        os.makedirs(os.path.dirname(hp.REWRITE_CACHE_PATH) or ".", exist_ok=True)
+        with open(hp.REWRITE_CACHE_PATH, "a", encoding="utf-8") as f:
+            for rec in rewrite_records:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
 
 for iter_idx in range(hp.NUM_ITERS):
     iter_metrics = []

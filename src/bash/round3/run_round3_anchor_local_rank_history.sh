@@ -1,18 +1,16 @@
 #!/bin/bash
 
-# Create log file with timestamp
 mkdir -p ../logs
-LOG_FILE="../logs/run_round3_anchor_local_rank_$(date '+%Y_%m_%d').log"
+LOG_FILE="../logs/run_round3_anchor_local_rank_history_$(date '+%Y_%m_%d').log"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting run_round3_anchor_local_rank.sh script"
+log "Starting run_round3_anchor_local_rank_history.sh script"
 
 RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
 NODE_EMB_BASE="../trees/BRIGHT"
-V6_KNN_TOPK=100
 
 COMMON_PARAMS=(
     --reasoning_in_traversal_prompt -1
@@ -29,22 +27,18 @@ COMMON_PARAMS=(
     --rewrite_every 1
     --rewrite_context_topk 5
     --round3_rewrite_context leaf
+    --round3_rewrite_use_history
+    --round3_rewrite_history_topk 10
 )
 
 RUN_SUBSETS=(
-    "biology"
     "psychology"
     "economics"
+    "biology"
     "earth_science"
     "robotics"
-    # "sustainable_living"
-    # "stackoverflow"
-    # "theoremqa_questions"
-    # "theoremqa_theorems"
-    # "pony"
 )
 
-# subset -> tree_version (from trees/BRIGHT/*)
 declare -A TREE_VERSION_MAP=(
     ["aops"]="top-down"
     ["biology"]="bottom-up"
@@ -62,25 +56,21 @@ declare -A TREE_VERSION_MAP=(
 
 PROMPTS=(
     "round3_action_v1"
-    # "round3_agent_executor_v1"
-    # "round3_action_v2"
-    # "thinkqe"
+    "round3_agent_executor_v1"
 )
 
 ROUND3_EXPLORE_MODE="concat"
 ANCHOR_LOCAL_RANK_MODES=(
+    "none"
     # "v2"
     # "v3"
-    # "none"
     # "v4"
-    "v6"
-    "v5"
 )
 
 for prompt in "${PROMPTS[@]}"; do
     for subset in "${RUN_SUBSETS[@]}"; do
         for anchor_mode in "${ANCHOR_LOCAL_RANK_MODES[@]}"; do
-            suffix="round3_anchor_local_rank_${anchor_mode}_${prompt}"
+            suffix="round3_anchor_local_rank_${anchor_mode}_${prompt}_history"
             NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.diver.npy"
 
             final_args=()
@@ -100,15 +90,6 @@ for prompt in "${PROMPTS[@]}"; do
             final_args+=("--rewrite_prompt_name" "$prompt")
             final_args+=("--round3_explore_mode" "$ROUND3_EXPLORE_MODE")
             final_args+=("--round3_anchor_local_rank" "$anchor_mode")
-            if [[ "$anchor_mode" == "v6" ]]; then
-                V6_KNN_PATH="${NODE_EMB_BASE}/${subset}/leaf_knn_top${V6_KNN_TOPK}.npz"
-                if [[ ! -f "$V6_KNN_PATH" ]]; then
-                    log "Missing v6 kNN file for subset=${subset}: ${V6_KNN_PATH}"
-                    exit 1
-                fi
-                # Intent: force v6 runs to use precomputed leaf-kNN for consistent and faster expansion.
-                final_args+=("--round3_v6_leaf_knn_path" "$V6_KNN_PATH")
-            fi
             final_args+=("--subset" "$subset")
             tree_version="${TREE_VERSION_MAP[$subset]}"
             if [[ -z "$tree_version" ]]; then

@@ -64,6 +64,7 @@ class HyperParams(argparse.Namespace):
         'rewrite_prompt_path',
         'rewrite_cache_path',
         'round3_router_cache_path',
+        'round3_v6_leaf_knn_path',
         'qe_cache_path',
     ])
 
@@ -71,7 +72,8 @@ class HyperParams(argparse.Namespace):
         super().__init__(**kwargs)
     
     def __str__(self):
-        return compress_hparam_string('--'.join(f'{k.lower()}={v}' for k, v in vars(self).items() if k.lower() not in self.NO_SAVE_VARS))
+        effective_items = self._effective_items_for_naming()
+        return compress_hparam_string('--'.join(f'{k.lower()}={v}' for k, v in effective_items if k.lower() not in self.NO_SAVE_VARS))
         # return compress_hparam_string('--'.join(f'{k.lower()}={os.path.basename(str(v)).split(".")[0]}' for k, v in vars(self).items() if k.lower() not in self.NO_SAVE_VARS))
 
     def __repr__(self):
@@ -95,6 +97,19 @@ class HyperParams(argparse.Namespace):
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         return digest if length is None else digest[:length]
+
+    def _effective_items_for_naming(self):
+        payload = dict(vars(self))
+        # Intent: drop router-only naming args unless router prompt is enabled.
+        router_enabled = bool(payload.get('round3_router_prompt_name'))
+        if not router_enabled:
+            for key in list(payload.keys()):
+                if str(key).startswith('round3_router_'):
+                    payload.pop(key, None)
+        # Intent: drop history-topk naming arg when retrieval history injection is disabled.
+        if not bool(payload.get('round3_rewrite_use_history')):
+            payload.pop('round3_rewrite_history_topk', None)
+        return payload.items()
     
     @classmethod
     def from_args(cls, args=None):
@@ -170,6 +185,8 @@ class HyperParams(argparse.Namespace):
         )
         parser.add_argument('--rewrite_at_start', default=False, action='store_true', help='Run rewrite once before the first traversal iteration')
         parser.add_argument('--leaf_only_retrieval', default=False, action='store_true', help='Restrict flat retrieval to leaf nodes only (used in run_leaf_rank.py)')
+        parser.add_argument('--leaf_no_initial_rewrite', default=False, action='store_true',
+                            help='Skip initial rewrite in run_leaf_rank.py and start rewrite after first retrieval iteration')
         parser.add_argument('--use_retriever_traversal', default=False, action='store_true',
                             help='If set, score traversal slates with retriever embeddings instead of LLM prompts')
 
@@ -183,6 +200,10 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--round3_rewrite_once', default=False, action='store_true', help='Rewrite only at iter 0 in round3')
         parser.add_argument('--round3_explore_mode', type=str, default='replace', choices=['replace', 'concat'],
                             help='How to combine rewrite with the traversal query in round3')
+        parser.add_argument('--round3_rewrite_use_history', default=False, action='store_true',
+                            help='Prepend retrieval history (doc IDs only) to rewrite prompts in run_round3_1.py')
+        parser.add_argument('--round3_rewrite_history_topk', type=int, default=10,
+                            help='Top-K retrieved leaf doc IDs per previous iteration in rewrite history')
         parser.add_argument(
             '--round3_action_oracle',
             type=str,
@@ -215,15 +236,23 @@ class HyperParams(argparse.Namespace):
             '--round3_anchor_local_rank',
             type=str,
             default='none',
-            choices=['none', 'v1', 'v2', 'v3', 'v4'],
+            choices=['none', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6'],
             help=(
                 'Local ranking override from anchor order: '
                 'none=default local ranking; '
                 'v1=replace anchor branches with top descendant leaf for local ranking; '
                 'v2=use v1 behavior and also use those leaves as rewrite context; '
                 'v3=replace branches by greedy best-child descent to a leaf; '
-                'v4=replace branches by best path-average leaf (branch→leaf mean score)'
+                'v4=replace branches by best path-average leaf (branch→leaf mean score); '
+                'v5=leaf-only anchor candidates (top-20) then LLM rerank to choose top-10; '
+                'v6=leaf-only anchor top-10 + prefix-diverse extra top-10 by max seed-leaf cosine, then LLM rerank'
             ),
+        )
+        parser.add_argument(
+            '--round3_v6_leaf_knn_path',
+            type=str,
+            default=None,
+            help='Optional .npz file with precomputed leaf->topK leaf neighbors for faster v6 expansion',
         )
         
         # Parse arguments

@@ -37,6 +37,8 @@ COMMON_PARAMS=(
     # --rewrite_prompt_name baseline_round3_action_v1
 )
 
+LEAF_NO_INITIAL_REWRITE=true
+
 # Define RUNS directly as strings (space-separated args)
 RUNS=(
     "--subset biology --tree_version bottom-up"
@@ -87,6 +89,9 @@ for idx in "${!RUNS[@]}"; do
 
     # Append iteration-specific params
     final_args+=("${ITER_ARR[@]}")
+    if [[ "${LEAF_NO_INITIAL_REWRITE}" == "true" ]]; then
+        final_args+=("--leaf_no_initial_rewrite")
+    fi
 
     cmd=( python run_leaf_rank.py "${final_args[@]}" )
     printf -v cmd_str '%q ' "${cmd[@]}"
