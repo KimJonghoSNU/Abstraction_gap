@@ -53,6 +53,26 @@ def _sanitize_cell(text: object) -> str:
     return s if s else "(none)"
 
 
+def _format_summary_cell(iter_record: Mapping[str, object], topk: int) -> str:
+    raw = iter_record.get("context_summaries", [])
+    if (not isinstance(raw, Sequence)) or isinstance(raw, (str, bytes)):
+        return ""
+    pieces: List[str] = []
+    for item in raw:
+        s = _sanitize_cell(item)
+        if s == "(none)":
+            continue
+        if len(s) > 220:
+            s = s[:220].rstrip()
+            if " " in s:
+                s = s.rsplit(" ", 1)[0].rstrip()
+            s = (s + " ...").strip()
+        pieces.append(s)
+        if len(pieces) >= topk:
+            break
+    return " || ".join(pieces)
+
+
 def build_retrieval_history_block(
     iter_records: Sequence[Mapping[str, object]],
     path_to_doc_id: Dict[Path, str],
@@ -62,8 +82,8 @@ def build_retrieval_history_block(
         return ""
     topk = max(1, int(topk))
     lines = [
-        "Retrieval History (all previous iterations; doc IDs only)",
-        "| Iter | Action | Query Used | Retrieved Doc IDs (Top-K) |",
+        "Retrieval History (all previous iterations; summarized evidence)",
+        "| Iter | Action | Query Used | Evidence Summary (Top-K) |",
         "| --- | --- | --- | --- |",
     ]
     for rec in iter_records:
@@ -72,6 +92,10 @@ def build_retrieval_history_block(
         iter_idx = rec.get("iter")
         query_t = _sanitize_cell(rec.get("query_t_history", rec.get("query_t", "")))
         action_t = _sanitize_cell(_format_action_field(rec))
+        summarized = _format_summary_cell(rec, topk=topk)
+        if summarized:
+            lines.append(f"| {iter_idx} | {action_t} | {query_t} | {summarized} |")
+            continue
         path_list = _paths_from_iter_record(rec)
         # Intent: keep only compact doc IDs (not document content) to avoid prompt bloat.
         doc_ids: List[str] = []

@@ -14,6 +14,11 @@ from json_repair import repair_json
 from tqdm.autonotebook import tqdm
 
 from cache_utils import _prompt_cache_key, append_jsonl
+from context_summary import (
+    build_abstractive_summary_prompt,
+    fallback_extractive_summary,
+    parse_abstractive_summary_output,
+)
 from flat_then_tree import FlatHit, gate_hit, is_prefix
 from history_prompts import build_retrieval_history_block, prepend_history_to_prompt
 from hyperparams import HyperParams
@@ -180,7 +185,7 @@ def _parse_action_output(text: str) -> Tuple[Dict[str, str] | None, Dict[str, st
             if isinstance(raw_rewrite, (list, dict)):
                 raw_rewrite = json.dumps(raw_rewrite, ensure_ascii=False)
             rewrite = str(raw_rewrite or "").strip()
-        return None, None, action, rewrite
+        return None, (docs if docs else None), action, rewrite
     return None, None, "exploit", cleaned.strip()
 
 
@@ -311,6 +316,127 @@ def _compose_query_from_docs(original_query: str, docs: Dict[str, str], actions:
     return (original_query + " " + blob).strip()
 
 
+def _select_categories_by_policy(
+    actions: Dict[str, str],
+    docs: Dict[str, str],
+    policy: str,
+    soft_keep: int,
+) -> List[str]:
+    available = [key for key in CATEGORY_ORDER if docs.get(key, "")]
+    if not available:
+        return []
+    if policy == "none":
+        return available
+    keep = max(1, int(soft_keep))
+    # Intent: focus the query on a small set of categories to implement exploit-style narrowing.
+    exploit = [k for k in available if actions.get(k, "EXPLOIT") == "EXPLOIT"]
+    explore = [k for k in available if actions.get(k, "EXPLOIT") == "EXPLORE"]
+    if exploit:
+        ordered = exploit + [k for k in explore if k not in exploit]
+    elif explore:
+        # Intent: when all active categories are explore, keep broad coverage instead of trimming to soft_keep.
+        return explore
+        # ordered = explore  # previous behavior
+    else:
+        ordered = available
+    return ordered[:keep]
+
+
+def _compose_query_from_docs_with_policy(
+    original_query: str,
+    docs: Dict[str, str],
+    actions: Dict[str, str],
+    policy: str,
+    soft_keep: int,
+) -> Tuple[str, List[str]]:
+    keep_keys = _select_categories_by_policy(actions, docs, policy, soft_keep)
+    pieces: List[str] = []
+    for key in keep_keys:
+        if actions.get(key, "EXPLOIT") == "PRUNE":
+            continue
+        text = docs.get(key, "")
+        if text:
+            pieces.append(text)
+    blob = "\n".join(pieces).strip()
+    if not blob:
+        return original_query, keep_keys
+    return (original_query + " " + blob).strip(), keep_keys
+
+
+def _embed_texts_cached(
+    texts: Sequence[str],
+    retriever: DiverEmbeddingModel,
+    emb_cache: Dict[str, np.ndarray],
+) -> np.ndarray:
+    cleaned: List[str] = []
+    for text in texts:
+        s = str(text or "").strip()
+        if s:
+            cleaned.append(s)
+    if not cleaned:
+        return np.zeros((0, 0), dtype=np.float32)
+    missing: List[str] = [text for text in cleaned if text not in emb_cache]
+    if missing:
+        missing_embs = retriever.encode_docs(missing, batch_size=4)
+        for text, emb in zip(missing, missing_embs):
+            emb_cache[text] = emb.astype(np.float32, copy=False)
+    rows = [emb_cache[text] for text in cleaned]
+    return np.vstack(rows).astype(np.float32, copy=False)
+
+
+def _select_categories_by_embedding_support(
+    *,
+    docs: Dict[str, str],
+    evidence_descs: Sequence[str],
+    previous_docs: Dict[str, str],
+    previous_categories: Sequence[str],
+    global_action: str,
+    keep: int,
+    explore_beta: float,
+    retriever: DiverEmbeddingModel,
+    emb_cache: Dict[str, np.ndarray],
+) -> Tuple[List[str], Dict[str, float], Dict[str, float], Dict[str, float]]:
+    keys = [key for key in CATEGORY_ORDER if str(docs.get(key, "")).strip()]
+    if not keys:
+        return [], {}, {}, {}
+    keep = max(1, min(int(keep), len(keys)))
+    doc_texts = [str(docs[key]).strip() for key in keys]
+    doc_embs = _embed_texts_cached(doc_texts, retriever, emb_cache)
+    evidence_texts = [str(text or "").strip() for text in evidence_descs if str(text or "").strip()]
+    support_by_key: Dict[str, float] = {}
+    if evidence_texts:
+        evidence_embs = _embed_texts_cached(evidence_texts, retriever, emb_cache)
+        if evidence_embs.size > 0:
+            sim = doc_embs @ evidence_embs.T
+            topm = max(1, min(3, sim.shape[1]))
+            support_vals = np.mean(np.sort(sim, axis=1)[:, -topm:], axis=1)
+            support_by_key = {key: float(val) for key, val in zip(keys, support_vals.tolist())}
+    if not support_by_key:
+        support_by_key = {key: 0.0 for key in keys}
+    penalty_by_key: Dict[str, float] = {key: 0.0 for key in keys}
+    if str(global_action).lower() == "explore":
+        prev_keys = [key for key in previous_categories if str(previous_docs.get(key, "")).strip()]
+        if prev_keys:
+            prev_texts = [str(previous_docs[key]).strip() for key in prev_keys]
+            prev_embs = _embed_texts_cached(prev_texts, retriever, emb_cache)
+            if prev_embs.size > 0:
+                # Intent: explore should avoid categories that are too similar to previously focused ones.
+                penalty = np.max(doc_embs @ prev_embs.T, axis=1)
+                penalty_by_key = {key: float(val) for key, val in zip(keys, penalty.tolist())}
+    final_by_key: Dict[str, float] = {}
+    for key in keys:
+        final_by_key[key] = support_by_key[key] - float(explore_beta) * penalty_by_key.get(key, 0.0)
+    ordered = sorted(
+        keys,
+        key=lambda key: (-final_by_key[key], -support_by_key[key], CATEGORY_ORDER.index(key)),
+    )
+    if str(global_action).lower() == "explore":
+        # Intent: explore should keep all generated categories so the next retrieval can fan out safely.
+        return ordered, final_by_key, support_by_key, penalty_by_key
+        # return ordered[:keep], final_by_key, support_by_key, penalty_by_key  # previous behavior
+    return ordered[:keep], final_by_key, support_by_key, penalty_by_key
+
+
 def _apply_action_rewrite(original_query: str, action: str, rewrite: str, explore_mode: str) -> str:
     rewrite = (rewrite or "").strip()
     if not rewrite:
@@ -381,6 +507,98 @@ def _paths_to_context_descs(
         if len(descs) >= topk:
             return descs
     return descs
+
+
+def _summarize_rewrite_candidates_with_llm(
+    rewrite_candidates: List[Dict],
+    retrieval_queries_by_sample: Sequence[str],
+    llm_api: GenAIAPI | VllmAPI,
+    llm_api_kwargs: Dict[str, object],
+    summary_cache: Dict[str, str],
+    logger: logging.Logger,
+    summary_max_words: int = 64,
+    summary_max_chars: int = 320,
+) -> None:
+    if not rewrite_candidates:
+        return
+    fields = ("leaf_descs", "branch_descs", "router_leaf_descs", "router_branch_descs")
+    pending_keys: List[str] = []
+    pending_prompts: List[str] = []
+    fallback_by_key: Dict[str, str] = {}
+    queued_keys: set[str] = set()
+
+    for meta in rewrite_candidates:
+        sample_idx = int(meta.get("sample_idx", -1))
+        query = ""
+        if 0 <= sample_idx < len(retrieval_queries_by_sample):
+            query = str(retrieval_queries_by_sample[sample_idx] or "")
+        plans: Dict[str, List[Tuple[str, str]]] = {}
+        for field in fields:
+            raw_descs = [str(x or "") for x in meta.get(field, []) if str(x or "").strip()]
+            pairs: List[Tuple[str, str]] = []
+            for desc in raw_descs:
+                prompt = build_abstractive_summary_prompt(
+                    query=query,
+                    text=desc,
+                    max_summary_words=summary_max_words,
+                )
+                key = _prompt_cache_key("round3_summary", prompt)
+                pairs.append((desc, key))
+                if key in summary_cache:
+                    continue
+                if key not in queued_keys:
+                    queued_keys.add(key)
+                    fallback_by_key[key] = desc
+                    pending_keys.append(key)
+                    pending_prompts.append(prompt)
+            plans[field] = pairs
+        meta["_summary_plans"] = plans
+
+    if pending_prompts:
+        logger.info("Running rewrite-context summary batch (%d prompts)", len(pending_prompts))
+        summary_kwargs = dict(llm_api_kwargs)
+        summary_kwargs["temperature"] = 0.0
+        summary_kwargs["print_summary_report"] = False
+        summary_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(summary_loop)
+        try:
+            outputs = summary_loop.run_until_complete(
+                llm_api.run_batch(pending_prompts, **summary_kwargs)
+            )
+        except Exception:
+            outputs = [""] * len(pending_prompts)
+        finally:
+            summary_loop.close()
+            asyncio.set_event_loop(None)
+        for key, out in zip(pending_keys, outputs):
+            parsed = parse_abstractive_summary_output(out, max_chars=summary_max_chars)
+            if (not parsed) or str(out).startswith("Error:"):
+                parsed = fallback_extractive_summary(
+                    fallback_by_key.get(key, ""),
+                    max_words=summary_max_words,
+                    max_chars=summary_max_chars,
+                )
+            summary_cache[key] = parsed
+
+    for meta in rewrite_candidates:
+        plans = meta.pop("_summary_plans", {})
+        for field in fields:
+            pairs = plans.get(field, [])
+            summarized: List[str] = []
+            seen: set[str] = set()
+            for raw_desc, key in pairs:
+                text = summary_cache.get(key, "")
+                if not text:
+                    text = fallback_extractive_summary(
+                        raw_desc,
+                        max_words=summary_max_words,
+                        max_chars=summary_max_chars,
+                    )
+                if (not text) or (text in seen):
+                    continue
+                seen.add(text)
+                summarized.append(text)
+            meta[field] = summarized
 
 
 def _build_active_branches(
@@ -932,6 +1150,8 @@ if node_embs.shape[0] != len(node_registry):
 node_embs = normalize_embeddings(node_embs)
 
 retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
+category_emb_cache: Dict[str, np.ndarray] = {}
+summary_cache: Dict[str, str] = {}
 
 leaf_indices = [idx for idx, node in enumerate(node_registry) if node.is_leaf]
 leaf_paths = [tuple(node_registry[idx].path) for idx in leaf_indices]
@@ -1056,6 +1276,8 @@ for iter_idx in range(hp.NUM_ITERS):
     retrieval_query_actions_by_sample: List[str] = []
     retrieval_query_actions_map_by_sample: List[Dict[str, str]] = []
     retrieval_query_docs_by_sample: List[Dict[str, str]] = []
+    retrieval_query_categories_by_sample: List[List[str]] = []
+    history_summaries_by_sample: List[List[str]] = [[] for _ in all_eval_samples]
     rewrite_candidate_idx_by_sample: Dict[int, int] = {}
 
     v5_enabled = hp.ROUND3_ANCHOR_LOCAL_RANK in {"v5", "v6"}
@@ -1080,17 +1302,24 @@ for iter_idx in range(hp.NUM_ITERS):
         if iter_idx == 0 and sample is all_eval_samples[0]:
             logger.info("Iter %d: starting anchor retrieval", iter_idx)
         #   - Single‑action mode → _apply_action_rewrite is used every iter.
-        #   - Per‑level actions mode → _compose_query_from_docs is used instead, once last_possible_docs is filled.
+        #   - Category-policy mode → _compose_query_from_docs_with_policy is used once category docs are available.
         if sample.last_possible_docs:
             # Intent: snapshot the exact query-control state used for this retrieval before rewrite updates it.
             query_action_t = "multi"
             query_actions_t = dict(sample.last_actions or {})
             query_docs_t = dict(sample.last_possible_docs or {})
-            anchor_query = _compose_query_from_docs(sample.original_query, sample.last_possible_docs, sample.last_actions)
+            anchor_query, query_categories_t = _compose_query_from_docs_with_policy(
+                sample.original_query,
+                sample.last_possible_docs,
+                sample.last_actions,
+                str(hp.ROUND3_CATEGORY_POLICY or "none").lower(),
+                hp.ROUND3_CATEGORY_SOFT_KEEP,
+            )
         else:
             query_action_t = str(sample.last_action or "exploit").strip().lower()
             query_actions_t = {}
             query_docs_t = {}
+            query_categories_t = []
             anchor_query = _apply_action_rewrite(
                 sample.original_query,
                 sample.last_action,
@@ -1193,6 +1422,7 @@ for iter_idx in range(hp.NUM_ITERS):
         retrieval_query_actions_by_sample.append(query_action_t)
         retrieval_query_actions_map_by_sample.append(query_actions_t)
         retrieval_query_docs_by_sample.append(query_docs_t)
+        retrieval_query_categories_by_sample.append(query_categories_t)
 
         local_leaf_indices = _filter_leaf_indices_by_prefixes(leaf_indices, leaf_paths, ranked_branches)
         if local_leaf_indices:
@@ -1357,9 +1587,16 @@ for iter_idx in range(hp.NUM_ITERS):
             else:
                 retrieval_history = ""
             rewrite_candidates.append({
+                "sample_idx": sample_idx,
                 "sample": sample,
                 "leaf_descs": leaf_descs,
                 "branch_descs": branch_descs,
+                "support_leaf_descs": _hits_to_context_descs(
+                    leaf_hits,
+                    node_registry,
+                    hp.ROUND3_CATEGORY_SUPPORT_TOPK,
+                    hp.MAX_DOC_DESC_CHAR_LEN,
+                ),
                 "router_leaf_descs": router_leaf_descs,
                 "router_branch_descs": router_branch_descs,
                 "prev_blob": prev_blob,
@@ -1409,6 +1646,29 @@ for iter_idx in range(hp.NUM_ITERS):
                     hp.REWRITE_CONTEXT_TOPK,
                     hp.MAX_DOC_DESC_CHAR_LEN,
                 )
+
+    use_summarized_context = str(hp.ROUND3_SUMMARIZED_CONTEXT or "on").lower() == "on"
+    if rewrite_candidates and use_summarized_context:
+        _summarize_rewrite_candidates_with_llm(
+            rewrite_candidates=rewrite_candidates,
+            retrieval_queries_by_sample=retrieval_queries_by_sample,
+            llm_api=llm_api,
+            llm_api_kwargs=llm_api_kwargs,
+            summary_cache=summary_cache,
+            logger=logger,
+            summary_max_words=64,
+            summary_max_chars=320,
+        )
+        for meta in rewrite_candidates:
+            sample_idx = int(meta.get("sample_idx", -1))
+            if 0 <= sample_idx < len(history_summaries_by_sample):
+                history_summaries_by_sample[sample_idx] = list(meta.get("leaf_descs", []))
+    elif rewrite_candidates:
+        # Intent: when summary mode is disabled, keep history summaries empty to force doc-ID fallback history.
+        for meta in rewrite_candidates:
+            sample_idx = int(meta.get("sample_idx", -1))
+            if 0 <= sample_idx < len(history_summaries_by_sample):
+                history_summaries_by_sample[sample_idx] = []
 
     if rewrite_candidates:
         # Intent: split router (action) from executor (rewrite) to keep round3_action_v1 content while decoupling decisions.
@@ -1485,6 +1745,7 @@ for iter_idx in range(hp.NUM_ITERS):
 
         rewrite_prompts: List[str] = []
         rewrite_meta: List[Dict] = []
+        category_policy_mode = str(hp.ROUND3_CATEGORY_POLICY or "none").lower()
         for meta in rewrite_candidates:
             sample = meta["sample"]
             leaf_descs = meta["leaf_descs"]
@@ -1512,6 +1773,9 @@ for iter_idx in range(hp.NUM_ITERS):
             cache_key = _prompt_cache_key("round3", prompt)
             if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
                 rewrite = rewrite_map[cache_key]
+                final_scores: Dict[str, float] = {}
+                support_scores: Dict[str, float] = {}
+                penalty_scores: Dict[str, float] = {}
                 cached_actions = action_map.get(cache_key)
                 cached_docs = docs_map.get(cache_key, {})
                 if isinstance(cached_actions, dict):
@@ -1521,13 +1785,41 @@ for iter_idx in range(hp.NUM_ITERS):
                     sample.last_action = "exploit"
                 else:
                     action = str(cached_actions or "exploit").strip().lower()
-                    if action == "hold" and sample.last_rewrite:
+                    if category_policy_mode == "soft" and cached_docs:
+                        if iter_idx == 0:
+                            # Intent: keep all categories on the first rewrite to match no-pruning bootstrap behavior.
+                            selected_categories = [key for key in CATEGORY_ORDER if str(cached_docs.get(key, "")).strip()]
+                        else:
+                            prev_categories = sample.iter_records[-1].get("query_categories", []) if sample.iter_records else []
+                            selected_categories, final_scores, support_scores, penalty_scores = _select_categories_by_embedding_support(
+                                docs=cached_docs,
+                                evidence_descs=meta.get("support_leaf_descs", []),
+                                previous_docs=sample.last_possible_docs or {},
+                                previous_categories=prev_categories,
+                                global_action=action,
+                                keep=hp.ROUND3_CATEGORY_SOFT_KEEP,
+                                explore_beta=hp.ROUND3_CATEGORY_EXPLORE_BETA,
+                                retriever=retriever,
+                                emb_cache=category_emb_cache,
+                            )
+                        action_label = "EXPLORE" if action == "explore" else "EXPLOIT"
+                        sample.last_possible_docs = cached_docs
+                        sample.last_actions = {
+                            key: (action_label if key in selected_categories else "PRUNE")
+                            for key in CATEGORY_ORDER if str(cached_docs.get(key, "")).strip()
+                        }
+                        # Intent: policy-aware query uses only selected categories while preserving the original category texts.
+                        sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
                         rewrite = sample.last_rewrite
+                        sample.last_action = action
                     else:
-                        sample.last_rewrite = rewrite
-                    sample.last_action = action
-                    sample.last_actions = {}
-                    sample.last_possible_docs = {}
+                        if action == "hold" and sample.last_rewrite:
+                            rewrite = sample.last_rewrite
+                        else:
+                            sample.last_rewrite = rewrite
+                        sample.last_action = action
+                        sample.last_actions = {}
+                        sample.last_possible_docs = {}
                 sample.rewrite_history.append({
                     "iter": iter_idx,
                     "cache_hit": True,
@@ -1535,6 +1827,9 @@ for iter_idx in range(hp.NUM_ITERS):
                     "actions": sample.last_actions,
                     "possible_docs": sample.last_possible_docs,
                     "rewrite": rewrite,
+                    "category_scores": final_scores if (category_policy_mode == "soft" and cached_docs) else {},
+                    "category_support_scores": support_scores if (category_policy_mode == "soft" and cached_docs) else {},
+                    "category_penalty_scores": penalty_scores if (category_policy_mode == "soft" and cached_docs) else {},
                 })
             else:
                 rewrite_prompts.append(prompt)
@@ -1543,6 +1838,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     "cache_key": cache_key,
                     "leaf_descs": leaf_descs,
                     "branch_descs": branch_descs,
+                    "support_leaf_descs": meta.get("support_leaf_descs", []),
                     "retrieval_history": retrieval_history,
                 })
 
@@ -1562,6 +1858,9 @@ for iter_idx in range(hp.NUM_ITERS):
             for meta, out in zip(rewrite_meta, rewrite_outputs):
                 actions, docs, action, rewrite = _parse_action_output(out)
                 sample = meta["sample"]
+                final_scores: Dict[str, float] = {}
+                support_scores: Dict[str, float] = {}
+                penalty_scores: Dict[str, float] = {}
                 if actions:
                     sample.last_actions = actions
                     sample.last_possible_docs = docs or {}
@@ -1569,13 +1868,42 @@ for iter_idx in range(hp.NUM_ITERS):
                     sample.last_action = "exploit"
                     rewrite = sample.last_rewrite
                 else:
-                    if action == "hold" and sample.last_rewrite:
+                    output_docs = docs or {}
+                    if category_policy_mode == "soft" and output_docs:
+                        if iter_idx == 0:
+                            # Intent: keep all categories on the first rewrite to match no-pruning bootstrap behavior.
+                            selected_categories = [key for key in CATEGORY_ORDER if str(output_docs.get(key, "")).strip()]
+                        else:
+                            prev_categories = sample.iter_records[-1].get("query_categories", []) if sample.iter_records else []
+                            selected_categories, final_scores, support_scores, penalty_scores = _select_categories_by_embedding_support(
+                                docs=output_docs,
+                                evidence_descs=meta.get("support_leaf_descs", []),
+                                previous_docs=sample.last_possible_docs or {},
+                                previous_categories=prev_categories,
+                                global_action=action,
+                                keep=hp.ROUND3_CATEGORY_SOFT_KEEP,
+                                explore_beta=hp.ROUND3_CATEGORY_EXPLORE_BETA,
+                                retriever=retriever,
+                                emb_cache=category_emb_cache,
+                            )
+                        action_label = "EXPLORE" if action == "explore" else "EXPLOIT"
+                        sample.last_possible_docs = output_docs
+                        sample.last_actions = {
+                            key: (action_label if key in selected_categories else "PRUNE")
+                            for key in CATEGORY_ORDER if str(output_docs.get(key, "")).strip()
+                        }
+                        # Intent: policy-aware query uses only selected categories while preserving the original category texts.
+                        sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
                         rewrite = sample.last_rewrite
+                        sample.last_action = action
                     else:
-                        sample.last_rewrite = rewrite
-                    sample.last_action = action
-                    sample.last_actions = {}
-                    sample.last_possible_docs = {}
+                        if action == "hold" and sample.last_rewrite:
+                            rewrite = sample.last_rewrite
+                        else:
+                            sample.last_rewrite = rewrite
+                        sample.last_action = action
+                        sample.last_actions = {}
+                        sample.last_possible_docs = {}
                 sample.rewrite_history.append({
                     "iter": iter_idx,
                     "cache_hit": False,
@@ -1583,6 +1911,9 @@ for iter_idx in range(hp.NUM_ITERS):
                     "actions": sample.last_actions,
                     "possible_docs": sample.last_possible_docs,
                     "rewrite": rewrite,
+                    "category_scores": final_scores,
+                    "category_support_scores": support_scores,
+                    "category_penalty_scores": penalty_scores,
                 })
                 rewrite_map[meta["cache_key"]] = rewrite
                 action_map[meta["cache_key"]] = sample.last_actions if sample.last_actions else sample.last_action
@@ -1625,7 +1956,7 @@ for iter_idx in range(hp.NUM_ITERS):
             float(np.mean(anchor_branch_hits)) * 100.0,
         )
     # tqdm shows per-iteration local/global scoring progress in terminal runs.
-    for sample, anchor_eval_paths, leaf_hits, branch_hits, local_hits, global_hits, active_paths, densities, query_t, query_action_t, query_actions_t, query_docs_t, v5_doc_ids_t, v5_reason_t in tqdm(
+    for sample, anchor_eval_paths, leaf_hits, branch_hits, local_hits, global_hits, active_paths, densities, query_t, query_action_t, query_actions_t, query_docs_t, query_categories_t, v5_doc_ids_t, v5_reason_t in tqdm(
         zip(
             all_eval_samples,
             anchor_eval_paths_by_sample,
@@ -1639,6 +1970,7 @@ for iter_idx in range(hp.NUM_ITERS):
             retrieval_query_actions_by_sample,
             retrieval_query_actions_map_by_sample,
             retrieval_query_docs_by_sample,
+            retrieval_query_categories_by_sample,
             v5_rerank_doc_ids_by_sample,
             v5_rerank_reason_by_sample,
         ),
@@ -1702,6 +2034,8 @@ for iter_idx in range(hp.NUM_ITERS):
             "query_action": query_action_t,
             "query_actions": query_actions_t,
             "query_possible_docs": query_docs_t,
+            "query_categories": query_categories_t,
+            "context_summaries": history_summaries_by_sample[sample_idx],
             "v5_rerank_doc_ids": v5_doc_ids_t,
             "v5_rerank_reason": v5_reason_t,
             "anchor_eval_paths": anchor_paths,

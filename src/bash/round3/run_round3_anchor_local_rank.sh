@@ -61,20 +61,21 @@ declare -A TREE_VERSION_MAP=(
 )
 
 PROMPTS=(
-    "round3_action_v1"
+    # "round3_action_v1"
     # "round3_agent_executor_v1"
     # "round3_action_v2"
     # "thinkqe"
+    "round3_free_rewrite_v2"
 )
 
 ROUND3_EXPLORE_MODE="concat"
 ANCHOR_LOCAL_RANK_MODES=(
     # "v2"
     # "v3"
-    # "none"
+    "none"
     # "v4"
-    "v6"
-    "v5"
+    # "v6"
+    # "v5"
 )
 
 for prompt in "${PROMPTS[@]}"; do

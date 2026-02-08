@@ -109,6 +109,14 @@ class HyperParams(argparse.Namespace):
         # Intent: drop history-topk naming arg when retrieval history injection is disabled.
         if not bool(payload.get('round3_rewrite_use_history')):
             payload.pop('round3_rewrite_history_topk', None)
+        # Intent: keep path names compact when category policy is disabled.
+        if str(payload.get('round3_category_policy', 'none')).lower() == 'none':
+            payload.pop('round3_category_soft_keep', None)
+            payload.pop('round3_category_support_topk', None)
+            payload.pop('round3_category_explore_beta', None)
+        # Intent: when summarized context is explicitly off, omit this flag from naming to keep off-baseline path stable.
+        if str(payload.get('round3_summarized_context', 'on')).lower() == 'off':
+            payload.pop('round3_summarized_context', None)
         return payload.items()
     
     @classmethod
@@ -204,6 +212,43 @@ class HyperParams(argparse.Namespace):
                             help='Prepend retrieval history (doc IDs only) to rewrite prompts in run_round3_1.py')
         parser.add_argument('--round3_rewrite_history_topk', type=int, default=10,
                             help='Top-K retrieved leaf doc IDs per previous iteration in rewrite history')
+        parser.add_argument(
+            '--round3_summarized_context',
+            type=str,
+            default='on',
+            choices=['on', 'off'],
+            help='Use summarized rewrite context and history evidence: on|off',
+        )
+        parser.add_argument(
+            '--round3_category_policy',
+            type=str,
+            default='none',
+            choices=['none', 'soft'],
+            help=(
+                'Category-level query policy in run_round3_1.py: '
+                'none=disable; '
+                'soft=focus the best supported categories based on per-category actions '
+                '(use --round3_category_soft_keep=1 for hard behavior)'
+            ),
+        )
+        parser.add_argument(
+            '--round3_category_soft_keep',
+            type=int,
+            default=2,
+            help='When --round3_category_policy=soft, keep up to this many categories (including the primary one)',
+        )
+        parser.add_argument(
+            '--round3_category_support_topk',
+            type=int,
+            default=10,
+            help='Top-K leaf evidence descriptions used to score category support (embedding-only selector)',
+        )
+        parser.add_argument(
+            '--round3_category_explore_beta',
+            type=float,
+            default=0.1,
+            help='Penalty weight for category similarity to previous selected categories during explore',
+        )
         parser.add_argument(
             '--round3_action_oracle',
             type=str,
