@@ -6,27 +6,23 @@ import re
 from difflib import SequenceMatcher
 from typing import Dict, Iterable, List, Set, Tuple
 
+import pandas as pd
 from json_repair import repair_json
 from vllm import LLM, SamplingParams
 
 
-CHUNK_MERGE_SUBSETS = {
-    "biology",
-    "earth_science",
-    "economics",
-    "psychology",
-    "robotics",
-    "sustainable_living",
-    "pony",
-    "stackoverflow",
-}
-
 BASE_CATEGORY_SEEDS = [
-    "Domain Theory",
-    "Cross-Domain Theory",
-    "Mathematical Theory",
-    "Entity",
-    "Example",
+    ("Theory", "Domain Theory"),
+    ("Theory", "Cross-Domain Theory"),
+    ("Theory", "Mathematical Theory"),
+    ("Theory", "Concept Definition"),
+    ("Rule", "Normative Rule"),
+    ("Evidence", "Causal Evidence"),
+    ("Method", "Procedural Method"),
+    ("Resource", "Technical Resource"),
+    ("Entity", "Entity"),
+    ("Example", "Worked Example"),
+    ("Background", "General Background"),
 ]
 
 DATASET_RELEVANCE_DEFINITION = {
@@ -105,41 +101,45 @@ SUBSET_DOMAIN_LABEL = {
 }
 
 PROMPT_TEMPLATE = (
-    "You are assigning an abstract evidence-category for one document.\n\n"
+    "You are assigning hierarchical category keywords for one document.\n\n"
     "Subset: {subset}\n"
     "Subset Domain: {subset_domain}\n"
     "Relevance Definition:\n{relevance_definition}\n\n"
     "Goal:\n"
-    "- Output one abstract category label for how this document can support reasoning answers.\n"
-    "- First try to use one of the core categories below.\n"
-    "- Reuse an existing label when it fits.\n"
-    "- Only create a new label when no existing label fits.\n"
-    "- Category labels must be abstract (1-3 words), not concrete named theories/entities.\n"
-    "- Bad: Evolution Theory, Poisson Distribution, DSM-5\n"
-    "- Good: Domain Theory, Mathematical Theory, Causal Evidence, Procedural Method\n\n"
-    "Core Categories:\n"
-    "- Domain Theory\n"
-    "- Cross-Domain Theory\n"
-    "- Mathematical Theory\n"
+    "- Output category keywords (not content keywords) in 2 levels.\n"
+    "- A document may have multiple categories at each level.\n"
+    "- The category should describe document role for retrieval support.\n"
+    "- Example: a passage explaining Darwin's evolution should map to Theory-related category, not \"Evolution\".\n"
+    "- Reuse existing categories when possible; create a new one only if truly needed.\n\n"
+    "Level-1 Category (broad, 1-2 words): choose one or more from:\n"
+    "- Theory\n"
+    "- Rule\n"
+    "- Method\n"
+    "- Evidence\n"
     "- Entity\n"
-    "- Example\n\n"
-    "Expansion rule:\n"
-    "- If no core category fits, you may create one new abstract category.\n\n"
-    "Known Categories (canonical):\n"
+    "- Resource\n"
+    "- Example\n"
+    "- Background\n\n"
+    "Level-2 Category (more specific, 2-4 words):\n"
+    "- Must be abstract and reusable across many documents.\n"
+    "- Must align with one of selected level-1 categories.\n"
+    "- You may output multiple level-2 categories when the document serves multiple citation roles.\n"
+    "- Avoid concrete topics/entities.\n"
+    "- Bad: Evolution, Maxwell-Boltzmann Distribution, DSM-5\n"
+    "- Good: Domain Theory, Causal Evidence, Procedural Method, Technical Resource\n\n"
+    "Known Level-2 Categories (canonical):\n"
     "{known_labels_block}\n\n"
-    "If your new category can absorb old labels, list those old labels in merge_from.\n\n"
+    "If your new level-2 category can absorb old labels, list those old labels in merge_from.\n\n"
     "Document ID: {doc_id}\n"
     "Document Snippet:\n{doc_desc}\n\n"
     "Output JSON only:\n"
     "{{\n"
-    "  \"category\": \"...\",\n"
-    "  \"canonical_label\": \"optional existing known label if reused, else empty\",\n"
+    "  \"level1_categories\": [\"one or more of [Theory, Rule, Method, Evidence, Entity, Resource, Example, Background]\"],\n"
+    "  \"level2_categories\": [\"one or more labels\"],\n"
+    "  \"canonical_level2\": [\"optional existing known level-2 labels if reused\"],\n"
     "  \"merge_from\": [\"optional known labels to alias into category\"]\n"
     "}}"
 )
-
-CONCRETE_TO_ABSTRACT = {
-}
 
 CATEGORY_NORMALIZATION = {
     "domaintheory": "Domain Theory",
@@ -150,11 +150,43 @@ CATEGORY_NORMALIZATION = {
     "probabilistictheory": "Mathematical Theory",
     "entity": "Entity",
     "example": "Example",
+    "workedexample": "Worked Example",
+    "technicalresource": "Technical Resource",
+    "auxiliarycontext": "General Background",
+    "backgroundcontext": "General Background",
+    "background": "General Background",
+    "conceptdefinition": "Concept Definition",
+    "normativerule": "Normative Rule",
+}
+
+LEVEL1_NORMALIZATION = {
+    "theory": "Theory",
+    "domain": "Theory",
+    # Intent: fold legacy Definition outputs into Theory after removing Definition from level-1 taxonomy.
+    "definition": "Theory",
+    "concept": "Theory",
+    "rule": "Rule",
+    "law": "Rule",
+    "constraint": "Rule",
+    "method": "Method",
+    "procedure": "Method",
+    "evidence": "Evidence",
+    "causal": "Evidence",
+    "entity": "Entity",
+    "resource": "Resource",
+    "reference": "Resource",
+    "example": "Example",
+    "background": "Background",
+    "context": "Background",
 }
 
 
-def _default_node_catalog_path(dataset: str, subset: str) -> str:
-    return os.path.join("trees", dataset, subset, "node_catalog.jsonl")
+def _default_long_documents_path(dataset: str, subset: str) -> str:
+    return os.path.join("data", dataset, "long_documents", f"{subset}-00000-of-00001.parquet")
+
+
+def _default_documents_path(dataset: str, subset: str) -> str:
+    return os.path.join("data", dataset, "documents", f"{subset}-00000-of-00001.parquet")
 
 
 def _default_output_path(dataset: str, subset: str, prompt_name: str) -> str:
@@ -241,122 +273,36 @@ def _build_guarded_prompt(
     return trimmed, True
 
 
-def _merge_chunked_doc_id(doc_id: str) -> Tuple[str, int]:
-    raw = str(doc_id or "").strip()
-    m = re.match(r"^(.*)_(\d+)\.txt$", raw)
-    if not m:
-        return raw, -1
-    base = m.group(1)
-    # Intent: after removing the last _<num>, also trim trailing 1-2 digits (without underscore).
-    base = re.sub(r"\d{1,2}$", "", base)
-    base = re.sub(r"[_-]+$", "", base)
-    return f"{base}.txt", int(m.group(2))
-
-
-def _iter_leaf_rows(node_catalog_path: str) -> Iterable[Tuple[int, Dict]]:
-    leaf_idx = 0
-    with open(node_catalog_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if not bool(row.get("is_leaf", False)):
-                continue
-            yield leaf_idx, row
-            leaf_idx += 1
-
-
-def _iter_document_units(node_catalog_path: str, subset: str) -> Iterable[Tuple[int, Dict]]:
-    subset_key = str(subset or "").strip().lower()
-    if subset_key not in CHUNK_MERGE_SUBSETS:
-        for leaf_idx, row in _iter_leaf_rows(node_catalog_path):
-            doc_id = str(row.get("id", "")).strip()
-            yield leaf_idx, {
-                "doc_id": doc_id,
-                "desc": str(row.get("desc", "")),
-                "is_chunk_merged": False,
-                "source_doc_ids": [doc_id] if doc_id else [],
-            }
-        return
-
-    groups: Dict[str, Dict] = {}
-    for leaf_idx, row in _iter_leaf_rows(node_catalog_path):
-        raw_doc_id = str(row.get("id", "")).strip()
-        if not raw_doc_id:
+def _iter_document_units_from_parquet(parquet_path: str) -> Iterable[Tuple[int, Dict]]:
+    df = pd.read_parquet(parquet_path, columns=["id", "content"])
+    for doc_idx, row in enumerate(df.itertuples(index=False)):
+        doc_id = str(getattr(row, "id", "")).strip()
+        if not doc_id:
             continue
-        merged_doc_id, chunk_idx = _merge_chunked_doc_id(raw_doc_id)
-        if merged_doc_id not in groups:
-            groups[merged_doc_id] = {
-                "first_leaf_idx": int(leaf_idx),
-                "parts": [],
-            }
-        groups[merged_doc_id]["parts"].append({
-            "chunk_idx": int(chunk_idx),
-            "leaf_idx": int(leaf_idx),
-            "doc_id": raw_doc_id,
-            "desc": str(row.get("desc", "")),
-        })
-
-    ordered_groups = sorted(groups.items(), key=lambda x: int(x[1].get("first_leaf_idx", 10**9)))
-    for unit_idx, (merged_doc_id, payload) in enumerate(ordered_groups):
-        parts = payload.get("parts", [])
-        parts_sorted = sorted(
-            parts,
-            key=lambda p: (
-                10**9 if int(p.get("chunk_idx", -1)) < 0 else int(p.get("chunk_idx", -1)),
-                int(p.get("leaf_idx", -1)),
-            ),
-        )
-        merged_desc = "\n".join(
-            [str(p.get("desc", "")).strip() for p in parts_sorted if str(p.get("desc", "")).strip()]
-        ).strip()
-        yield unit_idx, {
-            "doc_id": merged_doc_id,
-            "desc": merged_desc,
-            "is_chunk_merged": True,
-            "source_doc_ids": [str(p.get("doc_id", "")).strip() for p in parts_sorted if str(p.get("doc_id", "")).strip()],
+        yield doc_idx, {
+            "doc_id": doc_id,
+            "desc": str(getattr(row, "content", "")),
+            "is_long_document": True,
         }
 
 
-def _parse_depths(raw: str) -> Set[int]:
-    out: Set[int] = set()
-    for token in str(raw or "").split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            depth = int(token)
-        except Exception:
-            continue
-        if depth >= 0:
-            out.add(depth)
-    return out
-
-
-def _iter_nonleaf_units(node_catalog_path: str, depths: Set[int]) -> Iterable[Tuple[int, Dict]]:
-    unit_idx = 0
-    with open(node_catalog_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if bool(row.get("is_leaf", False)):
-                continue
-            depth = int(row.get("depth", -1))
-            if depth not in depths:
-                continue
-            node_id = str(row.get("id", "")).strip()
-            if not node_id:
-                node_id = f"path:{row.get('path', [])}"
-            yield unit_idx, {
-                "doc_id": f"NONLEAF_D{depth}:{node_id}",
-                "desc": str(row.get("desc", "")),
-                "depth": depth,
-                "is_nonleaf_warmup": True,
-            }
-            unit_idx += 1
+def _resolve_input_parquet_path(
+    *,
+    long_documents_path: str,
+    documents_path: str,
+) -> Tuple[str, str]:
+    if os.path.exists(long_documents_path):
+        return long_documents_path, "long_documents"
+    if os.path.exists(documents_path):
+        # Intent: fall back to documents split when long_documents is unavailable for a subset.
+        return documents_path, "documents"
+    raise FileNotFoundError(
+        "Missing both long_documents and documents parquet files. "
+        f"Checked: {long_documents_path} and {documents_path}. "
+        "Download with: python -c \"from huggingface_hub import snapshot_download; "
+        "snapshot_download(repo_id='xlangai/BRIGHT', repo_type='dataset', "
+        "allow_patterns=['long_documents/*', 'documents/*'], local_dir='data/BRIGHT')\""
+    )
 
 
 def _clean_json_candidate(text: str) -> str:
@@ -383,7 +329,7 @@ def _normalize_list(value: object, max_items: int) -> List[str]:
     for item in items:
         if not item:
             continue
-        normalized = _title_case_words(re.sub(r"\s+", " ", item).strip(), max_words=3)
+        normalized = _title_case_words(re.sub(r"\s+", " ", item).strip(), max_words=4)
         if normalized and normalized not in out:
             out.append(normalized)
         if len(out) >= max_items:
@@ -391,21 +337,62 @@ def _normalize_list(value: object, max_items: int) -> List[str]:
     return out
 
 
-def _normalize_category_label(raw_label: object) -> str:
-    label = _title_case_words(str(raw_label or ""), max_words=3)
+def _normalize_level1_label(raw_label: object) -> str:
+    label = _title_case_words(str(raw_label or ""), max_words=2)
     key = _normalize_label_key(label)
     if not label:
-        return "Auxiliary Context"
+        return "Background"
+    if key in LEVEL1_NORMALIZATION:
+        return LEVEL1_NORMALIZATION[key]
+    return "Background"
+
+
+def _normalize_level1_list(value: object, max_items: int = 4) -> List[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = []
+    out: List[str] = []
+    for item in items:
+        normalized = _normalize_level1_label(item)
+        if normalized not in out:
+            out.append(normalized)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _normalize_category_label(raw_label: object) -> str:
+    label = _title_case_words(str(raw_label or ""), max_words=4)
+    key = _normalize_label_key(label)
+    if not label:
+        return "General Background"
     if key in CATEGORY_NORMALIZATION:
         return CATEGORY_NORMALIZATION[key]
-    for cue, mapped in CONCRETE_TO_ABSTRACT.items():
-        if cue in key:
-            return mapped
     return label
 
 
+def _normalize_category_list(value: object, max_items: int = 4) -> List[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = []
+    out: List[str] = []
+    for item in items:
+        normalized = _normalize_category_label(item)
+        if normalized not in out:
+            out.append(normalized)
+        if len(out) >= max_items:
+            break
+    return out
+
+
 def _canonicalize_label(label: str, alias_map: Dict[str, str]) -> str:
-    current = _title_case_words(label, max_words=3)
+    current = _title_case_words(label, max_words=4)
     if not current:
         return ""
     visited: Set[str] = set()
@@ -417,7 +404,7 @@ def _canonicalize_label(label: str, alias_map: Dict[str, str]) -> str:
         nxt = alias_map.get(key, "")
         if not nxt:
             return current
-        current = _title_case_words(nxt, max_words=3)
+        current = _title_case_words(nxt, max_words=4)
 
 
 def _register_alias(old_label: str, new_label: str, alias_map: Dict[str, str], label_counts: Dict[str, int]) -> bool:
@@ -438,31 +425,44 @@ def _register_alias(old_label: str, new_label: str, alias_map: Dict[str, str], l
 def _get_canonical_label_counts(label_counts: Dict[str, int], alias_map: Dict[str, str]) -> Dict[str, int]:
     out: Dict[str, int] = {}
     for label, count in label_counts.items():
-        can = _canonicalize_label(label, alias_map) or _title_case_words(label, max_words=3)
+        can = _canonicalize_label(label, alias_map) or _title_case_words(label, max_words=4)
         if not can:
             continue
         out[can] = int(out.get(can, 0)) + int(count)
     return out
 
 
-def _build_shortlist(label_counts: Dict[str, int], alias_map: Dict[str, str], topk: int) -> List[Tuple[str, int]]:
+def _build_shortlist(
+    label_counts: Dict[str, int],
+    alias_map: Dict[str, str],
+    level2_to_level1: Dict[str, str],
+    topk: int,
+) -> List[Tuple[str, str, int]]:
     canonical_counts = _get_canonical_label_counts(label_counts, alias_map)
-    seed_entries: List[Tuple[str, int]] = []
-    for seed in BASE_CATEGORY_SEEDS:
-        seed_entries.append((seed, int(canonical_counts.get(seed, 0))))
-    non_seed = [(label, count) for label, count in canonical_counts.items() if label not in BASE_CATEGORY_SEEDS]
+    seed_labels = [seed_l2 for _, seed_l2 in BASE_CATEGORY_SEEDS]
+    seed_entries: List[Tuple[str, str, int]] = []
+    for level1, seed_l2 in BASE_CATEGORY_SEEDS:
+        seed_entries.append((level1, seed_l2, int(canonical_counts.get(seed_l2, 0))))
+    non_seed = [(label, count) for label, count in canonical_counts.items() if label not in seed_labels]
     non_seed = sorted(non_seed, key=lambda x: (-x[1], x[0]))
+    non_seed_entries: List[Tuple[str, str, int]] = []
+    for label, count in non_seed:
+        level1 = level2_to_level1.get(label, "Background")
+        non_seed_entries.append((level1, label, count))
     if topk <= 0:
-        return seed_entries + non_seed
-    return seed_entries + non_seed[:topk]
+        return seed_entries + non_seed_entries
+    return seed_entries + non_seed_entries[:topk]
 
 
-def _load_existing_state(out_jsonl_path: str) -> Tuple[Set[str], Dict[str, int], Dict[str, str]]:
+def _load_existing_state(
+    out_jsonl_path: str,
+) -> Tuple[Set[str], Dict[str, int], Dict[str, str], Dict[str, str]]:
     if not os.path.exists(out_jsonl_path):
-        return set(), {}, {}
+        return set(), {}, {}, {}
     seen: Set[str] = set()
     counts: Dict[str, int] = {}
     alias_map: Dict[str, str] = {}
+    level2_to_level1: Dict[str, str] = {}
     with open(out_jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -475,13 +475,22 @@ def _load_existing_state(out_jsonl_path: str) -> Tuple[Set[str], Dict[str, int],
             doc_id = str(row.get("doc_id", "")).strip()
             if doc_id:
                 seen.add(doc_id)
-            category = _title_case_words(row.get("category", ""), max_words=3)
-            category_raw = _title_case_words(row.get("category_raw", ""), max_words=3)
-            if category:
+            category_keywords = _normalize_category_list(
+                row.get("category_level_2_keywords", row.get("category_level_2", row.get("category", "")))
+            )
+            category_raw = _normalize_category_label(row.get("category_raw", ""))
+            level1_keywords = _normalize_level1_list(
+                row.get("category_level_1_keywords", row.get("category_level_1", ""))
+            )
+            level1_fallback = level1_keywords[0] if level1_keywords else "Background"
+            for idx, category in enumerate(category_keywords):
                 counts[category] = int(counts.get(category, 0)) + 1
-            if category and category_raw and _normalize_label_key(category) != _normalize_label_key(category_raw):
-                alias_map[_normalize_label_key(category_raw)] = category
-    return seen, counts, alias_map
+                mapped_level1 = level1_keywords[idx] if idx < len(level1_keywords) else level1_fallback
+                if category not in level2_to_level1:
+                    level2_to_level1[category] = mapped_level1
+            if category_keywords and category_raw and _normalize_label_key(category_keywords[0]) != _normalize_label_key(category_raw):
+                alias_map[_normalize_label_key(category_raw)] = category_keywords[0]
+    return seen, counts, alias_map, level2_to_level1
 
 
 def _build_prompt(subset: str, doc_id: str, doc_desc: str, known_labels_block: str) -> str:
@@ -501,7 +510,7 @@ def _build_prompt(subset: str, doc_id: str, doc_desc: str, known_labels_block: s
     )
 
 
-def _parse_output(text: str) -> Tuple[str, str, List[str]]:
+def _parse_output(text: str) -> Tuple[List[str], List[str], List[str], List[str]]:
     cleaned = _clean_json_candidate(text)
     obj = None
     try:
@@ -512,11 +521,34 @@ def _parse_output(text: str) -> Tuple[str, str, List[str]]:
         except Exception:
             obj = None
     if not isinstance(obj, dict):
-        return "Auxiliary Context", "", []
-    category_raw = _normalize_category_label(obj.get("category", ""))
-    canonical_hint = _title_case_words(obj.get("canonical_label", ""), max_words=3)
+        return ["Background"], ["General Background"], [], []
+    level1_raw = _normalize_level1_list(
+        obj.get("level1_categories", obj.get("level1_category", obj.get("category_level_1", obj.get("level1", ""))))
+    )
+    category_raw = _normalize_category_list(
+        obj.get("level2_categories", obj.get("level2_category", obj.get("category_level_2", obj.get("category", ""))))
+    )
+    canonical_hint_raw = obj.get("canonical_level2", obj.get("canonical_label", ""))
+    if isinstance(canonical_hint_raw, str):
+        canonical_hint_items = [canonical_hint_raw] if canonical_hint_raw.strip() else []
+    elif isinstance(canonical_hint_raw, list):
+        canonical_hint_items = canonical_hint_raw
+    else:
+        canonical_hint_items = []
+    canonical_hint: List[str] = []
+    for item in canonical_hint_items:
+        item_text = str(item or "").strip()
+        if not item_text:
+            continue
+        normalized_item = _normalize_category_label(item_text)
+        if normalized_item and normalized_item not in canonical_hint:
+            canonical_hint.append(normalized_item)
     merge_from = _normalize_list(obj.get("merge_from", []), max_items=6)
-    return category_raw, canonical_hint, merge_from
+    if not level1_raw:
+        level1_raw = ["Background"]
+    if not category_raw:
+        category_raw = ["General Background"]
+    return level1_raw, category_raw, canonical_hint, merge_from
 
 
 def _classify_batch_rows(
@@ -530,13 +562,21 @@ def _classify_batch_rows(
     batch_rows: List[Tuple[int, Dict]],
     label_counts: Dict[str, int],
     alias_map: Dict[str, str],
+    level2_to_level1: Dict[str, str],
     label_shortlist_topk: int,
     label_alias_threshold: float,
-) -> Tuple[List[Dict], List[str]]:
-    shortlist_with_counts = _build_shortlist(label_counts, alias_map, topk=label_shortlist_topk)
-    shortlist_labels = [label for label, _ in shortlist_with_counts]
+) -> List[Dict]:
+    shortlist_with_counts = _build_shortlist(
+        label_counts,
+        alias_map,
+        level2_to_level1,
+        topk=label_shortlist_topk,
+    )
+    shortlist_labels = [label for _, label, _ in shortlist_with_counts]
     if shortlist_with_counts:
-        known_labels_block = "\n".join([f"- {label} (count={count})" for label, count in shortlist_with_counts])
+        known_labels_block = "\n".join(
+            [f"- [{level1}] {label} (count={count})" for level1, label, count in shortlist_with_counts]
+        )
     else:
         known_labels_block = "- None yet (create a new abstract category if needed)"
 
@@ -545,6 +585,8 @@ def _classify_batch_rows(
     for _, row in batch_rows:
         doc_id = str(row.get("doc_id", "")).strip()
         desc = _truncate_words(row.get("desc", ""), max_desc_words)
+        # Intent: include doc id inside the snippet body so the model can anchor category decisions to a stable identifier.
+        desc = f"[DOC_ID] {doc_id}\n{desc}"
         guarded_prompt, was_trimmed = _build_guarded_prompt(
             subset=subset,
             doc_id=doc_id,
@@ -564,40 +606,88 @@ def _classify_batch_rows(
     classified: List[Dict] = []
     for (_, row), output in zip(batch_rows, outputs):
         text = output.outputs[0].text if output.outputs else ""
-        category_raw, canonical_hint, merge_from = _parse_output(text)
-        category, label_decision, merge_applied = _resolve_category(
-            generated_category=category_raw,
-            canonical_hint=canonical_hint,
+        level1_raw_list, category_raw_list, canonical_hint_list, merge_from = _parse_output(text)
+        primary_level1_raw = level1_raw_list[0] if level1_raw_list else "Background"
+        primary_category_raw = category_raw_list[0] if category_raw_list else "General Background"
+        primary_canonical_hint = canonical_hint_list[0] if canonical_hint_list else ""
+        level1_category, category, label_decision, merge_applied = _resolve_category(
+            generated_level1=primary_level1_raw,
+            generated_category=primary_category_raw,
+            canonical_hint=primary_canonical_hint,
             merge_from=merge_from,
             shortlist_labels=shortlist_labels,
             label_counts=label_counts,
             alias_map=alias_map,
+            level2_to_level1=level2_to_level1,
             alias_threshold=label_alias_threshold,
         )
-        label_counts[category] = int(label_counts.get(category, 0)) + 1
+        known_set = set(_get_canonical_label_counts(label_counts, alias_map).keys())
+        known_set.update(shortlist_labels)
+
+        resolved_level2_keywords: List[str] = [category]
+        resolved_level1_keywords: List[str] = [level1_category]
+        for idx in range(1, len(category_raw_list)):
+            raw_level2 = _canonicalize_label(category_raw_list[idx], alias_map)
+            if not raw_level2:
+                continue
+            chosen_extra = raw_level2
+            if raw_level2 not in known_set and known_set:
+                best_label = ""
+                best_score = -1.0
+                key_gen = _normalize_label_key(raw_level2)
+                for label in known_set:
+                    score = SequenceMatcher(None, key_gen, _normalize_label_key(label)).ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_label = label
+                if best_label and best_score >= float(label_alias_threshold):
+                    chosen_extra = best_label
+            if chosen_extra in resolved_level2_keywords:
+                continue
+            if chosen_extra not in level2_to_level1:
+                mapped_level1 = (
+                    level1_raw_list[idx] if idx < len(level1_raw_list) else level1_category
+                )
+                level2_to_level1[chosen_extra] = _normalize_level1_label(mapped_level1)
+            resolved_level2_keywords.append(chosen_extra)
+            resolved_level1_keywords.append(level2_to_level1.get(chosen_extra, level1_category))
+
+        for keyword in resolved_level2_keywords:
+            level2_to_level1[keyword] = level2_to_level1.get(keyword, level1_category)
+            label_counts[keyword] = int(label_counts.get(keyword, 0)) + 1
+        resolved_level1_keywords = list(dict.fromkeys(resolved_level1_keywords))
+
         classified.append({
             "row": row,
+            "category_level_1": level1_category,
+            "category_level_2": category,
+            "category_level_1_keywords": resolved_level1_keywords,
+            "category_level_2_keywords": resolved_level2_keywords,
             "category": category,
-            "category_raw": category_raw,
+            "category_raw": primary_category_raw,
+            "category_level_1_raw": primary_level1_raw,
             "label_decision": label_decision,
-            "canonical_hint": canonical_hint,
+            "canonical_hint": primary_canonical_hint,
             "merge_from": merge_from,
             "merge_applied": merge_applied,
             "shortlist_labels": shortlist_labels,
         })
-    return classified, shortlist_labels
+    return classified
 
 
 def _resolve_category(
     *,
+    generated_level1: str,
     generated_category: str,
     canonical_hint: str,
     merge_from: List[str],
     shortlist_labels: List[str],
     label_counts: Dict[str, int],
     alias_map: Dict[str, str],
+    level2_to_level1: Dict[str, str],
     alias_threshold: float,
-) -> Tuple[str, str, List[str]]:
+) -> Tuple[str, str, str, List[str]]:
+    level1 = _normalize_level1_label(generated_level1)
     generated = _canonicalize_label(generated_category, alias_map)
     hint = _canonicalize_label(canonical_hint, alias_map) if canonical_hint else ""
     known_set = set(_get_canonical_label_counts(label_counts, alias_map).keys())
@@ -636,7 +726,11 @@ def _resolve_category(
         if merge_applied:
             decision = f"{decision}_merge"
 
-    return chosen, decision, merge_applied
+    # Intent: keep level-1 stable for existing level-2 labels to avoid semantic drift in registry.
+    chosen_level1 = level2_to_level1.get(chosen, level1)
+    if chosen not in level2_to_level1:
+        level2_to_level1[chosen] = chosen_level1
+    return chosen_level1, chosen, decision, merge_applied
 
 
 def _flush_batch(
@@ -653,6 +747,7 @@ def _flush_batch(
     seen_doc_ids: Set[str],
     label_counts: Dict[str, int],
     alias_map: Dict[str, str],
+    level2_to_level1: Dict[str, str],
     label_shortlist_topk: int,
     label_alias_threshold: float,
     limit: int,
@@ -667,7 +762,7 @@ def _flush_batch(
             return 0
         batch_rows = batch_rows[:remaining]
 
-    classified, _ = _classify_batch_rows(
+    classified = _classify_batch_rows(
         llm=llm,
         sampling_params=sampling_params,
         tokenizer=tokenizer,
@@ -677,20 +772,28 @@ def _flush_batch(
         batch_rows=batch_rows,
         label_counts=label_counts,
         alias_map=alias_map,
+        level2_to_level1=level2_to_level1,
         label_shortlist_topk=label_shortlist_topk,
         label_alias_threshold=label_alias_threshold,
     )
     new_count = 0
     for item in classified:
         row = item["row"]
-        category = str(item["category"])
+        category_level_1 = str(item["category_level_1"])
+        category_level_2 = str(item["category_level_2"])
         record = {
             "doc_id": str(row.get("doc_id", "")),
-            "category": category,
+            # Intent: keep legacy `category` key for backward compatibility while adding explicit 2-level fields.
+            "category": category_level_2,
+            "category_level_1": category_level_1,
+            "category_level_2": category_level_2,
+            "category_level_1_keywords": item["category_level_1_keywords"],
+            "category_level_2_keywords": item["category_level_2_keywords"],
         }
         if debug_output:
             record.update({
                 "category_raw": item["category_raw"],
+                "category_level_1_raw": item["category_level_1_raw"],
                 "label_decision": item["label_decision"],
                 "canonical_label_hint": item["canonical_hint"],
                 "merge_from": item["merge_from"],
@@ -705,80 +808,36 @@ def _flush_batch(
     return new_count
 
 
-def _run_nonleaf_warmup(
-    *,
-    llm: LLM,
-    sampling_params: SamplingParams,
-    tokenizer,
-    prompt_token_limit: int,
-    node_catalog_path: str,
-    subset: str,
-    depths: Set[int],
-    max_nonleaf_desc_words: int,
-    batch_size: int,
+def _save_registry(
+    path: str,
     label_counts: Dict[str, int],
     alias_map: Dict[str, str],
-    label_shortlist_topk: int,
-    label_alias_threshold: float,
-    max_nodes: int,
-    print_every: int,
-) -> int:
-    if not depths:
-        return 0
-    warmup_batch: List[Tuple[int, Dict]] = []
-    warmup_processed = 0
-    for node_idx, row in _iter_nonleaf_units(node_catalog_path, depths):
-        if max_nodes > 0 and warmup_processed >= max_nodes:
-            break
-        warmup_batch.append((node_idx, row))
-        warmup_processed += 1
-        if len(warmup_batch) < batch_size:
-            continue
-        _classify_batch_rows(
-            llm=llm,
-            sampling_params=sampling_params,
-            tokenizer=tokenizer,
-            prompt_token_limit=prompt_token_limit,
-            subset=subset,
-            max_desc_words=max_nonleaf_desc_words,
-            batch_rows=warmup_batch,
-            label_counts=label_counts,
-            alias_map=alias_map,
-            label_shortlist_topk=label_shortlist_topk,
-            label_alias_threshold=label_alias_threshold,
-        )
-        warmup_batch = []
-        if print_every > 0 and warmup_processed % print_every == 0:
-            print(
-                f"[Warmup] processed_nonleaf={warmup_processed} "
-                f"num_categories={len(_get_canonical_label_counts(label_counts, alias_map))}"
-            )
-
-    if warmup_batch:
-        _classify_batch_rows(
-            llm=llm,
-            sampling_params=sampling_params,
-            tokenizer=tokenizer,
-            prompt_token_limit=prompt_token_limit,
-            subset=subset,
-            max_desc_words=max_nonleaf_desc_words,
-            batch_rows=warmup_batch,
-            label_counts=label_counts,
-            alias_map=alias_map,
-            label_shortlist_topk=label_shortlist_topk,
-            label_alias_threshold=label_alias_threshold,
-        )
-    return warmup_processed
-
-
-def _save_registry(path: str, label_counts: Dict[str, int], alias_map: Dict[str, str], meta: Dict[str, object]) -> None:
+    level2_to_level1: Dict[str, str],
+    meta: Dict[str, object],
+) -> None:
     canonical_counts = _get_canonical_label_counts(label_counts, alias_map)
-    categories = [{"label": label, "count": int(count)} for label, count in sorted(canonical_counts.items(), key=lambda x: (-x[1], x[0]))]
+    categories = []
+    level1_counts: Dict[str, int] = {}
+    for label, count in sorted(canonical_counts.items(), key=lambda x: (-x[1], x[0])):
+        level1 = level2_to_level1.get(label, "Background")
+        level1_counts[level1] = int(level1_counts.get(level1, 0)) + int(count)
+        categories.append({
+            "label": label,
+            "level1": level1,
+            "level2": label,
+            "count": int(count),
+        })
     payload = {
         "meta": meta,
         "num_categories": len(categories),
+        "num_level1_categories": len(level1_counts),
+        "level1_categories": [
+            {"level1": level1, "count": int(count)}
+            for level1, count in sorted(level1_counts.items(), key=lambda x: (-x[1], x[0]))
+        ],
         "categories": categories,
         "alias_map": alias_map,
+        "level2_to_level1": level2_to_level1,
     }
     _ensure_parent_dir(path)
     with open(path, "w", encoding="utf-8") as f:
@@ -789,10 +848,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="One-pass abstract category assignment per document (local vLLM).")
     parser.add_argument("--dataset", type=str, default="BRIGHT")
     parser.add_argument("--subset", type=str, required=True)
-    parser.add_argument("--node_catalog_path", type=str, default=None)
+    parser.add_argument("--long_documents_path", type=str, default=None)
+    parser.add_argument("--documents_path", type=str, default=None)
     parser.add_argument("--out_jsonl", type=str, default=None)
     parser.add_argument("--out_registry_json", type=str, default=None)
-    parser.add_argument("--prompt_name", type=str, default="category_assign_v1")
+    parser.add_argument("--prompt_name", type=str, default="category_assign_v2")
     parser.add_argument("--llm", type=str, required=True)
     parser.add_argument("--tensor_parallel_size", type=int, default=2)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.85)
@@ -802,14 +862,9 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--max_desc_words", type=int, default=12000)
-    parser.add_argument("--max_nonleaf_desc_words", type=int, default=12000)
-    parser.add_argument("--hybrid_depths", type=str, default="1,2,3")
-    parser.add_argument("--hybrid_warmup_max_nodes", type=int, default=0)
-    parser.add_argument("--no_hybrid_warmup", action="store_true", default=False)
+    # Intent: keep one range interface (doc_idx) to reduce CLI complexity and maintenance overhead.
     parser.add_argument("--start_doc_idx", type=int, default=0)
     parser.add_argument("--end_doc_idx", type=int, default=-1)
-    parser.add_argument("--start_leaf_idx", type=int, default=None)
-    parser.add_argument("--end_leaf_idx", type=int, default=None)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true", default=False)
     parser.add_argument("--print_every", type=int, default=200)
@@ -820,27 +875,29 @@ def main() -> None:
     parser.add_argument("--debug_output", action="store_true", default=False)
     args = parser.parse_args()
 
-    if args.start_leaf_idx is not None:
-        # Intent: backward compatibility for existing scripts that still pass leaf-index ranges.
-        args.start_doc_idx = int(args.start_leaf_idx)
-    if args.end_leaf_idx is not None:
-        # Intent: backward compatibility for existing scripts that still pass leaf-index ranges.
-        args.end_doc_idx = int(args.end_leaf_idx)
-
-    node_catalog_path = args.node_catalog_path or _default_node_catalog_path(args.dataset, args.subset)
+    long_documents_path = args.long_documents_path or _default_long_documents_path(args.dataset, args.subset)
+    documents_path = args.documents_path or _default_documents_path(args.dataset, args.subset)
+    source_path, source_name = _resolve_input_parquet_path(
+        long_documents_path=long_documents_path,
+        documents_path=documents_path,
+    )
     out_jsonl = args.out_jsonl or _default_output_path(args.dataset, args.subset, args.prompt_name)
     out_registry_json = args.out_registry_json or _default_registry_path(args.dataset, args.subset, args.prompt_name)
-    if not os.path.exists(node_catalog_path):
-        raise FileNotFoundError(f"Missing node catalog: {node_catalog_path}")
+    print(f"[Data] using {source_name}: {source_path}")
 
     if args.overwrite and os.path.exists(out_jsonl):
         os.remove(out_jsonl)
 
     _ensure_parent_dir(out_jsonl)
     if args.overwrite:
-        seen_doc_ids, label_counts, alias_map = set(), {}, {}
+        seen_doc_ids, label_counts, alias_map, level2_to_level1 = set(), {}, {}, {}
+        for level1, level2 in BASE_CATEGORY_SEEDS:
+            level2_to_level1[level2] = level1
     else:
-        seen_doc_ids, label_counts, alias_map = _load_existing_state(out_jsonl)
+        seen_doc_ids, label_counts, alias_map, level2_to_level1 = _load_existing_state(out_jsonl)
+        for level1, level2 in BASE_CATEGORY_SEEDS:
+            if level2 not in level2_to_level1:
+                level2_to_level1[level2] = level1
 
     llm = LLM(
         model=args.llm,
@@ -870,39 +927,14 @@ def main() -> None:
         f"hard_limit={int(args.hard_prompt_token_limit)})"
     )
 
-    hybrid_depths = _parse_depths(args.hybrid_depths)
-    warmup_nodes = 0
-    if not args.no_hybrid_warmup and hybrid_depths:
-        # Intent: warm up abstract category shortlist from non-leaf summaries before leaf-level assignment.
-        warmup_nodes = _run_nonleaf_warmup(
-            llm=llm,
-            sampling_params=sampling_params,
-            tokenizer=tokenizer,
-            prompt_token_limit=prompt_token_limit,
-            node_catalog_path=node_catalog_path,
-            subset=args.subset,
-            depths=hybrid_depths,
-            max_nonleaf_desc_words=args.max_nonleaf_desc_words,
-            batch_size=args.batch_size,
-            label_counts=label_counts,
-            alias_map=alias_map,
-            label_shortlist_topk=args.label_shortlist_topk,
-            label_alias_threshold=args.label_alias_threshold,
-            max_nodes=args.hybrid_warmup_max_nodes,
-            print_every=args.print_every,
-        )
-        print(
-            f"[Warmup Done] processed_nonleaf={warmup_nodes} "
-            f"num_categories={len(_get_canonical_label_counts(label_counts, alias_map))}"
-        )
-
     generated = 0
     skipped_existing = 0
     skipped_range = 0
     batch_rows: List[Tuple[int, Dict]] = []
 
     with open(out_jsonl, "a", encoding="utf-8") as out_file:
-        for doc_idx, row in _iter_document_units(node_catalog_path, args.subset):
+        # Intent: prefer long_documents, then fall back to documents to preserve subset coverage.
+        for doc_idx, row in _iter_document_units_from_parquet(source_path):
             if doc_idx < args.start_doc_idx:
                 skipped_range += 1
                 continue
@@ -933,6 +965,7 @@ def main() -> None:
                 seen_doc_ids=seen_doc_ids,
                 label_counts=label_counts,
                 alias_map=alias_map,
+                level2_to_level1=level2_to_level1,
                 label_shortlist_topk=args.label_shortlist_topk,
                 label_alias_threshold=args.label_alias_threshold,
                 limit=args.limit,
@@ -965,6 +998,7 @@ def main() -> None:
                 seen_doc_ids=seen_doc_ids,
                 label_counts=label_counts,
                 alias_map=alias_map,
+                level2_to_level1=level2_to_level1,
                 label_shortlist_topk=args.label_shortlist_topk,
                 label_alias_threshold=args.label_alias_threshold,
                 limit=args.limit,
@@ -976,13 +1010,12 @@ def main() -> None:
         out_registry_json,
         label_counts,
         alias_map,
+        level2_to_level1,
         meta={
             "dataset": args.dataset,
             "subset": args.subset,
             "prompt_name": args.prompt_name,
             "model": args.llm,
-            "hybrid_depths": sorted(hybrid_depths),
-            "warmup_nonleaf_nodes": int(warmup_nodes),
             "created_at": created_at,
         },
     )

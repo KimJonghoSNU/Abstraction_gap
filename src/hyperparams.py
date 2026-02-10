@@ -29,8 +29,9 @@ def compress_hparam_string(hparam_str: str, chunk_size: int = 5) -> str:
         if "=" in part:
             key, val = part.split("=", 1)
             if val and val.lower() not in ['false', 'none']:
-                # val = val.replace('/', '__')
-                val = os.path.basename(val).split(".")[0]
+                # Intent: preserve numeric/string values (e.g., 0.035) while shortening path-like values only.
+                if "/" in val or "\\" in val:
+                    val = os.path.splitext(os.path.basename(val))[0]
                 compressed_parts.append(f"{abbreviate_key(key)}={val}")
         else:
             # Handle flag-only parameters
@@ -114,6 +115,24 @@ class HyperParams(argparse.Namespace):
             payload.pop('round3_category_soft_keep', None)
             payload.pop('round3_category_support_topk', None)
             payload.pop('round3_category_explore_beta', None)
+            payload.pop('round4_rule_name', None)
+            payload.pop('round4_support_topm', None)
+            payload.pop('round4_rule_a_margin_tau', None)
+            payload.pop('round4_rule_b_drop_tau', None)
+            payload.pop('round4_analysis_category_mode', None)
+        else:
+            rule_name = str(payload.get('round4_rule_name', 'rule_a')).lower()
+            if rule_name != 'rule_a':
+                payload.pop('round4_rule_a_margin_tau', None)
+            if rule_name != 'rule_b':
+                payload.pop('round4_rule_b_drop_tau', None)
+            if str(payload.get('round4_analysis_category_mode', 'default')).lower() == 'default':
+                payload.pop('round4_analysis_category_mode', None)
+        if str(payload.get('category_fusion', 'off')).lower() == 'off':
+            payload.pop('category_fusion', None)
+        # Intent: keep naming stable for the default BRIGHT original-query setting.
+        if str(payload.get('query_source', 'original')).lower() == 'original':
+            payload.pop('query_source', None)
         # Intent: when summarized context is explicitly off, omit this flag from naming to keep off-baseline path stable.
         if str(payload.get('round3_summarized_context', 'on')).lower() == 'off':
             payload.pop('round3_summarized_context', None)
@@ -127,6 +146,13 @@ class HyperParams(argparse.Namespace):
         # Add common hyperparameters here
         parser.add_argument('--dataset', type=str, default='BRIGHT')
         parser.add_argument('--subset', type=str, required=True, help='Subset of data to use')
+        parser.add_argument(
+            '--query_source',
+            type=str,
+            default='original',
+            choices=['original', 'gpt4'],
+            help='Query source for BRIGHT examples: original=examples/query, gpt4=gpt4_reason/gpt4_query',
+        )
         parser.add_argument('--tree_version', type=str, required=True, help='Version of the tree structure to use')
         parser.add_argument('--traversal_prompt_version', type=int, default=5)
         parser.add_argument('--reasoning_in_traversal_prompt', type=int, default=-1)
@@ -248,6 +274,55 @@ class HyperParams(argparse.Namespace):
             type=float,
             default=0.1,
             help='Penalty weight for category similarity to previous selected categories during explore',
+        )
+        parser.add_argument(
+            '--round4_rule_name',
+            type=str,
+            default='rule_a',
+            choices=['rule_a', 'rule_b'],
+            help='Round4 category decision rule: rule_a=margin gate, rule_b=counterfactual drop risk',
+        )
+        parser.add_argument(
+            '--round4_support_topm',
+            type=int,
+            default=10,
+            help='Top-M evidence similarities averaged for category support score in run_round4.py',
+        )
+        parser.add_argument(
+            '--round4_rule_a_margin_tau',
+            type=float,
+            default=0.02,
+            help='Rule A exploit threshold: exploit when (top1_support - top2_support) >= tau',
+        )
+        parser.add_argument(
+            '--round4_rule_b_drop_tau',
+            type=float,
+            default=0.01,
+            
+            help='Rule B exploit threshold: exploit when min relative drop risk <= tau',
+        )
+        parser.add_argument(
+            '--round4_analysis_category_mode',
+            type=str,
+            default='default',
+            choices=['default', 'force_full', 'force_drop_one'],
+            help=(
+                'Round4 analysis-only category override in run_round4.py: '
+                'default=use rule decision; '
+                'force_full=always keep all categories; '
+                'force_drop_one=always drop one category when possible'
+            ),
+        )
+        parser.add_argument(
+            '--category_fusion',
+            type=str,
+            default='off',
+            choices=['off', 'category_query_mean'],
+            help=(
+                'Anchor top-k fusion in run_round4.py: '
+                'off=disable; '
+                'category_query_mean=rerank anchor top-10 by mean of per-category support and base query score'
+            ),
         )
         parser.add_argument(
             '--round3_action_oracle',

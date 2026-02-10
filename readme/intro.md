@@ -15,4 +15,3 @@ Positioning against related prompts needs care. Methods such as RETRO-style rera
 
 Empirically, our current evidence suggests that the main gain comes from evidence-planning rewrites themselves (including structured, multi-aspect hypotheses), while explicit explore/exploit control is not yet the primary driver. In other words, policy control is a promising extension, but not the core claim at this stage.
 
-To avoid overclaiming, we do not attribute all gains to “abstraction prompting” alone. Improvements can also be affected by output structure and query diversity. Our claim is narrower: aligning rewrite objectives with evidence discovery improves miss recovery and retrieval quality in reasoning-intensive settings.
