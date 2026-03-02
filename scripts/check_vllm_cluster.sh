@@ -9,12 +9,20 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 BASE_PORT=8000
-NUM_GPUS=4
+NUM_SERVERS_DEFAULT=4
 
 # Determine mode from saved file
 MODE="data"  # default
 if [ -f "logs/cluster_mode.txt" ]; then
     MODE=$(cat logs/cluster_mode.txt)
+fi
+
+NUM_SERVERS=$NUM_SERVERS_DEFAULT
+if [ -f "logs/cluster_num_servers.txt" ]; then
+    SAVED_SERVERS=$(cat logs/cluster_num_servers.txt)
+    if [[ "$SAVED_SERVERS" =~ ^[0-9]+$ ]] && [ "$SAVED_SERVERS" -ge 1 ]; then
+        NUM_SERVERS=$SAVED_SERVERS
+    fi
 fi
 
 echo -e "${BLUE}================================================${NC}"
@@ -84,11 +92,11 @@ else
     # ============================================
     # CHECK DATA PARALLEL SERVERS
     # ============================================
-    for i in $(seq 0 $((NUM_GPUS-1))); do
+    for i in $(seq 0 $((NUM_SERVERS-1))); do
         PORT=$((BASE_PORT + i))
         PID_FILE="logs/vllm_gpu${i}.pid"
 
-        echo -e "${BLUE}[GPU $i - Port ${PORT}]${NC}"
+        echo -e "${BLUE}[Worker $i - Port ${PORT}]${NC}"
 
         # Check PID
         if [ -f "$PID_FILE" ]; then

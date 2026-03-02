@@ -126,6 +126,63 @@ def _build_domain_route_hint(subset_name: str) -> str:
     )
 
 
+def _build_corpus_categories_hint(base_dir: str, dataset: str, subset: str, max_per_level1: int = 6) -> str:
+    registry_path = os.path.join(
+        base_dir,
+        "trees",
+        str(dataset),
+        str(subset),
+        "category_registry_category_assign_v2.json",
+    )
+    if not os.path.exists(registry_path):
+        return "- Theory (no registry found)\n- Method (no registry found)\n- Evidence (no registry found)"
+    try:
+        with open(registry_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return "- Theory (registry load failed)\n- Method (registry load failed)\n- Evidence (registry load failed)"
+
+    categories = payload.get("categories", [])
+    by_level1: Dict[str, List[Tuple[str, int]]] = {}
+    for row in categories:
+        if not isinstance(row, dict):
+            continue
+        level1 = str(row.get("level1", "")).strip()
+        level2 = str(row.get("level2", row.get("label", ""))).strip()
+        try:
+            count = int(row.get("count", 0))
+        except Exception:
+            count = 0
+        if not level1 or not level2:
+            continue
+        by_level1.setdefault(level1, []).append((level2, count))
+
+    if not by_level1:
+        return "- Theory (empty)\n- Method (empty)\n- Evidence (empty)"
+
+    lines: List[str] = []
+    ordered_level1 = sorted(
+        by_level1.items(),
+        key=lambda kv: (-sum(int(x[1]) for x in kv[1]), str(kv[0])),
+    )
+    for level1, pairs in ordered_level1:
+        seen: set[str] = set()
+        top_level2: List[str] = []
+        for level2, _ in sorted(pairs, key=lambda x: (-int(x[1]), str(x[0]))):
+            if level2 in seen:
+                continue
+            seen.add(level2)
+            top_level2.append(level2)
+            if len(top_level2) >= int(max_per_level1):
+                break
+        if not top_level2:
+            continue
+        # Intent: present compact level1->level2 exemplars so the rewriter uses role taxonomies, not surface topics.
+        lines.append(f"- {level1} ({', '.join(top_level2)})")
+
+    return "\n".join(lines) if lines else "- Theory (empty)\n- Method (empty)\n- Evidence (empty)"
+
+
 def _ordered_doc_keys(docs: Dict[str, str]) -> List[str]:
     known = [key for key in CATEGORY_ORDER if str((docs or {}).get(key, "")).strip()]
     extra: List[str] = []
@@ -147,6 +204,7 @@ def _format_action_prompt(
     branch_descs: List[str],
     subset_name: str = "",
     retrieval_history: str = "",
+    corpus_categories: str = "",
 ) -> str:
     leaf_blob = "\n".join([x for x in leaf_descs if x])
     branch_blob = "\n".join([x for x in branch_descs if x])
@@ -169,6 +227,7 @@ def _format_action_prompt(
             branch_descs=branch_blob,
             gate_descs=gate_blob,
             domain_route_hint=domain_route_hint,
+            corpus_categories=corpus_categories,
         )
         return prepend_history_to_prompt(prompt, retrieval_history)
     except KeyError:
@@ -181,6 +240,7 @@ def _format_action_prompt(
             .replace("{branch_descs}", branch_blob)
             .replace("{gate_descs}", gate_blob)
             .replace("{domain_route_hint}", domain_route_hint)
+            .replace("{corpus_categories}", corpus_categories)
         )
         return prepend_history_to_prompt(prompt, retrieval_history)
 
@@ -326,6 +386,51 @@ def _compose_query_from_docs_with_policy(
     if not blob:
         return original_query, keep_keys
     return (original_query + " " + blob).strip(), keep_keys
+
+
+def _clean_docs_map(docs: Dict[str, str]) -> Dict[str, str]:
+    return {
+        key: str(val).strip()
+        for key, val in (docs or {}).items()
+        if str(key or "").strip() and str(val or "").strip()
+    }
+
+
+def _build_actions_keep_all(docs: Dict[str, str]) -> Dict[str, str]:
+    return {
+        key: "EXPLOIT"
+        for key in _ordered_doc_keys(docs)
+        if str(docs.get(key, "")).strip()
+    }
+
+
+def _merge_best_docs_by_support(
+    *,
+    previous_best_docs: Dict[str, str],
+    previous_best_support: Dict[str, float],
+    candidate_docs: Dict[str, str],
+    candidate_support: Dict[str, float],
+) -> Tuple[Dict[str, str], Dict[str, float], List[str]]:
+    merged_docs = _clean_docs_map(previous_best_docs or {})
+    merged_support = {
+        str(key): float(val)
+        for key, val in (previous_best_support or {}).items()
+        if str(key or "").strip() in merged_docs
+    }
+    updated: List[str] = []
+    candidate_clean = _clean_docs_map(candidate_docs or {})
+    for key, text in candidate_clean.items():
+        score = float(candidate_support.get(key, 0.0))
+        prev_score = float(merged_support.get(key, float("-inf")))
+        # Intent: update per-category best rewrite only when the same-category support strictly improves.
+        if (key not in merged_docs) or (score > prev_score):
+            merged_docs[key] = text
+            merged_support[key] = score
+            updated.append(key)
+    for key in list(merged_support.keys()):
+        if key not in merged_docs:
+            merged_support.pop(key, None)
+    return merged_docs, merged_support, updated
 
 
 def _embed_texts_cached(
@@ -564,7 +669,14 @@ def _select_categories_round4_policy(
         retriever=retriever,
         emb_cache=emb_cache,
     )
-    if rule_name == "rule_b":
+    if rule_name == "rule_c":
+        top_key = ordered[0] if ordered else ""
+        top_val = float(support_by_key.get(top_key, 0.0)) if top_key else 0.0
+        selected = list(ordered)
+        decision_mode = "rule_c"
+        decision_signal = {"name": "top1_support", "value": top_val, "top_category": top_key}
+        drop_risk_scores = {}
+    elif rule_name == "rule_b":
         selected, decision_mode, decision_signal, drop_risk_scores = _select_categories_rule_b_counterfactual(
             ordered=ordered,
             support_by_key=support_by_key,
@@ -936,8 +1048,8 @@ hp.add_param("round3_rewrite_use_history", False)
 hp.add_param("round3_router_prompt_name", None)
 hp.add_param("round3_summarized_context", "off")
 round4_rule_name = str(getattr(hp, "ROUND4_RULE_NAME", "rule_a") or "rule_a").lower()
-if round4_rule_name not in {"rule_a", "rule_b"}:
-    raise ValueError(f'Unsupported --round4_rule_name="{round4_rule_name}". Allowed: rule_a|rule_b')
+if round4_rule_name not in {"rule_a", "rule_b", "rule_c"}:
+    raise ValueError(f'Unsupported --round4_rule_name="{round4_rule_name}". Allowed: rule_a|rule_b|rule_c')
 round4_support_topm = max(1, int(getattr(hp, "ROUND4_SUPPORT_TOPM", 10) or 10))
 round4_rule_a_margin_tau = float(getattr(hp, "ROUND4_RULE_A_MARGIN_TAU", 0.02) or 0.02)
 round4_rule_b_drop_tau = float(getattr(hp, "ROUND4_RULE_B_DROP_TAU", 0.01) or 0.01)
@@ -959,7 +1071,15 @@ hp.add_param("round4_rule_a_margin_tau", round4_rule_a_margin_tau)
 hp.add_param("round4_rule_b_drop_tau", round4_rule_b_drop_tau)
 hp.add_param("round4_analysis_category_mode", round4_analysis_category_mode)
 hp.add_param("category_fusion", category_fusion)
+round4_iter0_prompt_name = str(getattr(hp, "ROUND4_ITER0_PROMPT_NAME", "") or "").strip()
+if round4_iter0_prompt_name and round4_iter0_prompt_name not in REWRITE_PROMPT_TEMPLATES:
+    raise ValueError(
+        f'Unsupported --round4_iter0_prompt_name="{round4_iter0_prompt_name}". '
+        f"Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}"
+    )
+hp.add_param("round4_iter0_prompt_name", round4_iter0_prompt_name or None)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+corpus_categories_hint = _build_corpus_categories_hint(BASE_DIR, hp.DATASET, hp.SUBSET)
 exp_dir_name = str(hp)
 # Intent: isolate round4 artifacts under a dedicated directory for clean comparison with round3 runs.
 RESULTS_DIR = f"{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/round4/{exp_dir_name}/"
@@ -1043,6 +1163,8 @@ for idx, path in zip(leaf_indices, leaf_paths):
 
 rewrite_enabled = True
 rewrite_template = None
+rewrite_template_name = ""
+rewrite_iter0_template = None
 rewrite_map: Dict[str, str] = {}
 action_map: Dict[str, str] = {}
 if hp.REWRITE_PROMPT_NAME:
@@ -1057,15 +1179,20 @@ if hp.REWRITE_PROMPT_NAME:
             "Expected: replace|concat"
         )
     rewrite_template = REWRITE_PROMPT_TEMPLATES[hp.REWRITE_PROMPT_NAME]
+    rewrite_template_name = str(hp.REWRITE_PROMPT_NAME)
 if hp.REWRITE_PROMPT_PATH:
     if not os.path.exists(hp.REWRITE_PROMPT_PATH):
         raise ValueError(f"--rewrite_prompt_path not found: {hp.REWRITE_PROMPT_PATH}")
     with open(hp.REWRITE_PROMPT_PATH, "r", encoding="utf-8") as f:
         rewrite_template = f.read()
+    rewrite_template_name = f"path:{os.path.basename(hp.REWRITE_PROMPT_PATH)}"
 rewrite_map, action_map, docs_map = _load_rewrite_action_cache(hp.REWRITE_CACHE_PATH, hp.REWRITE_FORCE_REFRESH)
 
 if rewrite_template is None:
     rewrite_template = REWRITE_PROMPT_TEMPLATES["round3_action_v1"]
+    rewrite_template_name = "round3_action_v1"
+if round4_iter0_prompt_name:
+    rewrite_iter0_template = REWRITE_PROMPT_TEMPLATES[round4_iter0_prompt_name]
 
 if hp.LLM_API_BACKEND == "genai":
     llm_api = GenAIAPI(hp.LLM, logger=logger, timeout=hp.LLM_API_TIMEOUT, max_retries=hp.LLM_API_MAX_RETRIES)
@@ -1107,6 +1234,13 @@ global_topk = hp.ROUND3_GLOBAL_TOPK
 all_eval_metric_dfs: List[pd.DataFrame] = []
 for iter_idx in range(hp.NUM_ITERS):
     logger.info("Round4 iteration %d", iter_idx)
+    iter_rewrite_template = rewrite_template
+    iter_rewrite_prompt_name = rewrite_template_name
+    if iter_idx == 0 and rewrite_iter0_template is not None:
+        # Intent: bootstrap iter 0 with broader prompt, then switch to corpus-grounded prompt from iter>=1.
+        iter_rewrite_template = rewrite_iter0_template
+        iter_rewrite_prompt_name = round4_iter0_prompt_name
+    logger.info("Iter %d: rewrite prompt template = %s", iter_idx, iter_rewrite_prompt_name)
     iter_rows: List[Dict[str, float]] = []
 
     rewrite_candidates: List[Dict] = []
@@ -1393,7 +1527,7 @@ for iter_idx in range(hp.NUM_ITERS):
             branch_descs = meta["branch_descs"] if hp.ROUND3_REWRITE_CONTEXT == "leaf_branch" else []
             retrieval_history = meta.get("retrieval_history", "")
             prompt = _format_action_prompt(
-                rewrite_template,
+                iter_rewrite_template,
                 sample.original_query,
                 sample.last_rewrite,
                 sample.last_possible_docs,
@@ -1401,6 +1535,7 @@ for iter_idx in range(hp.NUM_ITERS):
                 branch_descs,
                 subset_name=hp.SUBSET,
                 retrieval_history=retrieval_history,
+                corpus_categories=corpus_categories_hint,
             )
             cache_key = _prompt_cache_key("round3", prompt)
             if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
@@ -1420,51 +1555,88 @@ for iter_idx in range(hp.NUM_ITERS):
                 cached_actions = action_map.get(cache_key)
                 cached_docs = docs_map.get(cache_key, {})
                 if category_policy_mode == "soft" and cached_docs:
-                    policy_docs = {
-                        key: str(val).strip()
-                        for key, val in (cached_docs or {}).items()
-                        if str(key or "").strip() and str(val or "").strip()
-                    }
-                    if round4_analysis_category_mode == "default":
-                        policy_docs, lock_applied, lock_source = _apply_previous_exploit_lock(
-                            policy_docs,
-                            sample.last_possible_docs or {},
-                            sample.last_actions or {},
-                            sample.last_category_decision_mode,
+                    policy_docs = _clean_docs_map(cached_docs)
+                    if round4_rule_name == "rule_c":
+                        _, current_support_scores, _ = _compute_category_support(
+                            docs=policy_docs,
+                            evidence_descs=meta.get("support_leaf_descs", []),
+                            support_topm=round4_support_topm,
+                            retriever=retriever,
+                            emb_cache=category_emb_cache,
                         )
-                    else:
-                        # Intent: analysis overrides compare category-drop effects without controller lock confounds.
+                        merged_docs, merged_support, updated_categories = _merge_best_docs_by_support(
+                            previous_best_docs=sample.last_possible_docs or {},
+                            previous_best_support=sample.last_category_support_scores or {},
+                            candidate_docs=policy_docs,
+                            candidate_support=current_support_scores,
+                        )
+                        selected_categories = _ordered_doc_keys(merged_docs)
+                        support_scores = dict(merged_support)
+                        category_scores = dict(support_scores)
+                        decision_mode = "rule_c"
+                        top_category = max(current_support_scores, key=current_support_scores.get) if current_support_scores else ""
+                        decision_signal = {
+                            "name": "rule_c_best_concat",
+                            "top_category": str(top_category),
+                            "top_support": float(current_support_scores.get(top_category, 0.0)) if top_category else 0.0,
+                            "updated_categories": list(updated_categories),
+                        }
+                        drop_risk_scores = {}
                         lock_applied = False
                         lock_source = []
-                    selected_categories, support_scores, decision_mode, decision_signal, drop_risk_scores = _select_categories_round4_policy(
-                        docs=policy_docs,
-                        evidence_descs=meta.get("support_leaf_descs", []),
-                        support_topm=round4_support_topm,
-                        rule_name=round4_rule_name,
-                        rule_a_margin_tau=round4_rule_a_margin_tau,
-                        rule_b_drop_tau=round4_rule_b_drop_tau,
-                        analysis_category_mode=round4_analysis_category_mode,
-                        bootstrap_keep_all=(iter_idx == 0),
-                        retriever=retriever,
-                        emb_cache=category_emb_cache,
-                    )
-                    category_scores = dict(support_scores)
-                    sample.last_possible_docs = cached_docs
-                    sample.last_actions = _build_actions_from_selected(
-                        cached_docs,
-                        selected_categories,
-                        decision_mode,
-                    )
-                    # Intent: policy-aware query uses only selected categories while preserving original category texts.
-                    sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
-                    rewrite = sample.last_rewrite
-                    sample.last_action = decision_mode
-                    sample.last_category_support_scores = dict(support_scores)
-                    sample.last_category_decision_mode = decision_mode
-                    sample.last_category_decision_signal = dict(decision_signal)
-                    sample.last_category_drop_risk_scores = dict(drop_risk_scores)
-                    sample.last_category_lock_applied = bool(lock_applied)
-                    sample.last_category_lock_source = list(lock_source)
+                        # Intent: rule_c retrieval always concatenates per-category best rewrites across all categories.
+                        sample.last_possible_docs = dict(merged_docs)
+                        sample.last_actions = _build_actions_keep_all(sample.last_possible_docs)
+                        sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
+                        rewrite = sample.last_rewrite
+                        sample.last_action = "exploit"
+                        sample.last_category_support_scores = dict(merged_support)
+                        sample.last_category_decision_mode = decision_mode
+                        sample.last_category_decision_signal = dict(decision_signal)
+                        sample.last_category_drop_risk_scores = {}
+                        sample.last_category_lock_applied = False
+                        sample.last_category_lock_source = []
+                    else:
+                        if round4_analysis_category_mode == "default":
+                            policy_docs, lock_applied, lock_source = _apply_previous_exploit_lock(
+                                policy_docs,
+                                sample.last_possible_docs or {},
+                                sample.last_actions or {},
+                                sample.last_category_decision_mode,
+                            )
+                        else:
+                            # Intent: analysis overrides compare category-drop effects without controller lock confounds.
+                            lock_applied = False
+                            lock_source = []
+                        selected_categories, support_scores, decision_mode, decision_signal, drop_risk_scores = _select_categories_round4_policy(
+                            docs=policy_docs,
+                            evidence_descs=meta.get("support_leaf_descs", []),
+                            support_topm=round4_support_topm,
+                            rule_name=round4_rule_name,
+                            rule_a_margin_tau=round4_rule_a_margin_tau,
+                            rule_b_drop_tau=round4_rule_b_drop_tau,
+                            analysis_category_mode=round4_analysis_category_mode,
+                            bootstrap_keep_all=(iter_idx == 0),
+                            retriever=retriever,
+                            emb_cache=category_emb_cache,
+                        )
+                        category_scores = dict(support_scores)
+                        sample.last_possible_docs = dict(cached_docs)
+                        sample.last_actions = _build_actions_from_selected(
+                            cached_docs,
+                            selected_categories,
+                            decision_mode,
+                        )
+                        # Intent: policy-aware query uses only selected categories while preserving original category texts.
+                        sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
+                        rewrite = sample.last_rewrite
+                        sample.last_action = decision_mode
+                        sample.last_category_support_scores = dict(support_scores)
+                        sample.last_category_decision_mode = decision_mode
+                        sample.last_category_decision_signal = dict(decision_signal)
+                        sample.last_category_drop_risk_scores = dict(drop_risk_scores)
+                        sample.last_category_lock_applied = bool(lock_applied)
+                        sample.last_category_lock_source = list(lock_source)
                 elif isinstance(cached_actions, dict):
                     sample.last_actions = cached_actions
                     sample.last_possible_docs = cached_docs
@@ -1494,6 +1666,7 @@ for iter_idx in range(hp.NUM_ITERS):
                 sample.rewrite_history.append({
                     "iter": iter_idx,
                     "cache_hit": True,
+                    "prompt_name": iter_rewrite_prompt_name,
                     "action": sample.last_action,
                     "actions": sample.last_actions,
                     "possible_docs": sample.last_possible_docs,
@@ -1514,6 +1687,7 @@ for iter_idx in range(hp.NUM_ITERS):
                 rewrite_meta.append({
                     "sample": sample,
                     "cache_key": cache_key,
+                    "prompt_name": iter_rewrite_prompt_name,
                     "leaf_descs": leaf_descs,
                     "branch_descs": branch_descs,
                     "support_leaf_descs": meta.get("support_leaf_descs", []),
@@ -1550,51 +1724,88 @@ for iter_idx in range(hp.NUM_ITERS):
                 )
                 output_docs = docs or {}
                 if category_policy_mode == "soft" and output_docs:
-                    policy_docs = {
-                        key: str(val).strip()
-                        for key, val in (output_docs or {}).items()
-                        if str(key or "").strip() and str(val or "").strip()
-                    }
-                    if round4_analysis_category_mode == "default":
-                        policy_docs, lock_applied, lock_source = _apply_previous_exploit_lock(
-                            policy_docs,
-                            sample.last_possible_docs or {},
-                            sample.last_actions or {},
-                            sample.last_category_decision_mode,
+                    policy_docs = _clean_docs_map(output_docs)
+                    if round4_rule_name == "rule_c":
+                        _, current_support_scores, _ = _compute_category_support(
+                            docs=policy_docs,
+                            evidence_descs=meta.get("support_leaf_descs", []),
+                            support_topm=round4_support_topm,
+                            retriever=retriever,
+                            emb_cache=category_emb_cache,
                         )
-                    else:
-                        # Intent: analysis overrides compare category-drop effects without controller lock confounds.
+                        merged_docs, merged_support, updated_categories = _merge_best_docs_by_support(
+                            previous_best_docs=sample.last_possible_docs or {},
+                            previous_best_support=sample.last_category_support_scores or {},
+                            candidate_docs=policy_docs,
+                            candidate_support=current_support_scores,
+                        )
+                        selected_categories = _ordered_doc_keys(merged_docs)
+                        support_scores = dict(merged_support)
+                        category_scores = dict(support_scores)
+                        decision_mode = "rule_c"
+                        top_category = max(current_support_scores, key=current_support_scores.get) if current_support_scores else ""
+                        decision_signal = {
+                            "name": "rule_c_best_concat",
+                            "top_category": str(top_category),
+                            "top_support": float(current_support_scores.get(top_category, 0.0)) if top_category else 0.0,
+                            "updated_categories": list(updated_categories),
+                        }
+                        drop_risk_scores = {}
                         lock_applied = False
                         lock_source = []
-                    selected_categories, support_scores, decision_mode, decision_signal, drop_risk_scores = _select_categories_round4_policy(
-                        docs=policy_docs,
-                        evidence_descs=meta.get("support_leaf_descs", []),
-                        support_topm=round4_support_topm,
-                        rule_name=round4_rule_name,
-                        rule_a_margin_tau=round4_rule_a_margin_tau,
-                        rule_b_drop_tau=round4_rule_b_drop_tau,
-                        analysis_category_mode=round4_analysis_category_mode,
-                        bootstrap_keep_all=(iter_idx == 0),
-                        retriever=retriever,
-                        emb_cache=category_emb_cache,
-                    )
-                    category_scores = dict(support_scores)
-                    sample.last_possible_docs = output_docs
-                    sample.last_actions = _build_actions_from_selected(
-                        output_docs,
-                        selected_categories,
-                        decision_mode,
-                    )
-                    # Intent: policy-aware query uses only selected categories while preserving original category texts.
-                    sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
-                    rewrite = sample.last_rewrite
-                    sample.last_action = decision_mode
-                    sample.last_category_support_scores = dict(support_scores)
-                    sample.last_category_decision_mode = decision_mode
-                    sample.last_category_decision_signal = dict(decision_signal)
-                    sample.last_category_drop_risk_scores = dict(drop_risk_scores)
-                    sample.last_category_lock_applied = bool(lock_applied)
-                    sample.last_category_lock_source = list(lock_source)
+                        # Intent: rule_c retrieval always concatenates per-category best rewrites across all categories.
+                        sample.last_possible_docs = dict(merged_docs)
+                        sample.last_actions = _build_actions_keep_all(sample.last_possible_docs)
+                        sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
+                        rewrite = sample.last_rewrite
+                        sample.last_action = "exploit"
+                        sample.last_category_support_scores = dict(merged_support)
+                        sample.last_category_decision_mode = decision_mode
+                        sample.last_category_decision_signal = dict(decision_signal)
+                        sample.last_category_drop_risk_scores = {}
+                        sample.last_category_lock_applied = False
+                        sample.last_category_lock_source = []
+                    else:
+                        if round4_analysis_category_mode == "default":
+                            policy_docs, lock_applied, lock_source = _apply_previous_exploit_lock(
+                                policy_docs,
+                                sample.last_possible_docs or {},
+                                sample.last_actions or {},
+                                sample.last_category_decision_mode,
+                            )
+                        else:
+                            # Intent: analysis overrides compare category-drop effects without controller lock confounds.
+                            lock_applied = False
+                            lock_source = []
+                        selected_categories, support_scores, decision_mode, decision_signal, drop_risk_scores = _select_categories_round4_policy(
+                            docs=policy_docs,
+                            evidence_descs=meta.get("support_leaf_descs", []),
+                            support_topm=round4_support_topm,
+                            rule_name=round4_rule_name,
+                            rule_a_margin_tau=round4_rule_a_margin_tau,
+                            rule_b_drop_tau=round4_rule_b_drop_tau,
+                            analysis_category_mode=round4_analysis_category_mode,
+                            bootstrap_keep_all=(iter_idx == 0),
+                            retriever=retriever,
+                            emb_cache=category_emb_cache,
+                        )
+                        category_scores = dict(support_scores)
+                        sample.last_possible_docs = dict(output_docs)
+                        sample.last_actions = _build_actions_from_selected(
+                            output_docs,
+                            selected_categories,
+                            decision_mode,
+                        )
+                        # Intent: policy-aware query uses only selected categories while preserving original category texts.
+                        sample.last_rewrite = _flatten_docs_by_action(sample.last_possible_docs, sample.last_actions)
+                        rewrite = sample.last_rewrite
+                        sample.last_action = decision_mode
+                        sample.last_category_support_scores = dict(support_scores)
+                        sample.last_category_decision_mode = decision_mode
+                        sample.last_category_decision_signal = dict(decision_signal)
+                        sample.last_category_drop_risk_scores = dict(drop_risk_scores)
+                        sample.last_category_lock_applied = bool(lock_applied)
+                        sample.last_category_lock_source = list(lock_source)
                 elif actions:
                     sample.last_actions = actions
                     sample.last_possible_docs = output_docs
@@ -1624,6 +1835,7 @@ for iter_idx in range(hp.NUM_ITERS):
                 sample.rewrite_history.append({
                     "iter": iter_idx,
                     "cache_hit": False,
+                    "prompt_name": meta.get("prompt_name", iter_rewrite_prompt_name),
                     "action": sample.last_action,
                     "actions": sample.last_actions,
                     "possible_docs": sample.last_possible_docs,
@@ -1649,7 +1861,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     "action": sample.last_action if not sample.last_actions else None,
                     "actions": sample.last_actions if sample.last_actions else None,
                     "possible_answer_docs": sample.last_possible_docs if sample.last_possible_docs else None,
-                    "prompt_name": hp.REWRITE_PROMPT_NAME,
+                    "prompt_name": meta.get("prompt_name", iter_rewrite_prompt_name),
                     "llm": hp.LLM,
                     "leaf_descs": meta.get("leaf_descs", []),
                     "branch_descs": meta.get("branch_descs", []),

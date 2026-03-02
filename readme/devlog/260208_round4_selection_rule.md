@@ -1,5 +1,11 @@
 # 2026-02-08 Round4 Plan (Critical Revision)
 
+## Enrichindex와 차이
+- 얘는 document expansion.
+- Ours: 문서에 tag된 거. cheaper, no additional encoding stage.
+
+
+
 ## Context
 
 - 관찰된 실패 패턴:
@@ -235,7 +241,7 @@
 - 분석 절차:
     1. metric consistency check
         - 로그 기준 metric(`Anchor nDCG@10`)과 pickle metric을 일치 검증.
-        - `nDCG@10`(anchor), `Global_nDCG@10`, `Local_nDCG@10`를 분리해서 비교.
+        - `nDCG@10`(anchor) 비교
     2. support feature 추출
         - per-iter: `top1`, `top2`, `margin`, `relative_margin`, entropy(추가 예정), `|categories|`.
     3. oracle decision 모사
@@ -261,3 +267,98 @@
     - oracle label 모사에서 exploit F1 개선 + predicted exploit rate calibration(oracle exploit rate 근접).
     - real 적용 시 pred_exploit 구간의 평균 `Anchor ΔnDCG@10`가 pred_explore보다 유의하게 높음.
     - 위 조건을 만족하는 단순 규칙(설명 가능한 policy) 1개 이상 확보.
+
+## 2026-02-10 Result: Oracle rerun2 분석 (biology, v1)
+
+- 입력:
+    - oracle:
+        - `results/BRIGHT/biology/round4_oracle/S=biology-TV=bottom-up-TPV=5-RInTP=/1-NumLC=10-PlTau=5.0-RCF=0.5-LlmApiB=vllm/Llm=Qwen3-4B-Instruct-2507-NumI=5/NumES=1000-MaxBS=2-S=round4_oracle_drop_rerun2_round3_agent_executor_v1-FT=1000-GBT=10/PreFRS=branch-RPN=round3_agent_executor_v1-RM=concat-RE=1-RCT=5/RCS=mixed-RGT=10-RRrfK=60-RRC=leaf-REM=concat/RCP=soft-RCSK=2-RCST=10-RCEB=0.1-RRN=rule_a/RST=10-RRAMTau=0.02-ROM=drop_one_ndcg-ROAT=1000-ROMK=10/all_eval_sample_dicts.pkl`
+    - real:
+        - `results/BRIGHT/biology/round4/S=biology-TV=bottom-up-TPV=5-RInTP=/1-NumLC=10-PlTau=5-RCF=0-LlmApiB=vllm/Llm=Qwen3-4B-Instruct-2507-NumI=10/NumES=1000-MaxBS=2-S=round4_rule_a_none_round3_agent_executor_v1-FT=1000-GBT=10/PreFRS=branch-RPN=round3_agent_executor_v1-RM=concat-RE=1-RCT=5/RCS=mixed-RGT=10-RRrfK=60-RRC=leaf-REM=concat/RCP=soft-RCSK=2-RCST=10-RCEB=0-RRN=rule_a/RST=10-RRAMTau=0/all_eval_sample_dicts.pkl`
+    - 분석 출력:
+        - `results/analysis/round4_oracle_policy_biology_rerun2_vs_rulea_v1.json`
+        - `results/analysis/round4_oracle_policy_biology_rerun2_vs_rulea_v1_relative.json`
+
+- 데이터 품질 체크:
+    - oracle `iter_records.query_category_support_scores`: non-empty `412/515` (80.0%)
+    - 분포: `{0: 103, 1: 11, 2: 51, 3: 96, 4: 254}`
+    - 해석: 초기/비활성 step을 제외하면 support score 저장은 정상.
+
+- Oracle label 모사 (단일 threshold):
+    - raw margin 기준 best `tau=0.0005033`
+        - exploit F1=`0.4731`, precision=`0.3106`, recall=`0.9919`
+        - predicted exploit rate=`98.75%`, true exploit rate=`30.92%`
+    - relative margin 기준 best `tau=0.0015855`
+        - exploit F1=`0.4741` (raw와 사실상 동일)
+        - predicted exploit rate=`94.26%`, true exploit rate=`30.92%`
+
+- Real 전이 결과(핵심):
+    - raw tau를 real에 적용하면 predicted exploit=`97.51%` (real actual exploit=`6.04%`)
+    - relative tau를 real에 적용하면 predicted exploit=`93.17%` (real actual exploit=`6.04%`)
+    - 결론: oracle에서 fit한 절대 threshold를 real에 그대로 가져오면 과도한 exploit이 발생함.
+
+- 왜 단일 margin이 실패하는가:
+    - oracle 내부에서도 explore/exploit margin 분포가 크게 겹침.
+        - explore margin: mean=`0.01616`, p50=`0.01112`, p95=`0.04973`
+        - exploit margin: mean=`0.01947`, p50=`0.01563`, p95=`0.05051`
+    - exploit 중 `37.9%`가 explore median 이하 margin에 위치.
+    - 해석: `top1-top2` 하나만으로 oracle action을 안정적으로 분리하기 어려움.
+
+- metric mismatch 점검:
+    - mismatch는 버그라기보다 metric 정의 차이로 확인됨.
+    - 예: real iter9
+        - anchor(mean from metrics_df)=`61.2271`
+        - global(mean from iter_records)=`61.2837`
+    - 따라서 앞으로 비교 기준은 `Anchor nDCG@10`으로 고정해서 해석.
+
+- 이번 분석에서 얻은 결정:
+    - 단일 margin threshold는 policy로 채택하지 않음.
+    - 다음 후보는 "rate-controlled exploit" 계열로 제한:
+        - online 분포 기준 quantile gate (상위 q만 exploit)
+        - + warmup 이후 적용 (`t>=2`) + 최소 category 수 safeguard 유지
+
+## 2026-02-10 추가 분석: Oracle drop category 빈도 + support 관련성
+
+- 분석 대상:
+    - `results/BRIGHT/biology/round4_oracle/S=biology-TV=bottom-up-TPV=5-RInTP=/1-NumLC=10-PlTau=5.0-RCF=0.5-LlmApiB=vllm/Llm=Qwen3-4B-Instruct-2507-NumI=5/NumES=1000-MaxBS=2-S=round4_oracle_drop_rerun2_round3_agent_executor_v1-FT=1000-GBT=10/PreFRS=branch-RPN=round3_agent_executor_v1-RM=concat-RE=1-RCT=5/RCS=mixed-RGT=10-RRrfK=60-RRC=leaf-REM=concat/RCP=soft-RCSK=2-RCST=10-RCEB=0.1-RRN=rule_a/RST=10-RRAMTau=0.02-ROM=drop_one_ndcg-ROAT=1000-ROMK=10/all_eval_sample_dicts.pkl`
+    - 유효 이벤트(`support>=2`): `401`
+
+- 카테고리별 drop 빈도 (`best_candidate=drop_*`):
+    - 전체 drop 선택: `124`
+    - `Other=40`, `Theory=32`, `Example=31`, `Entity=21`
+    - iteration별 drop 총량: `iter1=47`, `iter2=31`, `iter3=28`, `iter4=18`
+    - 관찰: 이 런에서는 `Other`가 가장 자주 제거됨.
+
+- support로 best-drop을 설명할 수 있는지:
+    - exploit(drop) 이벤트에서 top-support category가 drop된 비율: `39.52%` (`49/124`)
+    - 즉 "`top-support는 항상 keep`" 가설은 oracle 행동과 자주 충돌.
+    - 전체 pair 기준 `corr(support, drop_gain)`:
+        - `drop_gain = score(drop_c) - score(keep_all)`
+        - 상관계수 `-0.0094` (거의 0)
+    - tie(`drop_gain=0`) 제외해도 상관계수 `0.0050` (여전히 거의 0)
+
+- 안전 제약 후보 검증 (`never_drop_top1_support`):
+    - `regret` 정의(이 문서에서):
+        - 각 이벤트에서 oracle이 고를 수 있는 최고 점수와, 제약을 건 정책이 고르는 점수의 차이
+        - 식: `regret = max(candidate_scores) - candidate_scores[constrained_choice]`
+        - 여기서 `candidate_scores`는 `{keep_all, drop_Theory, ...}`의 oracle `nDCG@10` 값
+        - 해석:
+            - `regret = 0`: 제약 정책이 oracle 최고 선택과 동일한 점수를 냄
+            - `regret > 0`: 제약 때문에 더 좋은 선택을 놓침 (`nDCG@10` 손실)
+    - 예시:
+        - `keep_all=70.0`, `drop_Theory=74.0`, `drop_Entity=71.0`이고
+        - 제약이 `drop_Theory`를 금지해서 `drop_Entity`를 고르면
+        - `regret = 74.0 - 71.0 = 3.0`
+    - oracle best 대비 regret:
+        - mean=`0.9086`, p50=`0.0`, p90=`0.3393`, p95=`5.0499`
+    - regret 발생 비율:
+        - `regret>0`: `10.72%`
+        - `regret>1.0`: `9.48%`
+    - 해석: top1-drop 금지는 평균적으로는 큰 변화가 없어 보일 수 있지만, 일부 케이스에서 손실 tail이 큼.
+
+- 이번 추가 분석 결론:
+    - support 단일 지표만으로 oracle drop 결정을 재현하기는 어려움.
+    - support는 hard rule(절대 금지/절대 drop)보다 soft prior로 쓰는 것이 맞음.
+    - 다음 정책은 아래 형태가 더 타당:
+        - top1-drop 금지를 기본으로 두되, 예외 해제 조건(반복 실패/추세 악화)을 둔 bounded policy.
+        - 또는 support 외 신호 1개 이상(예: 빠른 counterfactual proxy score)을 결합.

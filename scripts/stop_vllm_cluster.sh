@@ -22,8 +22,16 @@ else
 fi
 echo -e "${BLUE}================================================${NC}\n"
 
-NUM_GPUS=4
+NUM_SERVERS_DEFAULT=4
 STOPPED=0
+
+NUM_SERVERS=$NUM_SERVERS_DEFAULT
+if [ -f "logs/cluster_num_servers.txt" ]; then
+    SAVED_SERVERS=$(cat logs/cluster_num_servers.txt)
+    if [[ "$SAVED_SERVERS" =~ ^[0-9]+$ ]] && [ "$SAVED_SERVERS" -ge 1 ]; then
+        NUM_SERVERS=$SAVED_SERVERS
+    fi
+fi
 
 if [[ "$MODE" == "tensor" ]]; then
     # ============================================
@@ -52,7 +60,7 @@ else
     # STOP DATA PARALLEL SERVERS
     # ============================================
     # Stop servers using PID files
-    for i in $(seq 0 $((NUM_GPUS-1))); do
+    for i in $(seq 0 $((NUM_SERVERS-1))); do
         PID_FILE="logs/vllm_gpu${i}.pid"
 
         if [ -f "$PID_FILE" ]; then
@@ -86,6 +94,18 @@ fi
 # Clean up mode file
 if [ -f "logs/cluster_mode.txt" ]; then
     rm logs/cluster_mode.txt
+fi
+if [ -f "logs/cluster_num_servers.txt" ]; then
+    rm logs/cluster_num_servers.txt
+fi
+if [ -f "logs/cluster_ports.txt" ]; then
+    rm logs/cluster_ports.txt
+fi
+if [ -f "logs/cluster_gpus_per_server.txt" ]; then
+    rm logs/cluster_gpus_per_server.txt
+fi
+if [ -f "logs/vllm_base_url.txt" ]; then
+    rm logs/vllm_base_url.txt
 fi
 
 echo -e "\n${BLUE}================================================${NC}"

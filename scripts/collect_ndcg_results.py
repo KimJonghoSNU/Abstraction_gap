@@ -82,7 +82,11 @@ def _extract_ndcg_means(df: pd.DataFrame, iter_idx: int, metric: str) -> Optiona
     return float(df[metric].mean())
 
 
-def _extract_max_ndcg(df: pd.DataFrame, metric: str) -> Tuple[Optional[float], Optional[int]]:
+def _extract_max_ndcg(
+    df: pd.DataFrame,
+    metric: str,
+    max_iter: Optional[int] = None,
+) -> Tuple[Optional[float], Optional[int]]:
     if hasattr(df.columns, "levels"):
         best_val = None
         best_iter = None
@@ -93,10 +97,15 @@ def _extract_max_ndcg(df: pd.DataFrame, metric: str) -> Tuple[Optional[float], O
                 continue
             mean_val = float(df[iter_key][metric].mean())
             iter_idx = int(iter_key.split("Iter ")[-1])
+            # Intent: --max_iter limits max search to the first N iterations (iter index < N).
+            if max_iter is not None and iter_idx >= int(max_iter):
+                continue
             if best_val is None or mean_val > best_val:
                 best_val = mean_val
                 best_iter = iter_idx
         return best_val, best_iter
+    if max_iter is not None and int(max_iter) <= 0:
+        return None, None
     if metric not in df.columns:
         return None, None
     return float(df[metric].mean()), 0
@@ -155,6 +164,7 @@ def collect_ndcg_results(
     exclude_subdirs: List[str],
     include_dir: Optional[str],
     metric: str,
+    max_iter: Optional[int],
 ) -> pd.DataFrame:
     records: List[Dict[str, object]] = []
     for metrics_path in tqdm(sorted(_find_metrics_files(base_dir, include_dir))):
@@ -167,13 +177,13 @@ def collect_ndcg_results(
             print(f"Warning: Failed to read metrics file: {metrics_path}")
             continue
         category, exp_id = _relative_experiment_id(base_dir, metrics_path, drop_map)
-        max_ndcg, max_iter = _extract_max_ndcg(df, metric)
+        max_ndcg, max_iter_idx = _extract_max_ndcg(df, metric, max_iter=max_iter)
         records.append({
             "category": category,
             "experiment": exp_id,
             "ndcg_iter0": round(_extract_ndcg_means(df, 0, metric), 2),
             "ndcg_max": round(max_ndcg, 2),
-            "ndcg_max_iter": max_iter,
+            "ndcg_max_iter": max_iter_idx,
         })
     return pd.DataFrame(records)
 
@@ -195,9 +205,31 @@ def _format_wide_results(df: pd.DataFrame) -> pd.DataFrame:
     wide = wide.reset_index()
     return wide
 
+
+def _append_ndcg_max_mean_column(wide_df: pd.DataFrame) -> pd.DataFrame:
+    if wide_df.empty:
+        return wide_df
+    ndcg_max_cols: List[object] = []
+    for col in wide_df.columns:
+        if isinstance(col, tuple):
+            metric_name = col[1] if len(col) > 1 else ""
+        else:
+            metric_name = str(col)
+        if metric_name == "ndcg_max":
+            ndcg_max_cols.append(col)
+
+    out_df = wide_df.copy()
+    if ndcg_max_cols:
+        ndcg_vals = out_df[ndcg_max_cols].apply(pd.to_numeric, errors="coerce")
+        # Intent: provide per-experiment mean nDCG over available subset columns as a dedicated summary column.
+        out_df[("overall", "avg_ndcg_max")] = ndcg_vals.mean(axis=1)
+    else:
+        out_df[("overall", "avg_ndcg_max")] = pd.NA
+    return out_df
+
 # python scripts/collect_ndcg_results.py --include_dir round3
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Collect nDCG@10 results for iter 0 and iter 3.")
+    parser = argparse.ArgumentParser(description="Collect nDCG result summaries from all_eval_metrics.pkl files.")
     parser.add_argument("--base_dir", type=str, default="results/BRIGHT", help="Base results directory")
     parser.add_argument("--out_csv", type=str, default="results/BRIGHT/ndcg_summary.csv", help="Output CSV path")
     parser.add_argument("--exclude_subdir", action="append", default=["260116", "260121"], help="Subdirectory name to exclude")
@@ -207,6 +239,12 @@ def main() -> None:
         type=str,
         default=None,
         help="Only scan directories matching this glob (e.g., baseline or *baseline*)",
+    )
+    parser.add_argument(
+        "--max_iter",
+        type=int,
+        default=None,
+        help="If set, compute ndcg_max using only iterations with index < max_iter (e.g., 5 => iter 0..4).",
     )
     parser.add_argument(
         "--drop_param",
@@ -238,11 +276,21 @@ def main() -> None:
         base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), base_dir)
     if not os.path.isabs(out_csv):
         out_csv = os.path.join(os.path.dirname(os.path.dirname(__file__)), out_csv)
-    out_csv = out_csv[:-4] + args.include_dir.replace("*", "") + out_csv[-4:] if args.include_dir else out_csv
+    if args.include_dir:
+        out_csv = out_csv[:-4] + args.include_dir.replace("*", "") + out_csv[-4:]
+    if args.max_iter is not None:
+        out_csv = out_csv[:-4] + f"_maxiter{int(args.max_iter)}" + out_csv[-4:]
     print(f"Collecting {args.metric} results from {base_dir}...")
     drop_map = _build_drop_map(args.drop_param)
-    df = collect_ndcg_results(base_dir, drop_map, args.exclude_subdir, args.include_dir, args.metric)
-    wide_df = _format_wide_results(df)
+    df = collect_ndcg_results(
+        base_dir,
+        drop_map,
+        args.exclude_subdir,
+        args.include_dir,
+        args.metric,
+        args.max_iter,
+    )
+    wide_df = _append_ndcg_max_mean_column(_format_wide_results(df))
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     wide_df.to_csv(out_csv, index=False)
     print(f"Wrote {len(wide_df)} rows to {out_csv}")

@@ -62,6 +62,7 @@ class HyperParams(argparse.Namespace):
         # avoid excessively long log filenames
         'retriever_model_path',
         'node_emb_path',
+        'traversal_prompt_template_path',
         'rewrite_prompt_path',
         'rewrite_cache_path',
         'round3_router_cache_path',
@@ -136,6 +137,9 @@ class HyperParams(argparse.Namespace):
         # Intent: when summarized context is explicitly off, omit this flag from naming to keep off-baseline path stable.
         if str(payload.get('round3_summarized_context', 'on')).lower() == 'off':
             payload.pop('round3_summarized_context', None)
+        # Intent: keep historical run path naming stable for default pre-planner reference source.
+        if str(payload.get('round4_preplanner_reference_mode', 'website_title')).lower() == 'website_title':
+            payload.pop('round4_preplanner_reference_mode', None)
         return payload.items()
     
     @classmethod
@@ -155,6 +159,16 @@ class HyperParams(argparse.Namespace):
         )
         parser.add_argument('--tree_version', type=str, required=True, help='Version of the tree structure to use')
         parser.add_argument('--traversal_prompt_version', type=int, default=5)
+        parser.add_argument(
+            '--traversal_prompt_template_path',
+            type=str,
+            default=None,
+            help=(
+                'Optional traversal prompt template file. '
+                'If set, overrides built-in prompts.py traversal templates. '
+                'Supported placeholders: {{QUERY}}, {{CANDIDATES}}, {{RELEVANCE_DEFINITION}}, {{PROMPT_ID}}'
+            ),
+        )
         parser.add_argument('--reasoning_in_traversal_prompt', type=int, default=-1)
         parser.add_argument('--max_query_char_len', type=int, default=None)
         parser.add_argument('--max_doc_desc_char_len', type=int, default=None)
@@ -279,8 +293,8 @@ class HyperParams(argparse.Namespace):
             '--round4_rule_name',
             type=str,
             default='rule_a',
-            choices=['rule_a', 'rule_b'],
-            help='Round4 category decision rule: rule_a=margin gate, rule_b=counterfactual drop risk',
+            choices=['rule_a', 'rule_b', 'rule_c'],
+            help='Round4 category decision rule: rule_a=margin gate, rule_b=counterfactual drop risk, rule_c=per-category best-rewrite concat',
         )
         parser.add_argument(
             '--round4_support_topm',
@@ -322,6 +336,26 @@ class HyperParams(argparse.Namespace):
                 'Anchor top-k fusion in run_round4.py: '
                 'off=disable; '
                 'category_query_mean=rerank anchor top-10 by mean of per-category support and base query score'
+            ),
+        )
+        parser.add_argument(
+            '--round4_iter0_prompt_name',
+            type=str,
+            default=None,
+            help=(
+                'Optional rewrite prompt name used only at iter 0 in run_round4.py; '
+                'iter>=1 continues using --rewrite_prompt_name (or --rewrite_prompt_path/default).'
+            ),
+        )
+        parser.add_argument(
+            '--round4_preplanner_reference_mode',
+            type=str,
+            default='website_title',
+            choices=['website_title', 'doc_id'],
+            help=(
+                'Reference pool used by run_round4_1 pre-planner: '
+                'website_title=use cleaned website titles; '
+                'doc_id=use raw document IDs from document_categories_category_assign_v2.jsonl'
             ),
         )
         parser.add_argument(

@@ -1,4 +1,5 @@
 import re
+import os
 import numpy as np
 from google.genai.types import Schema, Type, Content
 
@@ -114,6 +115,38 @@ def get_relevance_definition(subset):
     RELEVANCE_DEFINITION = RELEVANCE_DEFINITIONS[subset] if subset in RELEVANCE_DEFINITIONS else RELEVANCE_DEFINITIONS['stackexchange']
     return RELEVANCE_DEFINITION
 
+
+_TRAVERSAL_TEMPLATE_CACHE = {}
+
+
+def _load_traversal_template_text(path):
+    normalized = os.path.abspath(str(path))
+    if normalized in _TRAVERSAL_TEMPLATE_CACHE:
+        return _TRAVERSAL_TEMPLATE_CACHE[normalized]
+    if not os.path.exists(normalized):
+        raise FileNotFoundError(f"Traversal prompt template not found: {normalized}")
+    with open(normalized, "r", encoding="utf-8") as f:
+        text = f.read()
+    _TRAVERSAL_TEMPLATE_CACHE[normalized] = text
+    return text
+
+
+def _render_traversal_template(template, args):
+    replacements = {
+        "{{QUERY}}": args.get("query", ""),
+        "{{CANDIDATES}}": args.get("child_node_options", ""),
+        "{{RELEVANCE_DEFINITION}}": args.get("relevance_defintion", ""),
+        "{{PROMPT_ID}}": str(args.get("prompt_id", "")),
+        "{query}": args.get("query", ""),
+        "{child_node_options}": args.get("child_node_options", ""),
+        "{relevance_defintion}": args.get("relevance_defintion", ""),
+        "{prompt_id}": str(args.get("prompt_id", "")),
+    }
+    rendered = template
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value)
+    return rendered
+
 def get_traversal_prompt_response_constraint(require_reasoning=True, return_dict=True):
     if not return_dict:
       tree_traversal_response_schema = Schema(
@@ -176,6 +209,11 @@ def get_traversal_prompt(query, child_desc_list, hp, logger, return_constraint=T
   max_desc_char_len = None
   constraint = get_traversal_prompt_response_constraint() if return_constraint else None
   relevance_definition = get_relevance_definition(hp.SUBSET)
+  template_path = getattr(hp, "TRAVERSAL_PROMPT_TEMPLATE_PATH", None)
+  custom_template = None
+  if template_path:
+    # Intent: keep inference prompt aligned with training by allowing file-based template override.
+    custom_template = _load_traversal_template_text(template_path)
 
   while True:
     args = {
@@ -185,8 +223,11 @@ def get_traversal_prompt(query, child_desc_list, hp, logger, return_constraint=T
 
     args['relevance_defintion'] = relevance_definition
     args['prompt_id'] = np.random.randint(10_000_000)
-    assert 'leaf_cluster' in kwargs, 'leaf boolean must be provided for version 5'
-    prompt = TREE_TRAVERSAL_PROMPT_V5_LEAF.format(**args) if kwargs['leaf_cluster'] else TREE_TRAVERSAL_PROMPT_V5_CLUSTER.format(**args)
+    if custom_template:
+      prompt = _render_traversal_template(custom_template, args)
+    else:
+      assert 'leaf_cluster' in kwargs, 'leaf boolean must be provided for version 5'
+      prompt = TREE_TRAVERSAL_PROMPT_V5_LEAF.format(**args) if kwargs['leaf_cluster'] else TREE_TRAVERSAL_PROMPT_V5_CLUSTER.format(**args)
 
     if bool(hp.MAX_PROMPT_PROTO_SIZE) and (get_content_proto_size(prompt) > hp.MAX_PROMPT_PROTO_SIZE):
       max_desc_char_len = hp.MAX_DOC_DESC_CHAR_LEN if max_desc_char_len is None else max_desc_char_len - 100

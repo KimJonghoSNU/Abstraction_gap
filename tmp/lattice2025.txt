@@ -1,0 +1,1107 @@
+
+
+===== PAGE 1 =====
+LLM-GUIDEDHIERARCHICALRETRIEVAL
+Nilesh Gupta♠♣ Wei-Cheng Chang♣ Ngot Bui♣ Cho-Jui Hsieh♦ Inderjit S. Dhillon♠♣
+♠UT Austin♦UCLA♣Google
+/gtbhttps://github.com/nilesh2797/lattice
+ABSTRACT
+Modern IR systems are increasingly tasked with answering complex, multi-faceted
+queries that require deep reasoning rather than simple keyword or semantic match-
+ing. While LLM based IR has shown great promise, the current retrieve-then-rerank
+paradigm inherits the limits of embedding-based retrieval, parametric generative ap-
+proaches are difficult to adapt to new information, and long-in-context approaches
+that put the entire corpus in context are computationally infeasible for large doc-
+ument corpora. To this end, we introduce a hierarchical retrieval framework
+LA TTICEthat enables an LLM to reason and navigate a large corpus with search
+complexity that is logarithmic in the number of documents, achieved by imposing
+a semantic tree structure on the corpus. Our approach comprises two stages: (1) an
+offline process where we organize the document collection into a semantic hierar-
+chy – we explore two LLM-driven strategies for this, a bottom-up agglomerative
+approach and a top-down divisive approach using multi-level summaries; and (2)
+an online traversal stage where a "search LLM" navigates this tree. A central
+challenge in using LLMs for this search is that the LLM’s relevance judgments
+arenoisy, context-dependent, and unaware of the underlying hierarchy, making
+it difficult to compare nodes across different branches and levels of the tree. To
+solve this, our traversal algorithm estimates calibrated latent relevance scores from
+the LLM’s local outputs, which are combined into a path relevance metric to guide
+the search globally across the tree. Our training-free framework achieves state-of-
+the-art zero-shot performance on the reasoning-intensive BRIGHT (Su et al., 2024)
+benchmark (with up to 420K corpus size), demonstrating improvements of up to 9%
+in Recall@100 and 5% in nDCG@10 over the next zero-shot baseline. Moreover,
+compared to the highly specialized and fine-tuned SOTA method DIVER-v2 (Long
+et al., 2025), it achieves comparable results on BRIGHT subsets that use a static
+corpus for evaluation.
+Avg. Bio. Earth. Econ. Psy. Rob. Stack. Sus.
+Subset
+50
+60
+70
+80
+90
+100Recall@100
+74.8
+87.5
+78.4
+69.0
+78.7
+74.8
+68.5
+66.8
+65.3
+89.5
+77.9
+52.4
+69.9
+51.1
+56.7
+59.8
+70.8
+83.8
+73.8
+62.2
+75.4
+53.5
+78.1
+69.0
+Recall@100 by Method and Stackexchange Subset
+LATTICE (gemini 2.5 flash)
+BM25 (with GPT 4 query exp)
+ReasonIR-8B (with GPT 4 query exp)
+0 10000 20000 30000 40000 50000 60000
+# of Tokens to LLM
+0
+10
+20
+30
+40nDCG@10
+Number of tokens vs nDCG@10 for robotics subset
+LATTICE
+BM25 rerank
+ReasonIR-8B rerank
+Figure 1:(Left) Recall@100 on BRIGHT’s StackExchange subsets. Comparison between zero-shot LATTICE
+(Gemini-2.5-flash) against a BM25 retriever (with GPT-4 query expansion) and a fine-tuned dual-encoder
+ReasonIR-8B (Shao et al., 2025) (with GPT-4 query expansion). LATTICE yields the highest average recall
+(74.8%) and substantially outperforms BM25 across all subsets (avg +9.5 pp) and ReasonIR-8B on average (+4.0
+pp), with particularly large gains on some datasets like Economics and Robotics. (Right) LLM cost (measured in
+avg. number of input tokens given to LLM) vs. ranking quality (nDCG@10) on the Robotics subset. Reranking
+baselines (BM25+rerank, ReasonIR-8B+rerank) with varying top-k shortlist use same Gemini-2.5-flash as
+reranker exhibit early gains but quickly plateau. LATTICE starts with a shallow flat region (cost of traversing
+tree levels) but then scales more effectively—surpassing the baselines and continuing to improve to a higher
+final nDCG—demonstrating that guided hierarchical traversal using LLM can be more compute efficient.
+1
+arXiv:2510.13217v1  [cs.IR]  15 Oct 2025
+
+===== PAGE 2 =====
+Database
+Convert to Hierarchical
+Semantic Tree
+Traverse Tree on User
+Query
+ROOT
+Search LLM
+0.6 0 [2]0.5
+1.0
+0.3 0.2 0.8
+0.8
+0.65 0.5
+1.0 0.6 0.3 0.6
+0.8
+0.9 0.7 0.55
+ROOT
+How to do simple takeoff
+then do yaw rotation: ..
+Query
+Local
+relevance
+from LLM
+Path
+relevance= Local
+relevance
+Parent's path
+relevance+
+0.5
+LLM-guided Tree Traversal (LATTICE)
+0 0.11.00.7
+0.75
+0.37 0.42 0.87
+Cross compare against best
+parent layer's node
+Calibrate
+0.8 0.0 0.0
+0.83 0.43 0.43
+Cross compare against best
+sampled leaf so far
+Offline Tree Construction
+Cluster LLM
+Figure 2: A high-level overview of our proposed framework,LA TTICE. The process consists of two
+stages. (Left) In the offline stage, we organize an unstructured document corpus into a semantic
+tree. (Right) In the online stage, a search LLM performs a best-first traversal over calibrated path
+relevance scores to find documents relevant to a user query. The path relevance score is defined as the
+exponentially moving average of calibrated scores of nodes on the path. Score calibration is achieved
+by comparing nodes against high-relevance candidates from sibling branches and previously seen
+leaves, ensuring a globally coherent search.
+1 INTRODUCTION
+The proliferation of Large Language Models (LLMs) has catalyzed a paradigm shift in Information
+Retrieval (IR), moving beyond simple fact-finding towards complex problem solving that demands
+nuanced understanding and reasoning. Modern user queries often require not just keyword or semantic
+matching, but a deeper level of inference, categorized as reasoning-based retrieval (Su et al., 2024).
+For instance, a user might seek a solution to a coding bug by describing its behavior, or ask for math
+problems that require applying a specific theorem. Answering such queries effectively requires
+retrieval of documents that help reasonthroughthe problem, a task for which traditional IR systems
+are poorly equipped.
+Current LLM-based IR systems primarily fall into three paradigms, each with inherent drawbacks.
+The first,Retrieve-then-Rerank, employs a computationally cheap retriever (e.g., BM25 or dense
+retrieval) to fetch a broad set of candidate documents, which are then re-ordered by a more powerful
+but expensive LLM. Although scalable, this approach is constrained with thelimits of the initial
+retrieval stage(Weller et al., 2025); if a crucial document is not captured in the initial candidate set,
+even a perfect reranker cannot recover it. Furthermore, the initial retrieval often relies on shallow
+semantic similarity, failing to perform the multi-step reasoning needed to identify relevant documents
+for complex queries. The second paradigm,Generative Retrieval (GenIR), uses the LLM itself to
+synthesize an answer. This can beparametric(Tay et al., 2022), where the corpus is stored implicitly
+in the model weights, making the system prone to hallucinations and difficult to update with new
+information. Alternatively,long-context GenIR(Lee et al., 2024a) places the entire corpus (or a
+large subset) explicitly into the LLM’s context. While this allows the LLM to reason over the full
+text, it is computationally infeasible for a typical retrieval corpora, as the self-attention mechanism’s
+quadratic/super-linear complexity leads to prohibitive costs and latency.
+To this end, we propose an LLM-guided hierarchical retrieval frameworkLATTICE, a framework that
+combines the logarithmic search efficiency of hierarchical structures with the sophisticated reasoning
+capabilities of modern LLMs. Our method first organizes a document corpus into a semantic tree
+offline, with internal nodes represented by rich, LLM-generated textual summaries. Then, at query
+time, a search LLM navigates this semantic hierarchy using a greedy, best-first traversal, processing a
+beam of top candidates at each step. To ensure the search remains globally coherent, the traversal
+algorithm computes a path relevance score for each node by aggregating calibrated local scores from
+the LLM along the path from the root, allowing our method to robustly compare nodes across different
+branches and levels and efficiently reach the most relevant documents. Our main contributions are:
+• We introduce a novel retrieval framework where an LLM directly performs the traversal of a
+semantic hierarchy, using its reasoning capabilities to guide the search path at each step, achieving
+state-of-the-art zero-shot results on the reasoning-intensive BRIGHT benchmark with improve-
+ments of up to 9% in Recall@100 and 5% in nDCG@10.
+2
+
+===== PAGE 3 =====
+• We propose a robust LLM-guided search algorithm that reliably performs greedy search on a
+semantic tree using noisy LLM judgments.
+• We design and compare two distinct LLM-driven strategies for corpus organization: a bottom-up
+agglomerative clustering method and a top-down divisive summarization approach.
+As LLMs increasingly become the fundamental unit of intelligent systems, the main goal of
+this paper is to show promise for an LLM-native retrieval system where LLMs are more deeply
+integrated in the search process than current IR systems.
+2 RELATEDWORK
+2.1 LLMS FORINFORMATIONRETRIEVAL
+Retrieve-then-Rerank Paradigm.The dominant paradigm in modern IR is a two-stage retrieve-
+then-rerank pipeline (Zhu et al., 2023). LLMs have excelled as powerful rerankers in this framework,
+applied in either pointwise (score each document independently) or listwise fashion (rank a list of
+documents) (Reddy et al., 2024; Sun et al., 2024). However, the overall performance is irreversibly
+bottlenecked by the quality of the initial retrieval stage (Rathee et al., 2025). In the retrieval stage,
+LLMs are increasingly used as backbones for dense embedding models (Luo et al., 2024; Lee et al.,
+2025), though this often involves adapting their autoregressive architecture for representation learning
+which is not directly aligned with their pre-training task.
+Generative Paradigms.To overcome the limitations of the cascading pipeline, alternative
+paradigms have emerged.Generative Retrieval, such as the Differentiable Search Index (DSI) (Tay
+et al., 2022; Li et al., 2024), reframes IR as a sequence-to-sequence task, mapping a query directly
+to a document identifier. While conceptually elegant, these methods face challenges in scaling and
+updating the index (Pradeep et al., 2023).Long-Context Retrievalproposes placing the entire corpus
+into the LLM’s context window (Lee et al., 2024a), but this remains computationally infeasible for
+even moderate-scale applications. Our work offers a middle ground by using a semantic hierarchy
+to structure the corpus, thus enabling an LLM to navigate it efficiently without the scalability /
+updatability issues of generative retrieval or the computational cost of long-context models.
+2.2 HIERARCHICALRETRIEVAL
+Vector Hierarchies.Hierarchical structures have been long used to improve computational effi-
+ciency in tasks with large output spaces, such as hierarchical softmax for language modeling (Morin
+& Bengio, 2005) and tree-based methods for extreme multi-label classification (Prabhu & Varma,
+2014; Yu et al., 2022; Gupta et al., 2022). In vector search, algorithms such as Hierarchical Navigable
+Small World (HNSW) (Malkov & Yashunin, 2018) use a multilevel graph for an efficient approximate
+nearest-neighbor search, although this hierarchy is geometric rather than semantic.
+Textual Hierarchies.More recently, models like RAPTOR (Sarthi et al., 2024) construct a semantic
+hierarchy by recursively clustering and summarizing text chunks from the bottom up. This creates a
+tree with nodes representing different levels of abstraction. However, RAPTOR relies on conventional
+embedding-based similarity search to traverse this tree. Our work differs fundamentally by employing
+an LLM as anactive traversal agentduring the online retrieval phase. Instead of a static vector
+comparison, our model uses in-context reasoning at each node to decide the optimal path, transforming
+the retrieval into an intelligent navigation process.
+2.3 AGENTIC ANDREASONING-BASEDIR
+Reasoning as a Pre-processing Step.A common approach to incorporate reasoning in IR is
+through query expansion (QE) (Wang et al., 2023; Gao et al., 2023). In this setup, an LLM enriches
+the query with generated text or a chain-of-thought analysis before it is passed to a standard retrieval
+system. While effective, this treats reasoning as a discrete pre-retrieval step, leaving the core search
+3
+
+===== PAGE 4 =====
+R
+0 1 2 3 4 5 6 7 8
+0 1 2 3 0 1 2 3 4 5 6 7 0 1 2 3
+0 1 2 3 4 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 0 1 2 3 4 5 0 1 2
+0 1 2 3 0 0 1
+0 1 2 3 4 5 6 7 8 9 1011121314150 1 2 3 4 5 6 7 8 9 1011121314150 1 2 3 4 5 6 7 8 9 1011121314150 1 2 3 4 5 6 7 8 9 101112131415
+0
+0.2
+0.4
+0.6
+0.8
+1Relevance
+Prediction Tree for Query: Simple takeoff then do yaw rotation    Arming and takeoff work fine but i don't know how to do yaw rotation:    class controller:      def __init__(self):rospy.Subscriber('mavros/state', State, self.state_cb)                    self.state = State()          def state_cb(self, msg):          self.state = msg            def move(self,x,y,z):pub_posisi = rospy.Publisher("/mavros/setpoin...
+Path: (6, 2, 1)Path Relevance: 0.891Calibrated Relevance: 0.794Local Relevance: 0.950Child Relevance: 0: 0.95; 1: 0.5
+Description:Provides comprehensive guides and API reference documentation for the `tf.transformations` Python library, whichfacilitates 3D spatial transformations using `Numpy`. This cluster covers the creation, manipulation, and decompositionof 4x4 homogeneous transformation matrices for operations like rotation, translation, and scaling. It details functionsfor converting between rotation representations such as matrices, quaternions, and Euler angles, and includes referencefor key functions like `quaternion_from_matrix`, `scale_matrix`, `superimposition_matrix`, and `compose_matrix`.Children nodes: 0, 16
+Reasoning:The user is attempting to perform yaw rotation using `quaternion_from_euler` from the `tf.transformations` library in adrone control script and is seeking guidance on how to do so correctly. The essential problem is understanding how tocorrectly apply yaw rotation through Euler to quaternion conversion.
+- **Candidate 0**: This document is highly relevant because it directly describes the `tf.transformations` library's"robust support for converting between different 3D rotation representations, including matrices, quaternions, and Eulerangles, with functions like `euler_from_matrix`, `quaternion_from_matrix`, and `quaternion_matrix`." The user's codeexplicitly uses `quaternion_from_euler`, which is precisely a function for converting Euler angles to quaternions forrotation. This document provides critical concepts and theories on the exact mechanism the user is struggling with.
+- **Candidate 1**: This document is less relevant. While it pertains to the `tf.transformations` library, itsdescription focuses on general 3D geometric transformations and vector math, mentioning functions like `scale_matrix`and `translation_matrix`. It does not specifically highlight the conversion between Euler angles and quaternions forrotation, which is the core of the user's query.
+- **Candidate 2**: This document is also highly relevant. It serves as a comprehensive guide and API reference for the`tf.transformations` library and explicitly states that it "details functions for converting between rotationrepresentations such as matrices, quaternions, and Euler angles, and includes reference for key functions like`quaternion_from_matrix`." This directly addresses the user's use of `quaternion_from_euler` for yaw rotation. As aparent node that encompasses the content of node 0, it offers a broader context and foundational understanding.
+Search LLM
+User Query
+Figure 3: An illustration of the search process ofLA TTICEfor a real query from the BRIGHT
+benchmark. The color of each node corresponds to its computed path relevance; the highlighted
+yellow path shows the path to ground-truth documents. The search LLM makes a step-by-step
+decision at each internal node to determine which branch to explore next. The expanded callout
+provides a "glass box" view into one such decision, detailing the LLM’s explicit reasoning process as
+it scores the child nodes.
+mechanism unchanged, often resulting in complex multi-component pipelines (Long et al., 2025;
+Shao et al., 2025) and ill-suited for lengthy and complex queries.
+Agentic Frameworks.The emerging field of Agentic IR (Jin et al., 2025; Zhang et al., 2024)
+conceptualizes retrieval as a multi-step, goal-oriented process. However, current implementations
+typically involve an LLM agent calling an external, black-box search tool, making its success
+contingent on the tool’s effectiveness. Similarly, Graph-RAG (Edge et al., 2024; Zhang et al., 2025)
+leverages LLMs to reason over pre-structured knowledge graphs, but the role of LLMs to retrieve
+information from these graphs are limited. Our work integrates the reasoning agent more deeply into
+the retrieval process itself. The LLM is not just a pre-processor or a tool-caller but the core search
+mechanism, more specifically, is an agent whose environment is the corpus’ semantic tree. The tree
+provides essential scaffolding, constraining the agent’s action space to make the search tractable,
+while the agent’s reasoning enables intelligent traversal decisions, offering a more fundamental fusion
+of reasoning and retrieval.
+3 METHODOLOGY
+We begin by formalizing the task setup and notations in Section 3.1, followed by a detailed description
+of the search procedure in Section 3.2, and ending with the tree construction procedures in Section 3.3.
+3.1 SETUP
+The fundamental task isretrieval: given a large corpus of |D| documents, D={d 1, d2, . . . , d|D|},
+and a complex natural language query q, the objective is to retrieve a ranked list of documents
+Drel ⊆D. We define the core components and notations of our framework as follows:
+•Semantic Tree:The corpus is organized into a treeT= (V, E), with a single root node,v root.
+• Nodes (v∈V ):The set of nodes V is partitioned into leaf nodes VL (corresponding to documents)
+and internal nodesV I (representing document clusters).
+• Edges ( E):The set of directed edges E⊂V×V consists of ordered pairs (u, v), where
+u=parent(v). The set of immediate children of a nodeuis denoted asC(u).
+• Node Representation (ϕ(v)):Every node v∈V has a textual representation ϕ(v). For vl ∈V L,
+ϕ(vl)is its document’s content. Forv i ∈V I,ϕ(v i)is an LLM-generated summary of its children.
+4
+
+===== PAGE 5 =====
+• Search LLM (L):For the purpose of this paper we assume that the search LLM can be abstracted
+out as alistwise scoring function. Given a queryqand a list ofkcandidate nodes[v 1, . . . , vk], it
+returns a list of real-valued scores (along with a reasoning trace):
+L(q,[ϕ(v 1), . . . , ϕ(vk)]) = [s 1, . . . , sk]
+where si ∈[0,1], i= 1, . . . , k . A higher score implies higher preference. The prompt used in our
+experiments to prompt an LLM asLis detailed in Figure 7.
+3.2 ONLINELLM-GUIDEDHIERARCHICALSEARCH
+The core challenge in using an LLM for hierarchical search is that its relevance judgments are
+inherently noisy, context-dependent and unaware of the underlying hierarchy. The score assigned to a
+node depends on the query as well as on the other nodes present in the list of options provided to the
+LLM. On top of this, these scores are inherently noisy due to the non-deterministic reasoning chain /
+inference of LLMs. This makes it difficult to compare the promise of a node in one branch against a
+node in a completely different branch or at a different level of the tree. Given a search query, the goal
+of our traversal algorithm is to prioritize the exploration of relevant nodes in the tree by predicting
+apath relevance score, ˆprel(v), which converts these noisy, local signals into a globally coherent
+signal. The algorithm, depicted in Figure 2 and formalized in Algorithm 1, proceeds in following
+steps.
+1. Initialization.The search begins with a max-priority queue, thefrontier ( F ), which is initialized
+with the root node vroot. Its score is set to ˆprel(vroot)←1.0 . We also initialize an emptyprediction
+set (Pred)to store candidate leaf nodes and a history of all observed scores, ScoreHistory← ∅.
+2. Beam Expansion.The search runs for N iterations, where in each iteration we expand (i.e.
+evaluate the children nodes of the chosen node) a beam of the top B most promising nodes from the
+frontierF. These nodes are selected based on their current path relevance scoresˆp rel.
+3. Slate Construction with Calibration.For each node v in the beam, we construct a slate for the
+search LLM to evaluate. This slate consists of the children of the current node C(v), augmented with
+a setAug(v). The composition ofAug(v)depends on the type of nodes being evaluated:
+• If C(v) areinternal nodes, Aug(v) consists of the highest scoring sibling of v to provide a
+cross-reference between different branches.
+• If C(v) areleaf nodes, Aug(v) consists of ℓ (a hyperparameter) leaf nodes sampled from
+Pred according to a probability distribution proportional toe ˆprel(u), anchoring the evaluation
+against the best candidates found so far and giving a chance for best scoring candidates to
+be evaluated again in a different context. In Figure 4, we show that this is essential for the
+final ranking.
+4. Latent Score Estimation and Path Relevance Update.After the search LLM L evaluates the
+slate and produces local scores, we perform a global calibration step before updating path relevance.
+We model the observed score si
+v for a node v in a given slate i as a linear transformation of an
+underlying, slate-independentlatent relevance scoreˆsv:
+si
+v ≈a·ˆs v +b i
+where a is a single global scale parameter and bi is a per-slate bias parameter. After each new slate is
+evaluated, we update our estimates for all latent scores {ˆsv}, a, and biases {bi} by treating this as a
+Maximum Likelihood Estimation (MLE) problem. We find the parameters that minimize the Mean
+Squared Error (MSE) across all scores observed thus far:
+min
+a,{ˆsv},{bi}
+X
+i
+X
+v∈slatei
+(si
+v −(a·ˆs v +b i))2.
+Note that without the a, bi parameters ˆsv reduces to the mean of all the scores seen so far for node
+v in ScoreHistory, we notice improved performance with this formulation as it can account for
+noise in scoring. While other objectives such as margin-based losses or probabilistic models like
+5
+
+===== PAGE 6 =====
+Algorithm 1LLM-guided Hierarchical Search
+1:Parameters:q, T,L, B, N, K, α
+2:Initialize:
+3:FrontierF←new MaxPriorityQueue(), Pred← ∅
+4:ScoreHistory← ∅, LatentScores← ∅
+5:ˆprel(vroot)←1.0,F.push(v root,ˆprel(vroot))
+6:fori= 1toNdo
+7:Beam←Extract topBnodes fromF
+8:for allvin Beamdo
+9:Slate←C(v) +Aug(v)
+10:LocalScores[s v′]v′∈Slate ← L(q,[ϕ(v ′)]v′∈Slate)
+11:Add{(slate_id i, v′, sv′)|v ′ ∈Slate}to ScoreHistory
+12:end for
+13:LatentScores←SolveMLE(ScoreHistory){Minimize MSE to find allˆs v}
+14:for allvin Beam that were just expandeddo
+15:for allv ′ in Slatedo
+16:ˆs v′ ←LatentScores[v ′]
+17:ˆp rel(v′)←α·ˆp rel(parent(v′)) + (1−α)·ˆs v′
+18:end for
+19:for allv ′ inC(v)do
+20:ifv ′ is a leaf nodethen
+21:Addv ′ to Pred
+22:else
+23:F.push(v ′,ˆprel(v′))
+24:end if
+25:end for
+26:end for
+27:end for
+28:returnTop-Knodes from Pred sorted byˆp rel
+Plackett-Luce could be applied, we found the simple modified MSE optimization to be the most
+consistent. The resulting latent scoreˆsv is used to define the path relevance:
+ˆprel(v) =α·ˆp rel(parent(v)) + (1−α)·ˆs v
+Here α is a hyperparameter in [0,1] . After scoring, the newly evaluated internal nodes are added to
+the frontierF, and leaf nodes are added to the prediction set Pred.
+5. Termination.The algorithm terminates after N iterations. The final output is the set of top-K
+documents from Pred, ranked by their final path relevance scores.
+3.3 OFFLINETREECONSTRUCTION
+The objective is to create a tree T= (V, E) where every leaf node v∈V L is connected to the
+root node vroot via a single path and each node v∈V is annotated with a textual representation
+ϕ(v). The maximum branching factor of any node is constrained by a hyperparameter M, i.e.,
+|C(v)| ≤M∀v∈V . While our traversal algorithm can be adapted for more general Directed
+Acyclic Graph (DAG) structures, we focus on a tree for simplicity. We now describe our bottom-up
+construction approach, which is conceptually similar to recursive clustering and summarization
+methods like RAPTOR (Sarthi et al., 2024).
+3.3.1 APPROACH1: BOTTOM-UPCLUSTERING ANDSUMMARIZATION
+This approach constructs the tree layer by layer, starting from the leaf nodes and iteratively clustering
+and summarizing them until a single root node is formed. To do this, we require two main components:
+• Anembedding function, E:text→R d, which maps a textual representation ϕ(v) to a
+d-dimensional vector. We use Gecko embeddings (Lee et al., 2024b) in our experiments.
+6
+
+===== PAGE 7 =====
+• Aclustering function, C. Given a set of n vectors X={x 1, . . . ,xn}, the function
+produces a partition {K1, . . . , Km} of X, such that for all j∈ {1, . . . , m} , |Kj| ≤M and
+Ki ∩K j =∅ for i̸=j . This can be implemented via iterative application of standard
+clustering algorithms like spectral clustering.
+The construction process, formalized in Algorithm 2, proceeds as follows:
+1. Initial Layer Formation.The process begins with the set of leaf nodes, VL. We form an initial
+set of parent nodes,V current, one level above the leaves. This can be done in two ways:
+• From Scratch:Apply the embedding and clustering functions to all documents to form the
+initial parent nodes.
+• Using Metadata:For datasets where documents are passages from a smaller set of source
+articles (stackexchange sub-datasets in BRIGHT), we leverage this inherent structure. We
+form initial clusters by grouping all passages belonging to the same source document. If
+any of the resulting cluster contains more than M passages, we further group nodes in the
+cluster based on location proximity in the source document until all sub-clusters satisfy the
+branching factor constraint. This metadata-driven approach often yields more semantically
+coherent initial groupings. Further implementation details are provided in Appendix B.3.
+2. Iterative Clustering and Summarization.Starting with the initial set of parent nodes, Vcurrent,
+we iteratively repeat a summarize-embed-cluster cycle. In each iteration, we first generate a textual
+summary ϕ(v) for each node in Vcurrent, embed these new summaries, and cluster them to form the
+next, higher level of the tree.
+3. Termination.We repeat this process until the number of nodes at the current level is less than or
+equal to M. These final nodes are assigned as the children of the root node, vroot, completing the
+tree.
+3.3.2 APPROACH2: TOP-DOWNDIVISIVECLUSTERING
+As an alternative to the agglomerative bottom-up method, we also explore a top-down divisive
+approach. Conceptually, this method is similar to hierarchical k-means, where we begin with a
+single cluster containing the entire document corpus and recursively partition it. The standard
+implementation would use an embedding and clustering function at each step. However, we observed
+that this can produce noisy, suboptimal clusters at the higher levels of the tree where partitions should
+be based on broad conceptual similarities rather than keyword overlap.
+To address this, we employ an LLM as a more powerful clustering function. Since providing the entire
+corpus to an LLM is infeasible due to context limits, we introduce a prerequisite step:hierarchical
+summarization. For each leaf node vl, we prompt an LLM to generate five summaries in increasing
+order of complexity (we quantify the complexity of a summary by its length, for e.g. first level of
+summary is 1-2 word, next is 3-4 words, and so on, more details in Section B.3.2), yielding a set of
+multi-level representations{ϕ(v l)i}5
+i=1.
+The top-down construction, detailed in Algorithm 4, proceeds as a recursive partitioning process:
+1. Initialization.The process begins with a work queue containing the root node vroot, whose
+children are initially all leaf nodesV L.
+2. Recursive Partitioning.We iteratively process nodes from the queue. For each node v to be
+partitioned, we first select an appropriate summary level i for its leaf descendants (details in the
+Section B.3.2). We then provide the set of unique summaries at that level to an LLM, prompting it to
+group them intoMconceptual topics.
+3. Node Creation and Re-assignment.The LLM returns a description for each of the M topics
+and a mapping from the unique input summaries to these topics. We create M new internal nodes,
+assign them the topic descriptions, and partition the leaf descendants of v among these new nodes
+according to the LLM’s mapping. These M new nodes become the children of v. Any new node that
+still contains more thanMleaves is added to the queue for further partitioning.
+7
+
+===== PAGE 8 =====
+4. Termination.The process terminates when the queue is empty, meaning all internal nodes in the
+tree satisfy the maximum branching factor constraint.
+4 EXPERIMENTS
+4.1 EXPERIMENTALSETUP
+Benchmark.All experiments are conducted on the BRIGHT benchmark (Su et al., 2024), a
+collection of 12 reasoning-intensive retrieval tasks. The benchmark is specifically designed to evaluate
+deep reasoning and is composed of complex questions from diverse sources, including StackExchange,
+Leetcode, and TheoremQA, spanning topics from biology and economics to programming and
+mathematics.
+Evaluation Metrics.We use two standard IR metrics to measure performance:nDCG@10(Nor-
+malized Discounted Cumulative Gain at 10) to evaluate the ranking quality of the top 10 results, and
+Recall@100to measure the comprehensiveness of the retrieval within the top 100 results.
+Baselines.We compareLA TTICEagainst several strong baselines.
+• SOTA Systems:We compare against state-of-the-art systems likeDIVER-v1/v2(Long et al.,
+2025),RaDeR(Das et al., 2025),ReasonRank(Liu et al., 2025) andReasonIR(Shao et al., 2025),
+which are trained and highly specialized for the BRIGHT benchmark.
+• Controlled Reranking Baseline:To ensure a fair, apples-to-apples comparison, we include
+a strong retrieve-then-rerank baselineXRR2 1(BM25 + Rerank) that uses thesame base LLM
+(Gemini-2.5-flash) as our method. XRR2 first retrieves 100 candidates using BM25 with a GPT-4
+expanded query and then reranks them using Gemini-2.5-flash model for total 5 iterations. This
+allows us to isolate the performance gains attributable to directly using an LLM to search the space
+versus just reranking a small retrieved corpus.
+Implementation Details.For all LLM-driven components of our method (tree construction, sum-
+marization, and online search), we useGemini-2.5-flash(Comanici et al., 2025). For the online
+traversal, we set the path relevance momentum to α= 0.5 , the number of iterations to N= 20 ,
+ℓ= 10 and the beam size to B= 2 . This configuration results in approximately 250 documents
+being evaluated by the LLM per query. For tree construction, the maximum branching factor was set
+toM∼10−20. For datasets derived from StackExchange, we employed the bottom-up clustering
+method; for all others, we used the top-down divisive approach. Our method,LA TTICE, is evaluated
+in a strictly zero-shot setting, without any fine-tuning or ensembling with any other method for the
+BRIGHT benchmark tasks. Further details are provided in Appendix B.
+4.2 PERFORMANCE ON THEBRIGHT BENCHMARK
+Ranking Performance (nDCG@10)We present main ranking results on the BRIGHT bench-
+mark in Table 1. On the seven StackExchange datasets, which use a standard static corpus,LA T -
+TICEachieves an average nDCG@10 of51.6, significantly outperforming the controlled reranking
+baseline’s score of47.4. Furthermore, our zero-shot performance is highly competitive with the
+fine-tuned SOTA, Diver-v2 (52.2), and even achieves the best results in several sub-domains like Eco-
+nomics and Robotics. On the 3/5 Coding and Theorem-based tasks (LeetCode, AoPS & TheoremQ),
+our method’s performance is noticably lower than the baselines. This is attributable to a specific
+benchmark artifact: the use of a query-dependent dynamic corpus, where a unique large list (can
+be > 10K) of documents (which are potential positives) is excluded from the search space. While
+we prune the excluded leaf nodes at query time, the pre-computed summaries (ϕ(v)) of their parent
+nodes do not update dynamically. Consequently, these summaries often misguide the traversal (please
+see Figure 6, Section C.2). In contrast, retrieve-then-rerank pipelines can simply filter excluded
+documents from their candidate list post-retrieval without penalty. We would like to note that most
+real-world IR systems operate on a query-independent corpus.
+1https://github.com/jataware/XRR2/tree/main
+8
+
+===== PAGE 9 =====
+Method Fine- StackExchange Coding Theorem-based Avg.
+tunedAvg.Bio. Earth. Econ. Psy. Rob. Stack. Sus.Avg.Leet.∗ PonyAvg.AoPS∗ ThQ.∗ ThT.
+Retriever with GPT-4 REASON-query
+BM25 ✗ 34.853.6 54.1 24.3 38.7 18.9 27.7 26.318.4 19.3 17.6 14.6 3.9 19.2 20.8 27.0SBERT ✗ 18.218.5 26.3 17.5 27.2 8.8 11.8 17.5 17.3 24.3 10.3 16.9 5.0 22.3 23.5 17.7gte-Qwen1.5-7B✗ 28.435.5 43.1 24.3 34.3 15.4 22.9 23.915.3 25.4 5.2 22.6 4.6 28.7 34.6 24.8OpenAI ✗ 27.735.2 40.1 25.1 38.0 13.6 18.2 24.215.5 24.5 6.5 18.1 7.7 22.9 23.8 23.3Google ✗ 30.236.4 45.6 25.6 38.2 18.7 29.5 17.917.4 31.1 3.7 22.7 10.0 27.8 30.4 26.2ReasonIR-8B✓ 33.143.6 42.9 32.7 38.8 20.9 25.8 27.525.5 31.5 19.6 25.4 7.4 33.1 35.7 29.9RaDeR-7B ✓ 30.136.1 42.9 25.2 37.9 16.6 27.4 25.023.3 34.8 11.9 31.0 12.0 37.7 43.4 29.2DIVER ✓ 35.851.9 53.5 29.5 41.2 21.4 27.5 26.122.6 33.5 11.7 29.5 9.5 39.3 39.7 32.0
+Retrieve-then-rerank
+ReasonIR ✓ 41.759.8 53.2 32.0 43.6 28.8 38.7 36.034.0 33.2 34.8 29.4 7.9 32.6 47.7 37.3DIVER v1 ✓ 46.162.2 58.7 34.4 52.9 35.6 36.5 42.932.1 38.925.4 37.1 18.3 40.0 53.1 41.5ReasonRank✓ 46.862.7 55.5 36.7 54.6 35.7 38.0 44.827.5 29.5 25.6 35.5 14.4 42.0 50.1 40.8XRR2 ✗ 47.463.1 58.2 38.5 52.9 37.1 37.6 44.628.4 21.9 35.0 31.8 15.7 34.4 45.540.3DIVER v2 ✓ 52.268.0 62.542.058.241.544.3 49.2 33.8 34.8 32.9 38.6 19.144.352.6 45.7
+LLM-guided Hierarchical Retrieval
+LA TTICE ✗ 51.664.4 62.4 45.4 57.447.6 37.6 46.426.9 19.9 34.0 30.0 12.0 30.1 47.8 42.1
+Table 1: nDCG@10 performance of various retrievers and rankers on the BRIGHT benchmark.Bold
+represents overall best numbers, underline represents best numbers among zero-shot methods, ∗
+denotes subsets with dynamic corpus.
+Retrieval Performance (Recall@100)As illustrated in Figure 1, our method demonstrates su-
+perior overall retrieval comprehensiveness. On average,LA TTICEachieves a Recall@100 of74.8,
+outperforming both the BM25 baseline (65.3) and the specialized ReasonIR-8B model (70.8). This
+strong performance is consistent across the majority of subsets, with our method achieving the highest
+recall in four of the seven domains, including Economics and Psychology.
+Cost-Performance Analysis.To analyze the computational cost of our method, we compare the
+trade-off between performance (nDCG@10) and cost (measure in number of tokens processed by the
+LLM) against two retreive-then-rerank baselines using the gemini-2.5-flash as the ranking LLM and
+varying top-k predictions from the retriever. Figure 1 plots this relationship for the Robotics subset.
+While the reranking baselines exhibit diminishing returns,LA TTICE’s performance scales far more
+effectively on this subset. The performance initially remains flat as the model needs to take atleast
+tree height number of slate comparisons to reach a leaf node. This shows promise that our guided
+hierarchical search can be more efficient use of the LLM’s computational budget than reranking a
+long, flat list of documents, where many of the tokens are spent on irrelevant candidates.
+5 ANALYSIS
+2 4 6 8 10 12 14 16 18 20
+Iteration N
+0
+10
+20
+30
+40
+50
+60
+70nDCG@10
+40.7
+53.9
+60.6
+63.8
+64.4
+ ablation (# cross-branch calibration)
+= 0
+= 1
+= 3
+= 5
+= 10
+Figure 4: nDCG@10 vs.ℓ.
+Effect of # Cross-Branch Calibration (ℓ).Figure 4 shows
+the impact of including ℓ top-scoring nodes from sibling
+branches in the leaf slates on bio subset. The results demon-
+strate that this calibration is critical for effective search. The
+baseline with no calibration ( ℓ= 0 ) performs significantly
+worse and fails to improve with more search iterations. Per-
+formance consistently increases with ℓ, with substantial gains
+fromℓ= 1toℓ= 5. The gains diminish afterℓ= 5.
+Impact of Method ComponentsTo quantify the contribution of each component ofLA TTICE,
+we conduct a detailed ablation study with results presented in Table 2. We compare our full method
+against several variants: a version without score calibration (always taking the latest score given
+Configuration Avg. Bio. Earth. Econ. Psy. Rob. Stack. Sus.
+LATTICE(Full Method) 51.57 64.38 62.36 45.37 57.35 47.57 37.58 46.35
+−No Score Calibration (ˆsv =lastsiv) 49.36 64.45 58.98 44.27 54.41 46.70 32.93 43.80
+−No Path Relevance (α= 0) 48.62 63.62 55.89 41.90 52.99 42.14 40.68 43.09
+−No Reasoning (thinking_budget= 0)49.33 63.69 57.32 43.77 57.33 45.73 33.16 43.95
+Table 2: Ablation study on the core components of our traversal algorithm, evaluated across all
+StackExchange subsets of the BRIGHT benchmark. All values are nDCG@10.
+9
+
+===== PAGE 10 =====
+by the search LLM to a node), one without path relevance (disabling path smoothing with α= 0 ),
+and one with zero reasoning budget to the LLM (passing thinking_budget= 0 in search LLM
+calls and strictly constraining it to output only the “scores” field in its output json). Disabling path
+relevance smoothing causes the largest degradation, followed by removing either the LLM’s reasoning
+or score calibration mechanism reducing the average score by over 2.2 nDCG points.
+101
+Iteration N (log-scale)
+0
+10
+20
+30
+40
+50
+60
+70nDCG@10
+60.9 62.2
+64.4 64.9
+Budget-matched B (beam-size) ablation
+B = 1, N = 40
+B = 2, N = 20
+B = 4, N = 10
+B = 8, N = 5
+Figure 5:nDCG@10 vs. beam-size.
+Beam Size vs. Search Iterations.Figure 5 presents a budget-
+matched analysis of beam size (B) versus search iterations (N),
+where the total number of node expansions ( B×N ) is kept
+roughly constant. The results indicate that for a fixed com-
+putational budget, prioritizing search depth (more iterations)
+over breadth (a larger beam) is better. The configurations with
+smaller beams, B= 1 and B= 2 , achieve the highest final
+nDCG@10 scores but are more sequential. This validates our
+choice of using a small beam size ( B= 2 ) with a moderate
+number of iterations.
+Biology TheoT.
+nDCG@10 R@100nDCG@10 R@100
+Bottom-Up Tree
+64.38 87.53 35.89 61.82
+Top-Down Tree
+55.22 67.31 47.85 73.91
+Table 3: Tree construction comparison.
+Impact of Tree Construction StrategyWe investigate
+the impact of the tree construction strategy on two rep-
+resentative datasets in Table 3. The results show that
+aligning the tree construction method with the corpus’s
+underlying structure is critical for zero-shot performance.
+For the Biology dataset, which is composed of passages
+from larger source documents, the bottom-up approach
+is superior, improving nDCG@10 by over 9 points. We
+hypothesize that this is because it leverages the inherent
+part-whole relationships in the data. Conversely, for the TheoT. dataset, which is a collection of
+distinct documents under a high-level topic, the top-down approach excels, improving nDCG@10 by
+nearly 12 points. We hypothesize that this method is better suited to discovering the latent conceptual
+clusters among independent documents.
+ACKNOWLEDGEMENTS
+This research was supported in part by NSF award #2439754. We would also like to express our
+gratitude to Divy Thakkar for generously helping with additional gemini-api credits, which were
+essential for conducting our experiments.
+REFERENCES
+Gheorghe Comanici, Eric Bieber, Mike Schaekermann, Ice Pasupat, Noveen Sachdeva, Inderjit
+Dhillon, Marcel Blistein, Ori Ram, Dan Zhang, Evan Rosen, et al. Gemini 2.5: Pushing the frontier
+with advanced reasoning, multimodality, long context, and next generation agentic capabilities.
+arXiv preprint arXiv:2507.06261, 2025.
+Debrup Das, Sam O’ Nuallain, and Razieh Rahimi. Rader: Reasoning-aware dense retrieval models.
+arXiv preprint arXiv:2505.18405, 2025.
+Darren Edge, Ha Trinh, Newman Cheng, Joshua Bradley, Alex Chao, Apurva Mody, Steven Truitt,
+Dasha Metropolitansky, Robert Osazuwa Ness, and Jonathan Larson. From local to global: A
+graph rag approach to query-focused summarization.arXiv preprint arXiv:2404.16130, 2024.
+Luyu Gao, Xueguang Ma, Jimmy Lin, and Jamie Callan. Precise zero-shot dense retrieval without
+relevance labels. InProceedings of the 61st Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pp. 1762–1777, 2023.
+Nilesh Gupta, Patrick Chen, Hsiang-Fu Yu, Cho-Jui Hsieh, and Inderjit Dhillon. Elias: End-to-end
+learning to index and search in large output spaces.Advances in Neural Information Processing
+Systems, 35:19798–19809, 2022.
+10
+
+===== PAGE 11 =====
+Bowen Jin, Hansi Zeng, Zhenrui Yue, Jinsung Yoon, Sercan Arik, Dong Wang, Hamed Zamani, and
+Jiawei Han. Search-r1: Training llms to reason and leverage search engines with reinforcement
+learning.arXiv preprint arXiv:2503.09516, 2025.
+Jinhyuk Lee, Anthony Chen, Zhuyun Dai, Dheeru Dua, Devendra Singh Sachan, Michael Boratko,
+Yi Luan, Sébastien MR Arnold, Vincent Perot, Siddharth Dalmia, et al. Can long-context language
+models subsume retrieval, rag, sql, and more?arXiv preprint arXiv:2406.13121, 2024a.
+Jinhyuk Lee, Zhuyun Dai, Xiaoqi Ren, Blair Chen, Daniel Cer, Jeremy R Cole, Kai Hui, Michael
+Boratko, Rajvi Kapadia, Wen Ding, et al. Gecko: Versatile text embeddings distilled from large
+language models.arXiv preprint arXiv:2403.20327, 2024b.
+Jinhyuk Lee, Feiyang Chen, Sahil Dua, Daniel Cer, Madhuri Shanbhogue, Iftekhar Naim, Gus-
+tavo Hernández Ábrego, Zhe Li, Kaifeng Chen, Henrique Schechter Vera, et al. Gemini embedding:
+Generalizable embeddings from gemini.arXiv preprint arXiv:2503.07891, 2025.
+Yongqi Li, Nan Yang, Liang Wang, Furu Wei, and Wenjie Li. Learning to rank in generative retrieval.
+InProceedings of the AAAI Conference on Artificial Intelligence, volume 38, pp. 8716–8723, 2024.
+Wenhan Liu, Xinyu Ma, Weiwei Sun, Yutao Zhu, Yuchen Li, Dawei Yin, and Zhicheng Dou. Reason-
+rank: Empowering passage ranking with strong reasoning ability.arXiv preprint arXiv:2508.07050,
+2025.
+Meixiu Long, Duolin Sun, Dan Yang, Junjie Wang, Yue Shen, Jian Wang, Peng Wei, Jinjie Gu, and
+Jiahai Wang. Diver: A multi-stage approach for reasoning-intensive information retrieval.arXiv
+preprint arXiv:2508.07995, 2025.
+Kun Luo, Minghao Qin, Zheng Liu, Shitao Xiao, Jun Zhao, and Kang Liu. Large language models as
+foundations for next-gen dense retrieval: A comprehensive empirical assessment.arXiv preprint
+arXiv:2408.12194, 2024.
+Yu. A. Malkov and D. A. Yashunin. Efficient and robust approximate nearest neighbor search using
+hierarchical navigable small world graphs, 2018. URL https://arxiv.org/abs/1603.
+09320.
+Frederic Morin and Yoshua Bengio. Hierarchical probabilistic neural network language model. In
+International workshop on artificial intelligence and statistics, pp. 246–252. PMLR, 2005.
+Andrew Ng, Michael Jordan, and Yair Weiss. On spectral clustering: Analysis and an algorithm.
+Advances in neural information processing systems, 14, 2001.
+Yashoteja Prabhu and Manik Varma. Fastxml: A fast, accurate and stable tree-classifier for extreme
+multi-label learning. InProceedings of the 20th ACM SIGKDD international conference on
+Knowledge discovery and data mining, pp. 263–272, 2014.
+Ronak Pradeep, Kai Hui, Jai Gupta, Adam D Lelkes, Honglei Zhuang, Jimmy Lin, Donald Metzler,
+and Vinh Q Tran. How does generative retrieval scale to millions of passages?arXiv preprint
+arXiv:2305.11841, 2023.
+Mandeep Rathee, Sean MacAvaney, and Avishek Anand. Guiding retrieval using llm-based listwise
+rankers. InEuropean Conference on Information Retrieval, pp. 230–246. Springer, 2025.
+Revanth Gangi Reddy, JaeHyeok Doo, Yifei Xu, Md Arafat Sultan, Deevya Swain, Avirup Sil, and
+Heng Ji. First: Faster improved listwise reranking with single token decoding.arXiv preprint
+arXiv:2406.15657, 2024.
+Parth Sarthi, Salman Abdullah, Aditi Tuli, Shubh Khanna, Anna Goldie, and Christopher D Manning.
+Raptor: Recursive abstractive processing for tree-organized retrieval. InThe Twelfth International
+Conference on Learning Representations, 2024.
+Rulin Shao, Rui Qiao, Varsha Kishore, Niklas Muennighoff, Xi Victoria Lin, Daniela Rus, Bryan
+Kian Hsiang Low, Sewon Min, Wen-Tau Yih, Pang Wei Koh, and Luke Zettlemoyer. ReasonIR:
+Training retrievers for reasoning tasks.arXiv [cs.AI], April 2025.
+11
+
+===== PAGE 12 =====
+Hongjin Su, Howard Yen, Mengzhou Xia, Weijia Shi, Niklas Muennighoff, Han-Yu Wang, Haisu Liu,
+Quan Shi, Zachary S Siegel, Michael Tang, Ruoxi Sun, Jinsung Yoon, Sercan O Arik, Danqi Chen,
+and Tao Yu. BRIGHT: A realistic and challenging benchmark for reasoning-intensive retrieval.
+arXiv [cs.CL], July 2024.
+Weiwei Sun, Lingyong Yan, Xinyu Ma, Shuaiqiang Wang, Pengjie Ren, Zhumin Chen, Dawei Yin,
+and Zhaochun Ren. Is chatgpt good at search? investigating large language models as re-ranking
+agents, 2024. URLhttps://arxiv.org/abs/2304.09542.
+Yi Tay, Vinh Tran, Mostafa Dehghani, Jianmo Ni, Dara Bahri, Harsh Mehta, Zhen Qin, Kai Hui, Zhe
+Zhao, Jai Gupta, et al. Transformer memory as a differentiable search index.Advances in Neural
+Information Processing Systems, 35:21831–21843, 2022.
+Liang Wang, Nan Yang, and Furu Wei. Query2doc: Query expansion with large language models.
+arXiv preprint arXiv:2303.07678, 2023.
+Orion Weller, Michael Boratko, Iftekhar Naim, and Jinhyuk Lee. On the theoretical limitations of
+embedding-based retrieval.arXiv preprint arXiv:2508.21038, 2025.
+Hsiang-Fu Yu, Kai Zhong, Jiong Zhang, Wei-Cheng Chang, and Inderjit S Dhillon. Pecos: Prediction
+for enormous and correlated output spaces.Journal of Machine Learning Research, 23(98):1–32,
+2022.
+Weinan Zhang, Junwei Liao, Ning Li, Kounianhua Du, and Jianghao Lin. Agentic information
+retrieval.arXiv preprint arXiv:2410.09713, 2024.
+Yu Zhang, Shutong Qiao, Jiaqi Zhang, Tzu-Heng Lin, Chen Gao, and Yong Li. A survey of large
+language model empowered agents for recommendation and search: Towards next-generation
+information retrieval.arXiv preprint arXiv:2503.05659, 2025.
+Yutao Zhu, Huaying Yuan, Zhengyi Liu, Chenxi Li, Ahmed Awadallah, Haolan Wang, and Ji-Rong
+Wen. Large language models for information retrieval: A survey.arXiv preprint arXiv:2308.07107,
+2023.
+12
+
+===== PAGE 13 =====
+A LIMITATIONS ANDFUTUREWORK
+Our work introduces a novel framework for hierarchical retrieval, but it also presents several avenues
+for future research. One of the limitation of our current approach is the use of astatic semantic tree.
+As demonstrated in our experiments on dynamic corpora, the pre-computed summaries of internal
+nodes do not update when leaf nodes are filtered, which can occasionally misguide the search. Future
+work could explore methods for efficient, localized updates to the tree’s summaries, allowing the
+hierarchy to adapt to a changing corpus without the need for a full reconstruction.
+Second, theoffline tree construction process, while a one-time cost, can be computationally intensive
+for extremely large corpora due to the repeated use of LLMs for clustering and summarization.
+Research into more efficient construction methods, perhaps by combining traditional clustering for
+the lower levels with LLM-based summarization for only the top, most abstract layers, could further
+improve scalability.
+Finally, our traversal algorithm opens up new research directions. The score calibration method,
+while effective, uses a simple linear model. More sophisticated probabilistic models, could be
+explored for even more robustlatent score estimation. Furthermore, while our greedy, best-first
+traversal is effective in a zero-shot setting, the entire process could be framed as a reinforcement
+learning problem, where the search LLM is an agent trained to optimize a policy for navigating the
+tree to maximize retrieval rewards. We believe that exploring these directions will further establish
+hierarchical, LLM-driven navigation as a powerful new paradigm in information retrieval.
+B IMPLEMENTATIONDETAILS
+B.1 HYPERPARAMETERS
+This section provides a detailed list of all hyperparameters and implementation choices used in our
+experiments to ensure full reproducibility.
+B.1.1 OFFLINETREECONSTRUCTION
+• Maximum Branching Factor (M):We set the maximum number of children for any node
+toM= 10−20.
+• Embedding Model (E):We use gecko (Lee et al., 2024b) embeddings to generate vector
+representations for the clustering steps.
+• Clustering Algorithm (C):Our implementation uses an iterative spectral clustering (Ng
+et al., 2001) algorithm to partition nodes into at most M clusters at each level of the
+hierarchy.
+• Summarization LLM:We use Gemini-2.5-flash for all summarization tasks (both
+for internal nodes in the bottom-up method and for the multi-level document summaries in
+the top-down method). The exact prompt template used is detailed in Appendix D.
+• Top-Down Summary Levels:For the top-down method, we generate 5 levels of hierarchical
+summaries for each document.
+B.1.2 ONLINETRAVERSAL
+• Search LLM (L):We use Gemini-2.5-flash as the search agent that performs the
+listwise scoring. The prompt structure is provided in Appendix D.
+• Number of Iterations (N):We run the search for N= 20 iterations for all main experi-
+ments.
+• Beam Size (B):We use a beam size of B= 2 for parallel node expansion in each iteration.
+• Path Relevance Momentum (α):The smoothing factor for the path relevance score is set
+toα= 0.5.
+• Calibration Nodes (l):We augment each leaf slate with ℓ= 10 cross-branch leaf nodes for
+calibration, based on our ablation study.
+13
+
+===== PAGE 14 =====
+• Reasoning Budget:The default “thinking budget” for the LLM’s reasoning step is set to
+-1, meaning the model gets to decide how long it wants to thin.
+• MLE Solver:The latent scores are updated after each batch of slate evaluations. The MSE
+loss is minimized using the Adam optimizer with a learning rate of10 −2 for100steps.
+Usage of LLMsDuring the preparation of this manuscript, LLM were used as a collaborative
+writing assistant to aid with drafting, refining prose for clarity and conciseness, and structuring
+arguments; all core ideas, experiments, and analyses were conducted by the authors.
+B.2 DATASETDETAILS
+All experiments are conducted on the BRIGHT benchmark (Su et al., 2024), a comprehensive
+collection of 12 datasets designed to evaluate reasoning-intensive retrieval. A summary of the
+statistics for each subset is provided in Table 4.
+Dataset Subset # Queries Corpus Size (D) Avg. Doc Length
+StackExchange
+Biology 103 57,359 83.6
+Earth Science 116 121,249 132.6
+Economics 103 50,220 120.2
+Psychology 101 52,835 118.2
+Robotics 101 61,961 121.0
+Stack Overflow 117 107,081 704.7
+Sustainable Living 108 60,792 107.9
+Coding
+LeetCode 142 413,932 482.6
+Pony 112 7,894 98.3
+Math
+AoPS 111 188,002 250.5
+TheoremQA-Q 194 188,002 250.5
+TheoremQA-T 76 23,839 354.8
+Table 4: Statistics for the 12 subsets of the BRIGHT benchmark used in our experiments.
+The datasets exhibit two key characteristics relevant to our work. First, the StackExchange subsets
+are composed of passages derived from longer source documents. We leverage this structure for our
+metadata-based initial clustering in the bottom-up tree construction method. Second, the Coding and
+Theorem-based datasets (excluding Pony and TheoremQA Theorems) utilize aquery-dependent
+corpus, where a unique list of documents (often >10k) must be excluded from the search space for
+each query. This feature, discussed in our main results analysis, poses a unique challenge for static
+index structures like our semantic tree.
+B.3 TREECONSTRUCTION
+B.3.1 BOTTOM-UP
+The Bottom-up tree constructions algorithms are defined in Alogirthm 2, 3.
+B.3.2 TOP-DOWN
+The Top-down tree constructions algorithm is defined in Algorithm 4, the two subroutines used are
+described below.
+TheSelectSummaryLevelfunction implements a heuristic to find the optimal summary granularity
+for a given set of leaf nodes. It begins with the most abstract summary level (i= 1 ) and iteratively
+14
+
+===== PAGE 15 =====
+Algorithm 2Bottom-Up Tree Construction
+1:Parameters:CorpusD,E,C, Summarize LLM,M, Optional InitialClusters
+2:Initialize:V L ← {Node(d)|d∈D},V←V L,E← ∅
+3:ifInitialClusters is providedthen
+4:V current ←CreateNodesFromClusters(V L,InitialClusters, V, E)
+5:else
+6:Embeddings← {E(ϕ(v)) :v∈V L}
+7:Clusters← C(Embeddings)
+8:V current ←CreateNodesFromClusters(V L,Clusters, V, E)
+9:end if
+10:while|V current|> Mdo
+11:{Summarize the current layer before clustering}
+12:for allvinV current do
+13:ϕ(v)←Summarize({ϕ(c)|c∈C(v)})
+14:end for
+15:V next_layer ← ∅
+16:Embeddings← {E(ϕ(v)) :v∈V current}
+17:Clusters← C(Embeddings)
+18:V next_layer ←CreateNodesFromClusters(V current,Clusters, V, E)
+19:V current ←V next_layer
+20:end while
+21:v root ←NewInternalNode(),ϕ(v root)←””
+22:C(v root)←V current
+23:V←V∪ {v root},E←E∪ {(v root, c)|c∈C(v root)}
+24:returnTreeT= (V, E)
+Algorithm 3CreateNodesFromClusters Subroutine
+1:functionCreateNodesFromClusters(V source, Clusters,V,E)
+2:Input:
+3:V source: The set of nodes in the layer to be clustered.
+4:Clusters: The partition ofV source’s embeddings fromC.
+5:V, E: The global node and edge sets for the tree (passed by reference).
+6:Initialize:V new_layer ← ∅
+7:for allclusterKin Clustersdo
+8:v new ←NewInternalNode()
+9:C(v new)← {v∈V source |v∈K}
+10:V←V∪ {v new}
+11:E←E∪ {(v new, c)|c∈C(v new)}
+12:V new_layer ←V new_layer ∪ {vnew}
+13:end for
+14:returnV new_layer
+checks the number of unique summaries, selecting the first level i where the count of unique
+summaries is sufficient for meaningful clustering (e.g., greater than M) while remaining under a
+maximum token limit for the LLM context.
+TheClusterLLMfunction is realized via a structured prompt (see 9. The LLM is provided with the
+list of unique summaries and tasked with grouping them into M coherent conceptual clusters. The
+prompt instructs the model to first generate a short, descriptive title for each of the M clusters, and
+then to output a mapping from each input summary to one of these cluster titles. The final output is a
+structured object containing the M topic descriptions (which become the ϕ(v) for the new nodes)
+and the mapping.
+15
+
+===== PAGE 16 =====
+Algorithm 4Top-Down Divisive Tree Construction
+1:Parameters:CorpusD, Summarize LLM, Cluster LLM, Max branching factorM
+2:Initialize:
+3:For each documentd l ∈D, generate multi-level summaries{ϕ(v l)i}5
+i=1.
+4:V L ← {Node(d)|d∈D},V←V L
+5:v root ←NewInternalNode(),C(v root)←V L
+6:V←V∪ {v root},E← {(v root, c)|c∈V L}
+7:PartitionQueue←new Queue()
+8:if|V L|> Mthen
+9:PartitionQueue.enqueue(v root)
+10:end if
+11:whilePartitionQueue is not emptydo
+12:v←PartitionQueue.dequeue()
+13:LeafDescendants←GetLeafDescendants(v, T)
+14:i←SelectSummaryLevel(LeafDescendants)
+15:UniqueSummaries←unique({ϕ(c) i |c∈LeafDescendants})
+16:TopicDescs, Mapping←ClusterLLM(UniqueSummaries, M)
+17:NewChildren← ∅
+18:forj= 1toMdo
+19:v ′
+j ←NewInternalNode(),ϕ(v ′
+j)←TopicDescs[j]
+20:V←V∪ {v ′
+j}, NewChildren←NewChildren∪{v ′
+j}
+21:end for
+22:ReassignChildren(LeafDescendants, Mapping, NewChildren, T)
+23:E←E\ {(v, c)|c∈C(v)}{Disconnect old children}
+24:C(v)←NewChildren
+25:E←E∪ {(v, c)|c∈NewChildren}{Connect new children}
+26:for allv ′
+j in NewChildrendo
+27:if|C(v ′
+j)|> Mthen
+28:PartitionQueue.enqueue(v ′
+j)
+29:end if
+30:end for
+31:end while
+32:returnTreeT= (V, E)
+C SUBJECTIVEANALYSIS
+C.1 SAMPLE SCORING RESPONSE FROMLLM
+To provide a more intuitive understanding of our method, Figure 3 presents a qualitative case study
+of the search process for a real query from the BRIGHT benchmark. The user query is a code snippet
+asking about “yaw rotation,” a complex 3D graphics problem. The figure visualizes the semantic tree
+and the traversal path taken byLA TTICE(highlighted in yellow) to successfully locate a relevant
+document deep within the hierarchy.
+The expanded callout provides a "glass box" view into the search LLM’s reasoning at a critical
+decision point. The LLM’s generatedReasoningexplicitly connects the user’s query to the node’s
+topic, noting that the user is “attempting to perform yaw rotation using quaternion_from_euler.”
+It then performs a detailed, comparative evaluation of the children nodes. It correctly identifies
+Candidate 1 as highly relevant because it discusses “support for converting between different 3D
+rotation representations, including matrices, quaternions, and Euler angles,” which directly addresses
+the user’s problem. This example demonstrates that our method does not rely on shallow semantic
+similarity; instead, the search is an active process guided by the LLM’s deep, step-by-step reasoning
+about the query in the context of the corpus hierarchy.
+16
+
+===== PAGE 17 =====
+R
+0 1 2 3 4 5 6 7 8 9 10 11 12
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 0 1 2 3 4 5 6 7 8 9 10 11 0 1 2 3 4 5 6 7 8 9 10 11 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 0 1 2 3 4 5 0 1 2 3 4 5 6 7 8 9 10 11 12 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 0 1 2 3 4 5
+012340123456789101112131415161718192021012345678910111213141516171819202122232401234501234567891011121314150123456780123456789101112131415161718192021222324252627282930012345670123456780123456701234567890123456789
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 0 1 2 3 4 5 6 0 1 2 3 4 5 6 7 8 9 10 0 1 2 3 4 5 6 7 8 9 10 11
+0
+0.2
+0.4
+0.6
+0.8
+1Relevance
+Interactive Prediction Tree for Query: Let $s_k$ denote the sum of the $\textit{k}$th powers of the roots of the polynomial $x^3-5x^2+8x-13$. In particular, $s_0=3$, $s_1=5$, and$s_2=9$. Let $a$, $b$, and $c$ be real numbers such that $s_{k+1} = a \, s_k + b \, s_{k-1} + c \, s_{k-2}$ for $k = 2$, $3$, $....$ What is $a+b+c$?$\textbf{(A)} \; -6 \qquad \textbf{(B)} \; 0 \qquad \textbf{(C)} \; 6 \qquad \textbf{(D)} \; 10 \qquad \textbf{(E)} \; 26$
+9/22/25, 3:41 PM visualize_sample.html
+ﬁle:///Users/nileshgupta/Downloads/visualize_sample.html 1/1
+Figure 6: Search failing due to dynamically excluded search corpus, red edges denote excluded leaf
+nodes, gold edges denote ground-truth path
+C.2 SEARCH FAILURE ON DYNAMIC CORPUS
+Figure 6 provides a qualitative case study of a search failure, visually demonstrating the primary
+challenge our method faces on datasets with a dynamic corpus. The figure shows the search tree for a
+random query from the AoPS dataset. Red edges indicate leaf nodes that were dynamically excluded
+for this specific query, while the yellow path highlights the ideal traversal route to the ground-truth
+document.
+As the figure shows, the search agent correctly follows the ground-truth path for the first two levels.
+However, it then reaches an internal node whose pre-computed summary is now misleading; the
+summary was generated based on all of its children, including the large number that have since been
+pruned from the search space (the red nodes). This inaccurate, stale summary causes the search LLM
+to make an incorrect judgment, deviating from the correct path and ultimately failing to retrieve the
+relevant document. This example visually confirms the specific failure mode of a static hierarchical
+index when faced with a dynamic corpus, reinforcing the quantitative analysis in our main results
+section.
+D PROMPTS
+17
+
+===== PAGE 18 =====
+You are an intelligent search agent navigating a hierarchical semantic tree of topics. Your mission is to
+predict the most promising candidates to find the answer to the user’s query using the relevance definition
+below.
+**Relevance Definition: ** {relevance_defintion}
+---
+## USER QUERY
+{query}
+---
+## CANDIDATES
+Here are the candidates, each is identified by a unique ‘node_id‘ provided at the very start in [] (e.g.,
+[0]).
+{child_node_options}
+---
+## YOUR EVALUATION TASK
+1. First, identify the essential problem in the query.
+2. Think step by step to reason about why each candidate is relevant or irrelevant (based on the relevance
+definition). Provide this analysis in the ‘reasoning‘ field.
+3. Rank these passages based on their relevance to the query. Provide your ranking in the ‘ranking‘ field.
+4. Assign a relevance score from 0 to 100 (based on the relevance definition and the ranking). Provide
+relevances in the ‘relevance_scores‘ field.
+---
+## OUTPUT FORMAT
+You must provide your response as a single, clean JSON object. The JSON should have three keys: ‘reasoning
+‘, ‘ranking‘, and ‘relevance_scores‘.
+* ‘reasoning‘: This must be a **string**.
+* ‘ranking‘: This must be an **array of integers ** representing the order of the candidates.
+* ‘relevance_scores‘: This must be an **array of arrays ** where each inner array contains [node_id,
+relevance_score]. For example: [[0, 85], [1, 92], [2, 73]].
+---
+## YOUR RESPONSE
+Figure 7: Prompt template used in our experiments for scoring a list of nodes forL.
+18
+
+===== PAGE 19 =====
+You are an expert in information retrieval and keyword generation. Your task is to analyze a provided list
+of informational passages and generate a hierarchically sorted list of search keywords for each passage,
+strictly adhering to the 5-level rubric below.
+## Keyword Generation Rules (5 Levels):
+Level 1: 1-2 Word, Core Subject / Domain (Broadest)
+Meaning: The absolute fundamental, overarching subject area or discipline.
+Characteristics: Only 1 to 2 word, very high-level (e.g., "Technology", "Science", "History")
+Level 2: 3-4 Word, General Topic / Sub-domain
+Meaning: Narrows Level 1; the specific major topic or branch within the broader field.
+Characteristics: Only 3 to 4 words, still general but more focused
+Level 3: 4-6 Word, Key Concepts / Main Themes
+Meaning: The central ideas, significant concepts, or primary themes directly discussed.
+Characteristics: Only 4 to 6 words, core messages, primary subjects, often main sections
+Level 4: 7-10 Word, Very Concise Passage Summary
+Meaning: A very short, concise summary of what the entire passage is about. This should encapsulate the
+essential idea or purpose of the passage.
+Characteristics: Only 7 to 10 words
+Level 5: 11-20 Word, Concise Passage Summary (Most Specific)
+Meaning: A concise summary but more descriptive than level 4 of what the entire passage is about. This
+should encapsulate the main idea or purpose of the passage.
+Characteristics: A single sentence, 11 to 20 words.
+### General Keyword Requirements:
+- All keywords must be actionable terms or phrases a user would realistically search.
+- Ensure comprehensive coverage of the passage’s content across all 5 levels.
+## Output Format
+Your output must be a single JSON object. This object will contain a top-level key: "passages_keywords".
+The value associated with this key must be a JSON array. Each element in this array will be an object with
+two keys:
+"passage_id": An integer that exactly matches the "id" from the corresponding input passage.
+"hierarchical_keywords": A JSON array of strings of length 5. Each string represents a hierarchical level (
+Level 1 at index 0, Level 2 at index 1, and so on).
+## List of Input Passages:
+{desc_list}
+Figure 8: Prompt template used in our experiments for generating multi-level keywords to be used in
+top-down tree construction.
+19
+
+===== PAGE 20 =====
+You are an expert data analyst and taxonomist. Your task is to analyze a list of keywords and their
+associated counts which indicate how many that keyword appears in the corpus.
+## Goal
+- Group the following keywords into **k** semantically coherent and **well-balanced** (i.e. each cluster
+should aim to contain similar weighted count) clusters, where k is between [{min_k}, {max_k}]. The primary
+basis for grouping must be the **topic and meaning ** of the keywords.
+- Use the provided count as a measure of each keyword’s **importance or popularity **. This weight should
+help you decide which topics are most significant.
+- Try to always maximize the number of clusters but **without** sacrificing the quality of the clustering,
+**quality of clustering is paramount **.
+For every cluster, generate:
+* A descriptive ‘cluster_name‘.
+* An information-dense ‘cluster_description‘ summarizing the core themes.
+* A list of all input ‘keywords‘ that constitute this cluster or apply to this cluster.
+## Input Data
+Here is the list of keywords and their importance counts:
+{keywords_list_with_count}
+## Desired Output Format
+Your final output must be a single JSON object, with no other text or explanation. The JSON object must
+have key: "clusters".
+{{
+"clusters": [
+{{"name": "Name of Cluster 1", "description": "A very information dense description of the cluster", "
+keywords": ["keyword 1", "keyword 2", ...] }},
+{{"name": "Name of Cluster 2", "description": "A very information dense description of the cluster", "
+keywords": ["keyword 3", "keyword 4", ...] }},
+...
+],
+}}
+---
+## Your Response
+Figure 9: Prompt template used for ClusterLLM to be used in top-down tree construction i.e.
+clustering a given set of keywords into[M min, Mmax]clusters.
+20
+
+===== PAGE 21 =====
+You are an expert AI analyst and summarizer. Your mission is to create a highly informative and "
+discriminative signpost" for a navigating search agent. This signpost (a summary) must guide the agent to
+the correct cluster of nodes to answer a user’s query.
+You will follow a strict, step-by-step cognitive process. You must analyze the children nodes in a target
+parent node (the "Positive Set").
+Prompt ID: {prompt_id} (ignore, this is just for watermarking purposes).
+## INPUTS
+### POSITIVE SET: Information about the target parent node to be summarized
+{positive_set_descriptions}
+---
+## YOUR TASK & OUTPUT FORMAT
+Your entire output must be a single, valid JSON object. Inside this JSON, you will follow the 3-step
+thinking process outlined below, populating each field as instructed.
+### JSON Structure and Instructions:
+{{
+"detailed_fingerprints": [
+// For EACH children node in the POSITIVE SET (target parent node), extract a structured object of its
+key, queryable facts.
+{{
+"one_line_summary": "...", // write a very information dense and very concise one-line summary for
+the information contained in this node
+"key_entities": ["..."], // List a very few key entities which is central to this node
+"genre_or_category": ["..."], // List a few key genre / categories this node can be classified into
+"name": "...", // Name the node
+}}
+],
+"common_theme": "...", // Reason deeply what are the common themes between the nodes in the POSITIVE SET
+"summary": "...", // Based on step 1 and step 2, write a very information dense description of the target
+node, **make sure to include all key entities **.
+}}
+---
+## Your Response
+Figure 10: Prompt template for generating bottom-up summaries of a group of nodes.
+21

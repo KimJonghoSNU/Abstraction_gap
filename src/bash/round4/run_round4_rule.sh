@@ -71,8 +71,9 @@ PROMPTS=(
 
 ROUND3_EXPLORE_MODE="concat"
 ROUND4_RULES=(
-    "rule_a"
-    "rule_b"
+    # "rule_a"
+    # "rule_b"
+    "rule_c"
 )
 ANCHOR_LOCAL_RANK_MODES=(
     # Intent: run both baseline anchor settings in round4 for apples-to-apples comparison.

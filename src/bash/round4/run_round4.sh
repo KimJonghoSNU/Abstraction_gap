@@ -62,7 +62,8 @@ declare -A TREE_VERSION_MAP=(
 
 PROMPTS=(
     # "round3_action_v1"
-    "round3_agent_executor_v1"
+    # "round3_agent_executor_v1"
+    "round3_agent_executor_v4"
     # "round3_action_v2"
     # "thinkqe"
     # "round3_free_rewrite_v2"

@@ -8,7 +8,8 @@ import hashlib
 from tqdm.autonotebook import tqdm
 import os
 import logging
-from typing import List
+from collections import defaultdict, deque
+from typing import Any, Dict, List, Set, Tuple
 from datasets import load_dataset
 from google.genai import types
 from json_repair import repair_json
@@ -45,6 +46,120 @@ from utils import (
 )
 np.random.seed(42)
 #endregion
+
+
+def _tree_version_to_dag_version(tree_version: str) -> str | None:
+    prefix = "category-topdown-"
+    tv = str(tree_version or "").strip()
+    if tv.startswith(prefix):
+        return tv[len(prefix):]
+    return None
+
+
+def _build_unrolled_tree_from_dag(
+    *,
+    base_dir: str,
+    dataset: str,
+    subset: str,
+    tree_version: str,
+) -> SemanticNode | None:
+    dag_version = _tree_version_to_dag_version(tree_version)
+    if not dag_version:
+        return None
+
+    dag_version_u = dag_version.replace("-", "_")
+    dag_path = os.path.join(
+        base_dir,
+        "trees",
+        dataset,
+        subset,
+        f"category_dag_topdown_{dag_version_u}.json",
+    )
+    if not os.path.exists(dag_path):
+        raise FileNotFoundError(
+            f"DAG artifact not found for tree_version={tree_version}: {dag_path}"
+        )
+
+    with open(dag_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    nodes_raw = payload.get("nodes", [])
+    edges_raw = payload.get("edges", [])
+    if (not isinstance(nodes_raw, list)) or (not isinstance(edges_raw, list)):
+        raise ValueError(f"Invalid DAG payload format: {dag_path}")
+
+    row_by_id: Dict[str, Dict[str, Any]] = {}
+    for row in nodes_raw:
+        if not isinstance(row, dict):
+            continue
+        node_id = str(row.get("id", "")).strip()
+        if not node_id:
+            continue
+        row_by_id[node_id] = row
+    if not row_by_id:
+        raise ValueError(f"No nodes found in DAG payload: {dag_path}")
+
+    outgoing_ids: Dict[str, Set[str]] = defaultdict(set)
+    incoming_ids: Dict[str, Set[str]] = defaultdict(set)
+    for edge in edges_raw:
+        if not isinstance(edge, dict):
+            continue
+        parent_id = str(edge.get("parent_id", "")).strip()
+        child_id = str(edge.get("child_id", "")).strip()
+        if (not parent_id) or (not child_id):
+            continue
+        if parent_id not in row_by_id or child_id not in row_by_id:
+            continue
+        outgoing_ids[parent_id].add(child_id)
+        incoming_ids[child_id].add(parent_id)
+
+    root_id = ""
+    for node_id, row in row_by_id.items():
+        if str(row.get("kind", "")).strip().lower() == "root":
+            root_id = node_id
+            break
+    if (not root_id) and ("L0|root" in row_by_id):
+        root_id = "L0|root"
+    if not root_id:
+        root_id = sorted(row_by_id.keys())[0]
+
+    reachable: Set[str] = set()
+    queue: deque[str] = deque([root_id])
+    while queue:
+        cur = queue.popleft()
+        if cur in reachable:
+            continue
+        reachable.add(cur)
+        for nxt in sorted(outgoing_ids.get(cur, set())):
+            if nxt not in reachable:
+                queue.append(nxt)
+
+    def _child_sort_key(child_id: str) -> Tuple[int, int, str]:
+        row = row_by_id[child_id]
+        level = int(row.get("level", 999))
+        kind = str(row.get("kind", "")).strip().lower()
+        is_leaf = 1 if kind == "leaf" else 0
+        return (level, is_leaf, child_id)
+
+    def _make_node(node_id: str, anc: Set[str]) -> SemanticNode:
+        if node_id in anc:
+            # Intent: defensive cycle guard; DAG should be acyclic but we keep this to avoid infinite recursion on malformed data.
+            return SemanticNode(id=str(row_by_id[node_id].get("display_id", node_id)), desc="", child=[])
+        row = row_by_id[node_id]
+        display_id = row.get("display_id")
+        semantic_id = display_id if (display_id is not None) else node_id
+        node_desc = str(row.get("desc", "") or "")
+        children: List[SemanticNode] = []
+        next_anc = set(anc)
+        next_anc.add(node_id)
+        for child_id in sorted([x for x in outgoing_ids.get(node_id, set()) if x in reachable], key=_child_sort_key):
+            # Intent: unroll multi-parent DAG into path-distinct tree copies so run.py traversal/eval contract remains unchanged.
+            children.append(_make_node(child_id, next_anc))
+        return SemanticNode(id=semantic_id, desc=node_desc, child=children)
+
+    root = _make_node(root_id, set())
+    root.id = None
+    return root
 
 
 def _format_qe_prompt(template: str, query: str) -> str:
@@ -422,11 +537,29 @@ else:
     
 doc_id_to_content = {docs_df.iloc[i].id: docs_df.iloc[i].content for i in range(len(docs_df))}
 
-tree_dict = pkl.load(open(f'{BASE_DIR}/trees/{hp.DATASET}/{hp.SUBSET}/tree-{hp.TREE_VERSION}.pkl', 'rb'))
-semantic_root_node = SemanticNode().load_dict(tree_dict) if isinstance(tree_dict, dict) else tree_dict
+dag_root_node = _build_unrolled_tree_from_dag(
+    base_dir=BASE_DIR,
+    dataset=hp.DATASET,
+    subset=hp.SUBSET,
+    tree_version=hp.TREE_VERSION,
+)
+if dag_root_node is not None:
+    semantic_root_node = dag_root_node
+    logger.info(
+        "DAG mode enabled in run.py via unrolled tree | tree_version=%s",
+        hp.TREE_VERSION,
+    )
+else:
+    tree_dict = pkl.load(open(f'{BASE_DIR}/trees/{hp.DATASET}/{hp.SUBSET}/tree-{hp.TREE_VERSION}.pkl', 'rb'))
+    semantic_root_node = SemanticNode().load_dict(tree_dict) if isinstance(tree_dict, dict) else tree_dict
 node_registry = compute_node_registry(semantic_root_node)
 all_leaf_nodes = get_all_leaf_nodes_with_path(semantic_root_node)
-doc_id_to_path = {get_node_id(leaf.id, docs_df): path for leaf, path in all_leaf_nodes}
+doc_id_to_paths: Dict[str, List[List[int]]] = defaultdict(list)
+for leaf, path in all_leaf_nodes:
+    doc_id = get_node_id(leaf.id, docs_df)
+    if not doc_id:
+        continue
+    doc_id_to_paths[str(doc_id)].append(list(path))
 #endregion
 
 #region Setup LLM API and Eval Samples
@@ -709,9 +842,20 @@ if not loaded_existing:
     node_by_path = {tuple(node.path): node for node in node_registry}
     qe_log_count = 0
     for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
-        gold_paths = [doc_id_to_path[doc_id] for doc_id in examples_df.iloc[i]['gold_ids'] if doc_id in doc_id_to_path]
-        if len(gold_paths) < len(examples_df.iloc[i]['gold_ids']):
+        gold_paths: List[List[int]] = []
+        missing_gold_ids: List[str] = []
+        for doc_id in examples_df.iloc[i]['gold_ids']:
+            paths = doc_id_to_paths.get(str(doc_id), [])
+            if not paths:
+                missing_gold_ids.append(str(doc_id))
+                continue
+            gold_paths.extend(paths)
+        if missing_gold_ids:
             logger.warning(f"Some gold IDs for example {i} not found in document paths.")
+        # Intent: deduplicate multi-parent expanded gold paths so DAG mode does not overweight duplicated IDs.
+        if gold_paths:
+            gold_paths = list(dict.fromkeys([tuple(path) for path in gold_paths]))
+            gold_paths = [list(path) for path in gold_paths]
 
         query = examples_df.iloc[i]['query'][:hp.MAX_QUERY_CHAR_LEN]
         allowed_prefixes = None
