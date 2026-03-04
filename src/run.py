@@ -48,6 +48,54 @@ np.random.seed(42)
 #endregion
 
 
+def _is_prefix_path(prefix: Tuple[int, ...], full: Tuple[int, ...]) -> bool:
+    return (len(prefix) <= len(full)) and (full[: len(prefix)] == prefix)
+
+
+def _compute_branch_selection_metrics(samples: List[InferSample]) -> pd.DataFrame:
+    rows: List[Dict[str, float]] = []
+    for sample in samples:
+        selected_paths: List[Tuple[int, ...]] = []
+        for state_path in (getattr(sample, "beam_state_paths", None) or []):
+            if not state_path:
+                continue
+            cur = state_path[-1]
+            path_t = tuple(getattr(cur, "path", ()) or ())
+            if len(path_t) == 0:
+                continue
+            selected_paths.append(path_t)
+
+        gold_paths = [tuple(x) for x in getattr(sample, "gold_paths", []) if x]
+        if not selected_paths:
+            rows.append(
+                {
+                    "BranchHit@B": 0.0,
+                    "BranchAllHit@B": 0.0,
+                    "BranchPrecision@B": 0.0,
+                    "NumSelectedBranches": 0.0,
+                    "SelectedDepth": 0.0,
+                }
+            )
+            continue
+
+        good_flags: List[bool] = []
+        for branch in selected_paths:
+            is_good = any(_is_prefix_path(branch, gold) for gold in gold_paths)
+            good_flags.append(bool(is_good))
+
+        # Intent: log both coarse hit(any) and quality(precision/all-hit) to diagnose branch selector behavior.
+        rows.append(
+            {
+                "BranchHit@B": 100.0 * float(any(good_flags)),
+                "BranchAllHit@B": 100.0 * float(all(good_flags)),
+                "BranchPrecision@B": 100.0 * float(np.mean(good_flags)),
+                "NumSelectedBranches": float(len(selected_paths)),
+                "SelectedDepth": float(np.mean([len(x) for x in selected_paths])),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _tree_version_to_dag_version(tree_version: str) -> str | None:
     prefix = "category-topdown-"
     tv = str(tree_version or "").strip()
@@ -1219,11 +1267,35 @@ try:
                 logger.info(f"Rewrite context nDCG@10: {ctx_summary}")
         else:
           eval_metric_df = pd.DataFrame([sample.compute_eval_metrics(k=10) for sample in all_eval_samples])
+
+        branch_metric_df = _compute_branch_selection_metrics(all_eval_samples)
+        if (not branch_metric_df.empty) and (len(branch_metric_df) == len(eval_metric_df)):
+            # Intent: persist branch-quality diagnostics per sample at each iteration for later analysis.
+            eval_metric_df = pd.concat(
+                [eval_metric_df.reset_index(drop=True), branch_metric_df.reset_index(drop=True)],
+                axis=1,
+            )
+        else:
+            logger.warning(
+                "Branch metric merge skipped at iter %d (branch_rows=%d, eval_rows=%d)",
+                i,
+                int(len(branch_metric_df)),
+                int(len(eval_metric_df)),
+            )
         all_eval_metric_dfs.append(eval_metric_df)
         
         # Log metrics
         # wandb_log_iteration_metrics(eval_metric_df, i)
         logger.info('; '.join([f'{k}: {eval_metric_df[k].mean():.2f}' for k in eval_metric_df.columns]))
+        if "BranchHit@B" in eval_metric_df.columns:
+            logger.info(
+                "Iter %d | BranchHit@B=%.2f | BranchPrecision@B=%.2f | BranchAllHit@B=%.2f | NumSelectedBranches=%.2f",
+                i,
+                float(eval_metric_df["BranchHit@B"].mean()),
+                float(eval_metric_df["BranchPrecision@B"].mean()),
+                float(eval_metric_df["BranchAllHit@B"].mean()),
+                float(eval_metric_df["NumSelectedBranches"].mean()),
+            )
         save_exp(RESULTS_DIR, hp, llm_api, all_eval_samples, all_eval_metric_dfs, allow_overwrite=True)  
         logger.info('-'*50)
 finally:

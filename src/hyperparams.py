@@ -137,6 +137,31 @@ class HyperParams(argparse.Namespace):
         # Intent: when summarized context is explicitly off, omit this flag from naming to keep off-baseline path stable.
         if str(payload.get('round3_summarized_context', 'on')).lower() == 'off':
             payload.pop('round3_summarized_context', None)
+        # Intent: keep naming stable when round5 MRR pool uses default depth.
+        if int(payload.get('round5_mrr_pool_k', 100) or 100) == 100:
+            payload.pop('round5_mrr_pool_k', None)
+        payload.pop('round5_category_fallback_on_parse_fail', None)
+        payload.pop('round5_category_partial_ok', None)
+        round5_mode = str(payload.get('round5_mode', 'legacy')).lower()
+        # Intent: keep historical round5 path names stable when running the default legacy mode.
+        if round5_mode == 'legacy':
+            payload.pop('round5_mode', None)
+            payload.pop('round5_category_k', None)
+            payload.pop('round5_category_generator_prompt_name', None)
+            payload.pop('round5_category_rewrite_prompt_name', None)
+            payload.pop('round5_category_history_scope', None)
+            payload.pop('round5_category_drift_trigger', None)
+        else:
+            if int(payload.get('round5_category_k', 3) or 3) == 3:
+                payload.pop('round5_category_k', None)
+            if str(payload.get('round5_category_generator_prompt_name', 'round5_category_generator_v1')).lower() == 'round5_category_generator_v1':
+                payload.pop('round5_category_generator_prompt_name', None)
+            if str(payload.get('round5_category_rewrite_prompt_name', 'round5_agent_executor_category_v1')).lower() == 'round5_agent_executor_category_v1':
+                payload.pop('round5_category_rewrite_prompt_name', None)
+            if str(payload.get('round5_category_history_scope', 'full')).lower() == 'full':
+                payload.pop('round5_category_history_scope', None)
+            if str(payload.get('round5_category_drift_trigger', 'leaf_cluster')).lower() == 'leaf_cluster':
+                payload.pop('round5_category_drift_trigger', None)
         # Intent: keep historical run path naming stable for default pre-planner reference source.
         if str(payload.get('round4_preplanner_reference_mode', 'website_title')).lower() == 'website_title':
             payload.pop('round4_preplanner_reference_mode', None)
@@ -242,6 +267,55 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--round3_anchor_topk', type=int, default=None, help='Top-K for anchor flat retrieval (defaults to flat_topk)')
         parser.add_argument('--round3_local_topk', type=int, default=None, help='Top-K for local (B_active descendants) retrieval (defaults to flat_topk)')
         parser.add_argument('--round3_global_topk', type=int, default=10, help='Top-K for global leaf retrieval')
+        parser.add_argument(
+            '--round5_mrr_pool_k',
+            type=int,
+            default=100,
+            help='Top-K local leaf retrieval size used to compute Highest-MRR sub-branch in run_round5.py',
+        )
+        parser.add_argument(
+            '--round5_mode',
+            type=str,
+            default='legacy',
+            choices=['legacy', 'category'],
+            help=(
+                'run_round5.py rewrite mode: '
+                'legacy=single-pass agent_executor_v1; '
+                'category=generate open-set categories then category-bound rewrite'
+            ),
+        )
+        parser.add_argument(
+            '--round5_category_k',
+            type=int,
+            default=3,
+            help='Number of categories to generate per iteration when --round5_mode=category',
+        )
+        parser.add_argument(
+            '--round5_category_generator_prompt_name',
+            type=str,
+            default='round5_category_generator_v1',
+            help='Prompt template name for category generation in run_round5.py',
+        )
+        parser.add_argument(
+            '--round5_category_rewrite_prompt_name',
+            type=str,
+            default='round5_agent_executor_category_v1',
+            help='Prompt template name for category-bound rewrite in run_round5.py',
+        )
+        parser.add_argument(
+            '--round5_category_history_scope',
+            type=str,
+            default='full',
+            choices=['full', 'none'],
+            help='Category history context for generator prompt: full|none',
+        )
+        parser.add_argument(
+            '--round5_category_drift_trigger',
+            type=str,
+            default='leaf_cluster',
+            choices=['leaf_cluster', 'none'],
+            help='When to inject anti-drift reminder into category generation: leaf_cluster|none',
+        )
         parser.add_argument('--round3_rrf_k', type=int, default=60, help='RRF k for fusing local/global ranked lists')
         parser.add_argument('--round3_rewrite_context', type=str, default='leaf', choices=['leaf', 'leaf_branch'],
                             help='Rewrite context evidence: leaf=leaf-only; leaf_branch=leaf evidence + branch context')

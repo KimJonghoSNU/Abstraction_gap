@@ -50,9 +50,9 @@ RUNS=(
     "--subset earth_science --tree_version bottom-up"
     "--subset psychology --tree_version bottom-up"
     "--subset robotics --tree_version bottom-up"
-    "--subset stackoverflow --tree_version bottom-up"
+    # "--subset stackoverflow --tree_version bottom-up"
     "--subset sustainable_living --tree_version bottom-up"
-    "--subset theoremqa_theorems --tree_version top-down"
+    # "--subset theoremqa_theorems --tree_version top-down"
     # "--subset pony --tree_version bottom-up"
 )
 

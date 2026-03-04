@@ -16,9 +16,9 @@
 set -e
 
 # Configuration
-MODEL="${1:-/data2/da02/models/Qwen3-4B-Instruct-2507}"
+MODEL="${1:-/data2/Qwen3-30B-A3B-Instruct-2507}"
 MODE="${2:-data}"  # "data" or "tensor"
-TP_PER_SERVER_ARG="${3:-auto}"
+TP_PER_SERVER_ARG="${3:-2}"
 BASE_PORT=8000
 GPU_MEM_UTIL=0.95
 # Specify GPU IDs to use
