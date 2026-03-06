@@ -1042,57 +1042,125 @@ def _compute_branch_metrics_from_samples(samples: Sequence[InferSample]) -> pd.D
     return pd.DataFrame(rows)
 
 
+def _collect_candidate_child_branches(
+    *,
+    selected_before: Sequence[Tuple[int, ...]],
+    child_branch_paths_by_path: Dict[Tuple[int, ...], List[Tuple[int, ...]]],
+    root_branch_children: Sequence[Tuple[int, ...]],
+    beam_size: int,
+) -> List[Tuple[int, ...]]:
+    candidates: List[Tuple[int, ...]] = []
+    seen: Set[Tuple[int, ...]] = set()
+    for path in selected_before:
+        for child_path in child_branch_paths_by_path.get(tuple(path), []):
+            child_t = tuple(child_path)
+            if child_t in seen:
+                continue
+            seen.add(child_t)
+            candidates.append(child_t)
+    if not candidates:
+        for child_path in root_branch_children:
+            child_t = tuple(child_path)
+            if child_t in seen:
+                continue
+            seen.add(child_t)
+            candidates.append(child_t)
+    return candidates[: max(1, int(beam_size))]
+
+
+def _resolve_oracle_branch_paths(
+    *,
+    oracle_mode: str,
+    selected_before: Sequence[Tuple[int, ...]],
+    gold_paths: Sequence[Tuple[int, ...]],
+    leaf_ancestor_paths: Dict[Tuple[int, ...], List[Tuple[int, ...]]],
+    child_branch_paths_by_path: Dict[Tuple[int, ...], List[Tuple[int, ...]]],
+    root_branch_children: Sequence[Tuple[int, ...]],
+    beam_size: int,
+) -> Tuple[List[Tuple[int, ...]], str, str]:
+    default_paths = [tuple(path) for path in selected_before if path]
+    if oracle_mode == "none":
+        return default_paths, "llm_selected_branches", ""
+
+    if oracle_mode == "gold_branch_v1":
+        base_candidates = _collect_candidate_child_branches(
+            selected_before=selected_before,
+            child_branch_paths_by_path=child_branch_paths_by_path,
+            root_branch_children=root_branch_children,
+            beam_size=beam_size,
+        )
+        fallback_reason = "no_gold_in_candidate_children"
+        source_tag = "oracle_gold_branch_v1"
+    elif oracle_mode == "gold_branch_v2":
+        # Intent: v2 follows existing semantics and treats selected_before as the current top-B source.
+        base_candidates = [tuple(path) for path in selected_before if path][: max(1, int(beam_size))]
+        fallback_reason = "no_gold_in_selected_before"
+        source_tag = "oracle_gold_branch_v2"
+    else:
+        raise ValueError(f"Unsupported oracle mode: {oracle_mode}")
+
+    gold_candidates: List[Tuple[int, ...]] = []
+    for path in base_candidates:
+        if _branch_is_gold_ancestor(tuple(path), gold_paths, leaf_ancestor_paths):
+            gold_candidates.append(tuple(path))
+            if len(gold_candidates) >= max(1, int(beam_size)):
+                break
+    if gold_candidates:
+        return gold_candidates, source_tag, ""
+    return default_paths, f"{source_tag}_fallback", fallback_reason
+
+
 hp = HyperParams.from_args()
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 round5_mode = str(getattr(hp, "ROUND5_MODE", "legacy") or "legacy").strip().lower()
 if round5_mode not in {"legacy", "category"}:
     raise ValueError(f'Unsupported --round5_mode "{round5_mode}". Allowed: legacy|category')
+if round5_mode != "category":
+    raise ValueError('run_round5_gold.py supports only --round5_mode "category".')
 hp.add_param("round5_mode", round5_mode)
 
 if hp.REWRITE_PROMPT_PATH:
-    print("Ignoring --rewrite_prompt_path in run_round5.py (template path override is disabled).")
+    print("Ignoring --rewrite_prompt_path in run_round5_gold.py (template path override is disabled).")
 
-round5_rewrite_prompt_name = "agent_executor_v1"
-round5_category_generator_prompt_name: Optional[str] = None
+round5_rewrite_prompt_name = str(
+    getattr(hp, "ROUND5_CATEGORY_REWRITE_PROMPT_NAME", "round5_agent_executor_category_v1")
+    or "round5_agent_executor_category_v1"
+).strip()
+round5_category_generator_prompt_name = str(
+    getattr(hp, "ROUND5_CATEGORY_GENERATOR_PROMPT_NAME", "round5_category_generator_v1")
+    or "round5_category_generator_v1"
+).strip()
 round5_category_k = max(1, int(getattr(hp, "ROUND5_CATEGORY_K", 3) or 3))
 round5_category_history_scope = str(getattr(hp, "ROUND5_CATEGORY_HISTORY_SCOPE", "full") or "full").lower()
 round5_category_drift_trigger = str(getattr(hp, "ROUND5_CATEGORY_DRIFT_TRIGGER", "leaf_cluster") or "leaf_cluster").lower()
+round5_category_oracle = str(getattr(hp, "ROUND5_CATEGORY_ORACLE", "none") or "none").lower()
 round5_category_fallback_on_parse_fail = True
 round5_category_partial_ok = True
 
-if round5_mode == "legacy":
-    if hp.REWRITE_PROMPT_NAME and str(hp.REWRITE_PROMPT_NAME).strip() != "agent_executor_v1":
-        print(
-            f'Ignoring --rewrite_prompt_name="{hp.REWRITE_PROMPT_NAME}" in run_round5.py '
-            "(legacy mode is fixed to agent_executor_v1)."
-        )
-else:
-    round5_category_generator_prompt_name = str(
-        getattr(hp, "ROUND5_CATEGORY_GENERATOR_PROMPT_NAME", "round5_category_generator_v1") or "round5_category_generator_v1"
-    ).strip()
-    round5_rewrite_prompt_name = str(
-        getattr(hp, "ROUND5_CATEGORY_REWRITE_PROMPT_NAME", "round5_agent_executor_category_v1") or "round5_agent_executor_category_v1"
-    ).strip()
-    if round5_category_generator_prompt_name not in REWRITE_PROMPT_TEMPLATES:
-        raise ValueError(
-            f'Unknown --round5_category_generator_prompt_name "{round5_category_generator_prompt_name}". '
-            f'Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}'
-        )
-    if round5_rewrite_prompt_name not in REWRITE_PROMPT_TEMPLATES:
-        raise ValueError(
-            f'Unknown --round5_category_rewrite_prompt_name "{round5_rewrite_prompt_name}". '
-            f'Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}'
-        )
-    if round5_category_history_scope not in {"full", "none"}:
-        raise ValueError(
-            f'Unsupported --round5_category_history_scope "{round5_category_history_scope}". Allowed: full|none'
-        )
-    if round5_category_drift_trigger not in {"leaf_cluster", "none"}:
-        raise ValueError(
-            f'Unsupported --round5_category_drift_trigger "{round5_category_drift_trigger}". Allowed: leaf_cluster|none'
-        )
-
+if round5_category_generator_prompt_name not in REWRITE_PROMPT_TEMPLATES:
+    raise ValueError(
+        f'Unknown --round5_category_generator_prompt_name "{round5_category_generator_prompt_name}". '
+        f'Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}'
+    )
+if round5_rewrite_prompt_name not in REWRITE_PROMPT_TEMPLATES:
+    raise ValueError(
+        f'Unknown --round5_category_rewrite_prompt_name "{round5_rewrite_prompt_name}". '
+        f'Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}'
+    )
+if round5_category_history_scope not in {"full", "none"}:
+    raise ValueError(
+        f'Unsupported --round5_category_history_scope "{round5_category_history_scope}". Allowed: full|none'
+    )
+if round5_category_drift_trigger not in {"leaf_cluster", "none"}:
+    raise ValueError(
+        f'Unsupported --round5_category_drift_trigger "{round5_category_drift_trigger}". Allowed: leaf_cluster|none'
+    )
+if round5_category_oracle not in {"none", "gold_branch_v1", "gold_branch_v2"}:
+    raise ValueError(
+        f'Unsupported --round5_category_oracle "{round5_category_oracle}". '
+        "Allowed: none|gold_branch_v1|gold_branch_v2"
+    )
 hp.add_param("round5_category_fallback_on_parse_fail", round5_category_fallback_on_parse_fail)
 hp.add_param("round5_category_partial_ok", round5_category_partial_ok)
 
@@ -1100,11 +1168,12 @@ hp.add_param("rewrite_prompt_name", round5_rewrite_prompt_name)
 hp.add_param("round5_category_k", round5_category_k)
 hp.add_param("round5_category_history_scope", round5_category_history_scope)
 hp.add_param("round5_category_drift_trigger", round5_category_drift_trigger)
+hp.add_param("round5_category_oracle", round5_category_oracle)
 hp.add_param("round5_category_generator_prompt_name", round5_category_generator_prompt_name)
 hp.add_param("round5_category_rewrite_prompt_name", round5_rewrite_prompt_name)
 
 if str(hp.ROUND3_SUMMARIZED_CONTEXT or "off").lower() != "off":
-    print("Ignoring --round3_summarized_context in run_round5.py (fixed to off).")
+    print("Ignoring --round3_summarized_context in run_round5_gold.py (fixed to off).")
 hp.add_param("round3_summarized_context", "off")
 
 round5_mrr_pool_k = max(1, int(getattr(hp, "ROUND5_MRR_POOL_K", 100) or 100))
@@ -1118,7 +1187,7 @@ if round5_selector_mode not in {"retriever_slate", "maxscore_global", "meanscore
 hp.add_param("round5_selector_mode", round5_selector_mode)
 
 exp_dir_name = str(hp)
-RESULTS_DIR = f"{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/round5/{exp_dir_name}/"
+RESULTS_DIR = f"{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/round5_gold/{exp_dir_name}/"
 if os.path.exists(RESULTS_DIR) and os.listdir(RESULTS_DIR):
     print(f"Results already exist at {RESULTS_DIR}. Skipping run.")
     raise SystemExit(0)
@@ -1128,11 +1197,12 @@ logger = setup_logger("lattice_runner_round5", f"{RESULTS_DIR}/run.log", logging
 with open(f"{RESULTS_DIR}/hparams.json", "w", encoding="utf-8") as f:
     json.dump(vars(hp), f, indent=2, ensure_ascii=True, sort_keys=True)
 logger.info(
-    "Round5 config | mode=%s | rewrite_prompt=%s | category_generator_prompt=%s | category_k=%d | selector_mode=%s | selector_topk=%d",
+    "Round5 config | mode=%s | rewrite_prompt=%s | category_generator_prompt=%s | category_k=%d | category_oracle=%s | selector_mode=%s | selector_topk=%d",
     round5_mode,
     round5_rewrite_prompt_name,
     str(round5_category_generator_prompt_name or "none"),
     int(round5_category_k),
+    round5_category_oracle,
     round5_selector_mode,
     int(round5_mrr_pool_k),
 )
@@ -1140,7 +1210,7 @@ logger.info(
 if not hp.REWRITE_CACHE_PATH:
     cache_root = os.path.join(BASE_DIR, "cache", "rewrite")
     os.makedirs(cache_root, exist_ok=True)
-    cache_mode_tag = "round5_category" if round5_mode == "category" else "round5_legacy"
+    cache_mode_tag = f"round5_gold_category_{round5_category_oracle}"
     cache_name = f"{hp.SUBSET}_{round5_rewrite_prompt_name}_{cache_mode_tag}_{hp.exp_hash(8)}.jsonl"
     hp.add_param("rewrite_cache_path", os.path.join(cache_root, cache_name))
 
@@ -1368,8 +1438,18 @@ for iter_idx in range(hp.NUM_ITERS):
             max_desc_len=hp.MAX_DOC_DESC_CHAR_LEN,
         )
         selected_before = _selected_branch_paths_from_sample(sample)
+        oracle_branch_paths, oracle_branch_source, oracle_branch_fallback_reason = _resolve_oracle_branch_paths(
+            oracle_mode=round5_category_oracle,
+            selected_before=selected_before,
+            gold_paths=[tuple(x) for x in getattr(sample, "gold_paths", []) if x],
+            leaf_ancestor_paths=leaf_ancestor_paths,
+            child_branch_paths_by_path=child_branch_paths_by_path,
+            root_branch_children=root_branch_children,
+            beam_size=hp.MAX_BEAM_SIZE,
+        )
+        # Intent: gold runner controls category generator context with branch-level oracle, while traversal stays unchanged.
         branch_descs = _collect_branch_descs_from_selected(
-            selected_paths=selected_before,
+            selected_paths=oracle_branch_paths,
             path_to_node=path_to_node,
             max_desc_len=hp.MAX_DOC_DESC_CHAR_LEN,
             topk=hp.REWRITE_CONTEXT_TOPK,
@@ -1412,6 +1492,9 @@ for iter_idx in range(hp.NUM_ITERS):
             "category_history": category_history_text,
             "leaf_cluster_triggered": bool(leaf_cluster_triggered),
             "stability_hint": stability_hint,
+            "category_branch_source": oracle_branch_source,
+            "category_branch_fallback_reason": oracle_branch_fallback_reason,
+            "category_branch_paths_used": [list(path) for path in oracle_branch_paths],
         }
 
         if round5_mode == "category":
@@ -1462,7 +1545,12 @@ for iter_idx in range(hp.NUM_ITERS):
 
     if round5_mode == "category":
         if category_prompts:
-            logger.info("Iter %d: starting category batch (%d prompts)", iter_idx, len(category_prompts))
+            logger.info(
+                "Iter %d: starting category batch (%d prompts) | oracle_mode=%s",
+                iter_idx,
+                len(category_prompts),
+                round5_category_oracle,
+            )
             cat_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(cat_loop)
             try:
@@ -1674,7 +1762,10 @@ for iter_idx in range(hp.NUM_ITERS):
                 "selected_categories": info.get("selected_categories", []),
                 "category_prompt": info.get("category_prompt", ""),
                 "category_raw_output": info.get("category_raw_output", ""),
-                "category_source": "llm_generator",
+                "category_source": str(info.get("category_branch_source", "llm_selected_branches")),
+                "category_oracle_mode": round5_category_oracle,
+                "category_branch_fallback_reason": str(info.get("category_branch_fallback_reason", "")),
+                "category_branch_paths_used": info.get("category_branch_paths_used", []),
                 "leaf_cluster_triggered": bool(info.get("leaf_cluster_triggered", False)),
                 "category_stability_hint": str(info.get("stability_hint", "")),
                 "leaf_descs": info.get("leaf_descs", []),
@@ -1869,7 +1960,10 @@ for iter_idx in range(hp.NUM_ITERS):
                 "rewrite_branch_descs_count": int(len(info.get("branch_descs", []))),
                 "possible_answer_docs": info.get("rewrite_docs", {}),
                 "selected_categories": info.get("selected_categories", []),
-                "category_source": "llm_generator",
+                "category_source": str(info.get("category_branch_source", "llm_selected_branches")),
+                "category_oracle_mode": round5_category_oracle,
+                "category_branch_fallback_reason": str(info.get("category_branch_fallback_reason", "")),
+                "category_branch_paths_used": info.get("category_branch_paths_used", []),
                 "leaf_cluster_triggered": bool(info.get("leaf_cluster_triggered", False)),
                 "selected_branches_before": [list(p) for p in selected_before_by_idx.get(sample_idx, [])],
                 "selected_branches_after": [list(p) for p in selected_after],

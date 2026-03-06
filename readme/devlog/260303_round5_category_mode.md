@@ -136,6 +136,11 @@
     - LLM 대신 retriever score로 slate 내 ranking 생성 후 `sample.update(...)`.
     - update 결과가 `selected_branches_after`이며, 다음 iteration(t+1)의 `selected_branches_before`가 된다.
     - update 후 새로 도달한 leaf는 누적 leaf pool에 추가.
+    - selector mode가 `maxscore_global`/`meanscore_global`이면 추가 override가 한 번 더 수행된다:
+        - 후보 branch: `selected_branches_before`의 direct child branch
+        - selector local pool: 해당 branch 하위 leaf 합집합(비면 전체 leaf fallback)
+        - `query_post` top-K retrieval 점수로 branch score를 계산해 global top-B로 재선택
+        - 매핑 실패 시 retriever-slate 결과 유지
 
 정리하면:
 - **category generator 입력의 retrieval 결과는 iteration t에서 query_pre로 freshly 검색한 결과**
@@ -159,3 +164,38 @@
 1. category generator cache 추가(비용 절감).
 2. category label drift 통계(log analyzer) 추가.
 3. legacy vs category를 동일 셋팅으로 5 subset 이상 비교해서 실제 gain/variance 확인.
+
+---
+
+## 2026-03-04 추가 구현: Category 모드에서도 selector score mode 비교 가능
+
+### 왜 추가했는가
+- category mode 실험에서도 "rewrite는 동일하게 두고, branch 확장 선택 기준만 바꿨을 때" 성능 차이를 확인하기 위해 selector mode를 통합했다.
+
+### 반영 내용
+- `src/run_round5.py`, `src/run_round5_gold.py`
+    - `--round5_selector_mode`를 category 모드에서도 동일하게 사용.
+    - 동작:
+        - `retriever_slate`: 기존 그대로 (`sample.update` 결과 사용)
+        - `maxscore_global`: 후보 branch별 top-K leaf 매칭 점수의 max로 global top-B 선택
+        - `meanscore_global`: 후보 branch별 top-K leaf 매칭 점수의 mean으로 global top-B 선택
+    - 공통 fallback:
+        - 후보 없음 / 매칭 없음 / expandable path 매핑 실패 시 retriever-slate 결과 유지
+- `iter_records`에 selector 진단 정보 추가:
+    - `selector_mode`
+    - `selector_pick_reason`
+    - `selector_candidate_branch_count`
+    - `selector_scored_top`
+
+### 실행 스크립트
+- `src/bash/round5/run_round5.sh`
+    - 기본적으로 selector 2개(`retriever_slate`, `maxscore_global`)를 for-loop 실행
+    - 필요 시 env로 mean 포함 가능:
+```bash
+ROUND5_SELECTOR_MODES="retriever_slate maxscore_global meanscore_global" \
+bash src/bash/round5/run_round5.sh
+```
+
+### 실험 해석 시 주의
+- category mode 비교에서 selector를 바꿀 때도 rewrite 프롬프트/카테고리 생성 단계는 동일하다.
+- 따라서 차이는 branch 확장 단계의 점수 계산식에서 오는 효과로 해석해야 한다.

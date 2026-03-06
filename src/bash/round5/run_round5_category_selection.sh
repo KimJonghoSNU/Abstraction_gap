@@ -39,6 +39,8 @@ ROUND5_MODE="${ROUND5_MODE:-category}"
 ROUND5_CATEGORY_K="${ROUND5_CATEGORY_K:-3}"
 ROUND5_CATEGORY_GENERATOR_PROMPT_NAME="${ROUND5_CATEGORY_GENERATOR_PROMPT_NAME:-round5_category_generator_v1}"
 ROUND5_CATEGORY_REWRITE_PROMPT_NAME="${ROUND5_CATEGORY_REWRITE_PROMPT_NAME:-round5_agent_executor_category_v1}"
+ROUND5_DISABLE_CALIBRATION="${ROUND5_DISABLE_CALIBRATION:-1}"
+ROUND5_SELECTOR_MODE="${ROUND5_SELECTOR_MODE:-retriever_slate}"
 
 COMMON_PARAMS=(
     --reasoning_in_traversal_prompt -1
@@ -57,8 +59,14 @@ COMMON_PARAMS=(
     --flat_topk 1000
     --rewrite_context_topk 5
     --round5_mrr_pool_k 100
+    --round5_selector_mode "$ROUND5_SELECTOR_MODE"
     --round5_mode "$ROUND5_MODE"
 )
+
+if [[ "$ROUND5_DISABLE_CALIBRATION" == "1" ]]; then
+    # Intent: keep category-selection ablations aligned with retriever-only branch scoring.
+    COMMON_PARAMS+=(--disable_calibration)
+fi
 
 if [[ "$ROUND5_MODE" == "category" ]]; then
     COMMON_PARAMS+=(

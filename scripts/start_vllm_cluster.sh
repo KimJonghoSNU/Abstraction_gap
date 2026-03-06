@@ -123,6 +123,7 @@ if [[ "$MODE" == "tensor" ]]; then
         --disable-log-requests \
         --max-model-len "$MAX_MODEL_LEN" \
         --trust-remote-code \
+        --gpu-memory-utilization 0.8 \
         > "$LOG_FILE" 2>&1 &
 
     PID=$!
@@ -245,6 +246,7 @@ else
             --max-model-len "$DATA_MAX_MODEL_LEN" \
             --trust-remote-code \
             --max_num_seqs "$DATA_MAX_NUM_SEQS" \
+            --gpu-memory-utilization 0.8 \
             $ENFORCE_EAGER_FLAG \
             > "$LOG_FILE" 2>&1 &
 

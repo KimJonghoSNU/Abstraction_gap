@@ -22,7 +22,7 @@ COMMON_PARAMS=(
     --suffix baseline3_leaf_only_loop
     --reasoning_in_traversal_prompt -1
     --load_existing
-    --num_iters 3
+    --num_iters 10
     --llm_api_backend vllm
     --llm /data2/da02/models/Qwen3-4B-Instruct-2507
     --llm_api_staggering_delay 0.02
@@ -34,6 +34,7 @@ COMMON_PARAMS=(
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
     --rewrite_prompt_name thinkqe
+    --rewrite_context_topk 10
 )
 
 # Define RUNS directly as strings (space-separated args)

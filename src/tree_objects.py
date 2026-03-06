@@ -245,6 +245,7 @@ class InferSample(object):
     self.num_iters = 0
     self.search_with_path_relevance = hp.SEARCH_WITH_PATH_RELEVANCE
     self.num_leaf_calib = hp.NUM_LEAF_CALIB
+    self.disable_calibration = bool(getattr(hp, 'DISABLE_CALIBRATION', False))
     self.logger = logger
 
     self.get_traversal_prompt = partial(get_traversal_prompt, hp=hp, logger=logger, return_constraint=False)
@@ -267,6 +268,7 @@ class InferSample(object):
         'num_iters',
         'search_with_path_relevance',
         'num_leaf_calib',
+        'disable_calibration',
         'excluded_ids_set',
         'rewrite_history',
         'qe_expanded_query',
@@ -356,7 +358,7 @@ class InferSample(object):
     return self
 
   def post_load_processing(self):
-    if not self.calib_model.trained: 
+    if (not self.disable_calibration) and (not self.calib_model.trained):
       self.calib_model.fit()
       self.update_relevances(self.prediction_tree)
 
@@ -419,17 +421,19 @@ class InferSample(object):
 
   def get_step_prompts(self):
     inputs = []
-    top_preds = self.get_top_predictions(k=None, rel_fn=self.get_rel_fn(return_calibrated_rel=True))
-    assert all([s <= 1.0001 for _, s in top_preds]), f'Top predictions not normalized: {top_preds}'
-    if len(top_preds) > self.num_leaf_calib:
-      theta = np.array([max(s, -1) for _, s in top_preds])
-      th = get_bimodal_gmm_intrsxn(theta)
-      p = [((4**(2*s)) if s > th else 1e-4) for _, s in top_preds]
-      # p = topk(theta, k=self.num_leaf_calib, alpha=10)
-      p = np.array(p) / np.sum(p)
-      sampled_inds = np.random.choice(np.arange(len(top_preds)), size=self.num_leaf_calib, replace=False, p=p)
-      top_preds = [top_preds[i] for i in sampled_inds]      
-    top_preds_slate = [(x.desc, x.registry_idx) for x, _ in top_preds]
+    top_preds_slate = []
+    if (not self.disable_calibration) and self.num_leaf_calib:
+      top_preds = self.get_top_predictions(k=None, rel_fn=self.get_rel_fn(return_calibrated_rel=True))
+      assert all([s <= 1.0001 for _, s in top_preds]), f'Top predictions not normalized: {top_preds}'
+      if len(top_preds) > self.num_leaf_calib:
+        theta = np.array([max(s, -1) for _, s in top_preds])
+        th = get_bimodal_gmm_intrsxn(theta)
+        p = [((4**(2*s)) if s > th else 1e-4) for _, s in top_preds]
+        # p = topk(theta, k=self.num_leaf_calib, alpha=10)
+        p = np.array(p) / np.sum(p)
+        sampled_inds = np.random.choice(np.arange(len(top_preds)), size=self.num_leaf_calib, replace=False, p=p)
+        top_preds = [top_preds[i] for i in sampled_inds]
+      top_preds_slate = [(x.desc, x.registry_idx) for x, _ in top_preds]
 
     for state_path in self.beam_state_paths:
       cur_state = state_path[-1]
@@ -493,11 +497,14 @@ class InferSample(object):
         relevance_scores = None
 
       if relevance_scores:
-        self.calib_model.add(relevance_scores)
+        if not self.disable_calibration:
+          # Intent: retriever-only ablations can skip calibration to keep selection logic score-pure.
+          self.calib_model.add(relevance_scores)
         cur_node_child_rels = [relevance_scores.get(c.registry_idx, 0) for c in cur_semantic_node.child]
         cur_state.instantiate_children(cur_node_child_rels, reasoning, creation_step=len(self.beam_state_paths_history)+1)
-    self.calib_model.fit()
-    self.update_relevances(self.prediction_tree)
+    if not self.disable_calibration:
+      self.calib_model.fit()
+      self.update_relevances(self.prediction_tree)
 
   def update_relevances(self, node):
     if node.parent:

@@ -137,9 +137,16 @@ class HyperParams(argparse.Namespace):
         # Intent: when summarized context is explicitly off, omit this flag from naming to keep off-baseline path stable.
         if str(payload.get('round3_summarized_context', 'on')).lower() == 'off':
             payload.pop('round3_summarized_context', None)
-        # Intent: keep naming stable when round5 MRR pool uses default depth.
+        # Intent: keep naming stable when round5 selector mode uses retriever-slate baseline.
+        if str(payload.get('round5_selector_mode', 'retriever_slate')).lower() == 'retriever_slate':
+            payload.pop('round5_selector_mode', None)
+        # Intent: keep naming stable when round5 selector top-k uses default depth.
         if int(payload.get('round5_mrr_pool_k', 100) or 100) == 100:
             payload.pop('round5_mrr_pool_k', None)
+        if not bool(payload.get('disable_calibration', False)):
+            payload.pop('disable_calibration', None)
+        if str(payload.get('round5_category_oracle', 'none')).lower() == 'none':
+            payload.pop('round5_category_oracle', None)
         payload.pop('round5_category_fallback_on_parse_fail', None)
         payload.pop('round5_category_partial_ok', None)
         round5_mode = str(payload.get('round5_mode', 'legacy')).lower()
@@ -201,6 +208,12 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--search_with_path_relevance', type=bool, default=True)
         parser.add_argument('--num_leaf_calib', type=int, default=10)
         parser.add_argument('--pl_tau', type=float, default=5.0)
+        parser.add_argument(
+            '--disable_calibration',
+            default=False,
+            action='store_true',
+            help='Disable calibration-model updates and leaf-calibration slate augmentation in InferSample.',
+        )
         parser.add_argument('--relevance_chain_factor', type=float, default=0.5)
         parser.add_argument('--llm_api_backend', type=str, default='genai')
         parser.add_argument('--llm', type=str, default='gemini-2.5-flash')
@@ -268,10 +281,23 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--round3_local_topk', type=int, default=None, help='Top-K for local (B_active descendants) retrieval (defaults to flat_topk)')
         parser.add_argument('--round3_global_topk', type=int, default=10, help='Top-K for global leaf retrieval')
         parser.add_argument(
+            '--round5_selector_mode',
+            type=str,
+            default='retriever_slate',
+            choices=['retriever_slate', 'maxscore_global', 'meanscore_global', 'max_hit_global'],
+            help=(
+                'Round5 branch selector mode: '
+                'retriever_slate=baseline beam update from retriever-ranked slates; '
+                'maxscore_global=override next branch selection by global top-B branch max leaf score; '
+                'meanscore_global=override next branch selection by global top-B branch mean leaf score; '
+                'max_hit_global=override next branch selection by global top-B branch matched-hit count'
+            ),
+        )
+        parser.add_argument(
             '--round5_mrr_pool_k',
             type=int,
             default=100,
-            help='Top-K local leaf retrieval size used to compute Highest-MRR sub-branch in run_round5.py',
+            help='Top-K local leaf retrieval size used to score branch candidates for --round5_selector_mode=maxscore_global|meanscore_global|max_hit_global',
         )
         parser.add_argument(
             '--round5_mode',
@@ -315,6 +341,18 @@ class HyperParams(argparse.Namespace):
             default='leaf_cluster',
             choices=['leaf_cluster', 'none'],
             help='When to inject anti-drift reminder into category generation: leaf_cluster|none',
+        )
+        parser.add_argument(
+            '--round5_category_oracle',
+            type=str,
+            default='none',
+            choices=['none', 'gold_branch_v1', 'gold_branch_v2'],
+            help=(
+                'Round5 category oracle mode: '
+                'none=use selected beam branches; '
+                'gold_branch_v1=use gold branches from candidate child branches when available; '
+                'gold_branch_v2=use gold branches within current selected branches when available'
+            ),
         )
         parser.add_argument('--round3_rrf_k', type=int, default=60, help='RRF k for fusing local/global ranked lists')
         parser.add_argument('--round3_rewrite_context', type=str, default='leaf', choices=['leaf', 'leaf_branch'],
