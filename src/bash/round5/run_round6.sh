@@ -14,6 +14,7 @@ NODE_EMB_BASE="../trees/BRIGHT"
 ROUND5_DISABLE_CALIBRATION="${ROUND5_DISABLE_CALIBRATION:-1}"
 ROUND5_SELECTOR_MODES="${ROUND5_SELECTOR_MODES:-meanscore_global}" # retriever_slate maxscore_global meanscore_global  max_hit_global
 # ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2}"
+# ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2_rubric}"
 ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-thinkqe_round3}"
 
 COMMON_PARAMS=(
@@ -117,7 +118,7 @@ for selector_mode in "${SELECTOR_MODES[@]}"; do
                 final_args+=("--rewrite_prompt_name" "$ROUND5_REWRITE_PROMPT_NAME")
             fi
 
-            cmd=( python run_round5.py "${final_args[@]}" )
+            cmd=( python run_round6.py "${final_args[@]}" )
             printf -v cmd_str '%q ' "${cmd[@]}"
             log "Executing: $cmd_str"
 

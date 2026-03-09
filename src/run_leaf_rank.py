@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import pickle as pkl
-from typing import List
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -118,20 +118,29 @@ def _apply_rewrite(mode: str, base_query: str, rewrite: str) -> str:
     return (base_query + " " + rewrite).strip()
 
 
-def _hits_to_context_descs(hits: List[object], node_registry: List[object], topk: int, max_desc_len: int | None) -> List[str]:
-    descs: List[str] = []
+def _hits_to_context_hits(hits: List[object], topk: int) -> List[object]:
+    out: List[object] = []
     seen: set[int] = set()
     for h in hits:
         ridx = int(h.registry_idx)
         if ridx in seen:
             continue
         seen.add(ridx)
+        out.append(h)
+        if len(out) >= topk:
+            break
+    return out
+
+
+def _hits_to_context_descs(hits: List[object], node_registry: List[object], topk: int, max_desc_len: int | None) -> List[str]:
+    descs: List[str] = []
+    context_hits = _hits_to_context_hits(hits, topk)
+    for h in context_hits:
+        ridx = int(h.registry_idx)
         desc = node_registry[ridx].desc
         if max_desc_len:
             desc = desc[:max_desc_len]
         descs.append(desc)
-        if len(descs) >= topk:
-            return descs
     return descs
 
 
@@ -142,6 +151,20 @@ def _compute_leaf_metrics(pred_paths: List[List[int]], gold_paths: List[List[int
         "Recall@100": compute_recall(pred_paths, gold_paths, k=100) * 100,
         "Recall@all": compute_recall(pred_paths, gold_paths, k=len(pred_paths)) * 100,
     }
+
+
+def _paths_to_ranked_doc_ids(paths: Sequence[Tuple[int, ...]], path_to_doc_id: Dict[Tuple[int, ...], str]) -> List[str]:
+    ranked: List[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        doc_id = path_to_doc_id.get(tuple(path))
+        if not doc_id:
+            continue
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        ranked.append(doc_id)
+    return ranked
 
 
 hp = HyperParams.from_args()
@@ -184,6 +207,7 @@ if hp.LEAF_ONLY_RETRIEVAL:
     node_registry = [full_node_registry[idx] for idx in leaf_registry_indices]
 all_leaf_nodes = get_all_leaf_nodes_with_path(semantic_root_node)
 doc_id_to_path = {get_node_id(leaf.id, docs_df): path for leaf, path in all_leaf_nodes}
+path_to_doc_id = {tuple(path): str(doc_id) for doc_id, path in doc_id_to_path.items()}
 
 if hp.LLM_API_BACKEND == "genai":
     llm_api = GenAIAPI(hp.LLM, logger=logger, timeout=hp.LLM_API_TIMEOUT, max_retries=hp.LLM_API_MAX_RETRIES)
@@ -264,6 +288,7 @@ for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
 logger.info(f"Loaded {len(samples)} eval samples.")
 
 metrics_path = f"{RESULTS_DIR}/leaf_iter_metrics.jsonl"
+iter_records_path = f"{RESULTS_DIR}/leaf_iter_records.jsonl"
 rewrite_records = []
 
 # Intent: preserve legacy behavior by default, while allowing no-initial-rewrite ablation via a flag.
@@ -273,6 +298,7 @@ else:
     logger.info("Starting initial rewrite.")
     init_prompts = []
     init_meta = []
+    init_iter_records = []
     for sample in samples:
         hits = flat_retrieve_hits(
             retriever=retriever,
@@ -285,12 +311,32 @@ else:
             rewrite_hits = [h for h in hits if h.is_leaf]
         else:
             rewrite_hits = [h for h in hits if not h.is_leaf]
+        context_hits = _hits_to_context_hits(rewrite_hits, hp.REWRITE_CONTEXT_TOPK)
         context_descs = _hits_to_context_descs(rewrite_hits, node_registry, hp.REWRITE_CONTEXT_TOPK, hp.MAX_DOC_DESC_CHAR_LEN)
+        retrieved_path_tuples = [tuple(h.path) for h in rewrite_hits[:hp.FLAT_TOPK]]
+        context_path_tuples = [tuple(h.path) for h in context_hits]
+        base_record = {
+            "phase": "initial_rewrite",
+            "iter": -1,
+            "query_idx": int(sample["index"]),
+            "query": sample["original_query"],
+            "query_for_retrieval": sample["original_query"],
+            "retrieval_topk": int(hp.FLAT_TOPK),
+            "retrieved_paths": [list(p) for p in retrieved_path_tuples],
+            "retrieved_doc_ids": _paths_to_ranked_doc_ids(retrieved_path_tuples, path_to_doc_id),
+            "rewrite_context_topk": int(hp.REWRITE_CONTEXT_TOPK),
+            "rewrite_context_paths": [list(p) for p in context_path_tuples],
+            "rewrite_context_doc_ids": _paths_to_ranked_doc_ids(context_path_tuples, path_to_doc_id),
+        }
         cache_key = _rewrite_cache_key("leaf_init", sample["original_query"], context_descs, iter_idx=None)
         if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
             rewrite = rewrite_map[cache_key]
             sample["last_rewrite"] = rewrite
             sample["current_query"] = _apply_rewrite(hp.REWRITE_MODE, sample["original_query"], rewrite)
+            cached_record = dict(base_record)
+            cached_record["cache_hit"] = True
+            cached_record["applied_rewrite"] = rewrite
+            init_iter_records.append(cached_record)
             continue
         if rewrite_template is None:
             raise ValueError("Rewrite enabled but no prompt template is available.")
@@ -304,6 +350,7 @@ else:
             "sample": sample,
             "cache_key": cache_key,
             "context_descs": context_descs,
+            "base_record": base_record,
         })
 
     if init_prompts:
@@ -321,6 +368,10 @@ else:
             rewrite_map[meta["cache_key"]] = rewrite
             meta["sample"]["last_rewrite"] = rewrite
             meta["sample"]["current_query"] = _apply_rewrite(hp.REWRITE_MODE, meta["sample"]["original_query"], rewrite)
+            generated_record = dict(meta.get("base_record", {}))
+            generated_record["cache_hit"] = False
+            generated_record["applied_rewrite"] = rewrite
+            init_iter_records.append(generated_record)
             rewrite_records.append({
                 "key": meta["cache_key"],
                 "rewritten_query": rewrite,
@@ -334,9 +385,14 @@ else:
         with open(hp.REWRITE_CACHE_PATH, "a", encoding="utf-8") as f:
             for rec in rewrite_records:
                 f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+    if init_iter_records:
+        with open(iter_records_path, "a", encoding="utf-8") as f:
+            for rec in init_iter_records:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
 
 for iter_idx in range(hp.NUM_ITERS):
     iter_metrics = []
+    iter_records = []
     iter_hits = []
     for sample in tqdm(samples, desc=f"Iter {iter_idx} retrieval"):
         hits = flat_retrieve_hits(
@@ -348,16 +404,39 @@ for iter_idx in range(hp.NUM_ITERS):
         )
         iter_hits.append(hits)
         leaf_hits = [h for h in hits if h.is_leaf]
-        pred_paths = [list(h.path) for h in leaf_hits[:hp.FLAT_TOPK]]
+        pred_path_tuples = [tuple(h.path) for h in leaf_hits[:hp.FLAT_TOPK]]
+        pred_paths = [list(p) for p in pred_path_tuples]
+        pred_doc_ids = _paths_to_ranked_doc_ids(pred_path_tuples, path_to_doc_id)
+        rewrite_hits_for_context = [h for h in hits if h.is_leaf] if hp.LEAF_ONLY_RETRIEVAL else hits
+        context_hits = _hits_to_context_hits(rewrite_hits_for_context, hp.REWRITE_CONTEXT_TOPK)
+        context_path_tuples = [tuple(h.path) for h in context_hits]
         metrics = _compute_leaf_metrics(pred_paths, sample["gold_paths"])
         metrics["iter"] = iter_idx
         metrics["query_idx"] = sample["index"]
         metrics["query"] = sample["original_query"]
         iter_metrics.append(metrics)
+        iter_records.append({
+            # Intent: keep per-iter retrieval evidence IDs/paths for downstream noise attribution analysis.
+            "phase": "iter_retrieval",
+            "iter": int(iter_idx),
+            "query_idx": int(sample["index"]),
+            "query": sample["original_query"],
+            "query_for_retrieval": sample["current_query"],
+            "last_rewrite": sample["last_rewrite"],
+            "retrieval_topk": int(hp.FLAT_TOPK),
+            "retrieved_paths": pred_paths,
+            "retrieved_doc_ids": pred_doc_ids,
+            "rewrite_context_topk": int(hp.REWRITE_CONTEXT_TOPK),
+            "rewrite_context_paths": [list(p) for p in context_path_tuples],
+            "rewrite_context_doc_ids": _paths_to_ranked_doc_ids(context_path_tuples, path_to_doc_id),
+        })
 
     with open(metrics_path, "a", encoding="utf-8") as f:
         for metrics in iter_metrics:
             f.write(json.dumps(metrics, ensure_ascii=True) + "\n")
+    with open(iter_records_path, "a", encoding="utf-8") as f:
+        for rec in iter_records:
+            f.write(json.dumps(rec, ensure_ascii=True) + "\n")
 
     mean_ndcg = float(np.mean([m["nDCG@10"] for m in iter_metrics])) if iter_metrics else 0.0
     mean_r10 = float(np.mean([m["Recall@10"] for m in iter_metrics])) if iter_metrics else 0.0
@@ -435,4 +514,6 @@ for iter_idx in range(hp.NUM_ITERS):
                     for rec in rewrite_records:
                         f.write(json.dumps(rec, ensure_ascii=True) + "\n")
 
+logger.info("Saved metrics to %s", metrics_path)
+logger.info("Saved retrieval records to %s", iter_records_path)
 logger.info("Completed run_leaf_rank.py.")

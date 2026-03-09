@@ -12,6 +12,7 @@ log() {
 }
 
 log "Starting run_baseline3_leaf_only_loop.sh script"
+log "run_leaf_rank.py will emit leaf_iter_records.jsonl with retrieved/rewrite-context doc ids and paths per iteration."
 
 # Edit these paths for your setup
 RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
@@ -33,7 +34,7 @@ COMMON_PARAMS=(
     --leaf_only_retrieval
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
-    --rewrite_prompt_name thinkqe
+    --rewrite_prompt_name agent_executor_v1_icl2
     --rewrite_context_topk 10
 )
 

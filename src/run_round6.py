@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import pickle as pkl
-import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -33,17 +33,6 @@ from utils import (
 
 
 CATEGORY_ORDER = ["Theory", "Entity", "Example", "Other"]
-DEFAULT_CATEGORY_LABELS = ["theory", "entity", "example"]
-STACKEXCHANGE_SUBSETS = {
-    "biology",
-    "earth_science",
-    "economics",
-    "psychology",
-    "robotics",
-    "sustainable_living",
-}
-CODING_SUBSETS = {"leetcode", "pony", "stackoverflow"}
-THEOREM_SUBSETS = {"aops", "theoq", "theot", "theoremqa_questions", "theoremqa_theorems"}
 
 
 @dataclass
@@ -178,162 +167,44 @@ def _parse_possible_answer_docs(text: str) -> Tuple[Dict[str, str], str]:
     return {}, str(candidate or "").strip()
 
 
-def _normalize_category_label(text: str) -> str:
-    label = str(text or "").strip().lower()
-    label = re.sub(r"[^a-z0-9_\-\s]", "", label)
-    label = label.replace("-", "_")
-    label = re.sub(r"\s+", "_", label)
-    label = re.sub(r"_+", "_", label).strip("_")
-    if not label:
-        return ""
-    parts = [p for p in label.split("_") if p]
-    if not parts:
-        return ""
-    if len(parts) > 2:
-        parts = parts[:2]
-    return "_".join(parts)
-
-
-def _parse_category_output(text: str, max_k: int) -> List[Dict[str, str]]:
-    candidate = _extract_json_candidate(text)
-    obj: Any = None
-    try:
-        obj = json.loads(candidate)
-    except Exception:
-        try:
-            obj = repair_json(candidate, return_objects=True)
-        except Exception:
-            obj = None
-
-    raw_categories: Any = None
-    if isinstance(obj, dict):
-        raw_categories = (
-            _recursive_get(obj, "Categories")
-            or _recursive_get(obj, "categories")
-            or _recursive_get(obj, "Selected_Categories")
-            or _recursive_get(obj, "selected_categories")
-        )
-
-    parsed: List[Dict[str, str]] = []
-    if isinstance(raw_categories, list):
-        for item in raw_categories:
-            if isinstance(item, dict):
-                label = _normalize_category_label(item.get("label", ""))
-                hint = str(item.get("hint", "") or "").strip()
-                if not label:
-                    continue
-                parsed.append({"label": label, "hint": hint})
-            else:
-                label = _normalize_category_label(item)
-                if label:
-                    parsed.append({"label": label, "hint": ""})
-    elif isinstance(raw_categories, dict):
-        for key, val in raw_categories.items():
-            label = _normalize_category_label(key)
-            hint = str(val or "").strip()
-            if label:
-                parsed.append({"label": label, "hint": hint})
-
-    out: List[Dict[str, str]] = []
-    seen: Set[str] = set()
-    for row in parsed:
-        label = str(row.get("label", "")).strip()
-        if (not label) or (label in seen):
-            continue
-        seen.add(label)
-        out.append({"label": label, "hint": str(row.get("hint", "") or "").strip()})
-        if len(out) >= max(1, int(max_k)):
-            break
-    return out
+def _get_relevance_definition(subset_name: str) -> str:
+    name = str(subset_name or "").strip().lower()
+    relevance_definitions = {
+        "leetcode": "The relevance between queries and positive documents is defined by whether the coding problem "
+        "(i.e., query) involves the same algorithm and/or data structure. The queries and documents are "
+        "problems and solutions from LeetCode. The problem descriptions are used as queries Q, and the "
+        "positive documents D+Q are solved problems (with solutions) that were annotated as similar "
+        "problems by LeetCode.",
+        "theoremqa_questions": "A query is relevant to a document if the document references the same/similar theorem used in the query.",
+        "pony": "The relevance between queries and positive documents is defined by whether the coding problem "
+        "(i.e., query) requires the corresponding syntax documentation.",
+        "stackexchange": "A document is considered relevant to a query if it can be cited in an accepted or highly voted "
+        "answer that helps reason through the query with critical concepts or theories.",
+        "scifact": "A document is relevant if it contains sufficient, non-redundant, and minimal evidence (rationale sentences) "
+        "that can be used to determine the veracity (either support OR refutation) of a specific scientific claim. "
+        "The query is a scientific claim, and the documents are abstracts of scientific papers.",
+        "nq": "A document is relevant to a query if it contains the answer to the question posed in the query. "
+        "The query is a natural language web search question, and the documents are passages from wikipedia "
+        "that may contain the answer.",
+        "fiqa": "A document is considered relevant if it contains the specific information needed to answer the associated question.",
+        "scidocs": "A query is a source scientific paper (represented by its title and abstract) and a document is a candidate paper from the corpus. "
+        "A gold document is defined as relevant because it is either directly cited by the query paper or co-viewed "
+        "(accessed in the same user session) with the query paper in user activity logs.",
+    }
+    relevance_definitions["aops"] = relevance_definitions["theoremqa_questions"]
+    relevance_definitions["theoremqa_theorems"] = relevance_definitions["theoremqa_questions"]
+    relevance_definitions["theoq"] = relevance_definitions["theoremqa_questions"]
+    relevance_definitions["theot"] = relevance_definitions["theoremqa_questions"]
+    return relevance_definitions.get(name, relevance_definitions["stackexchange"])
 
 
 def _build_domain_route_hint(subset_name: str) -> str:
-    name = str(subset_name or "").strip().lower()
-    relevance_definitions = {
-        "leetcode": (
-            "The relevance between queries and positive documents is defined by whether the coding problem "
-            "(i.e., query) involves the same algorithm and/or data structure. The queries and documents are "
-            "problems and solutions from LeetCode. The problem descriptions are used as queries Q, and the "
-            "positive documents D+Q are solved problems (with solutions) that were annotated as similar "
-            "problems by LeetCode."
-        ),
-        "theoremqa_questions": (
-            "A query is relevant to a document if the document references the same/similar theorem used in the query."
-        ),
-        "pony": (
-            "The relevance between queries and positive documents is defined by whether the coding problem "
-            "(i.e., query) requires the corresponding syntax documentation."
-        ),
-        "stackexchange": (
-            "A document is considered relevant to a query if it can be cited in an accepted or highly voted "
-            "answer that helps reason through the query with critical concepts or theories."
-        ),
-    }
-
-    if name in {"leetcode"}:
-        key = "leetcode"
-    elif name in {"theoremqa_questions", "theoremqa_theorems", "aops", "theoq", "theot"}:
-        key = "theoremqa_questions"
-    elif name in {"pony"}:
-        key = "pony"
-    else:
-        # Intent: all remaining BRIGHT subsets follow StackExchange-style relevance routing in this hint.
-        key = "stackexchange"
+    relevance_definition = _get_relevance_definition(subset_name)
 
     return (
-        "Use this relevance definition as your routing prior for category generation:\n"
-        f"{relevance_definitions[key]}"
+        "Use this relevance definition as your routing prior for retrieval rewrite:\n"
+        f"{relevance_definition}"
     )
-
-
-def _format_category_history(
-    category_bank: Sequence[Dict[str, Any]],
-    scope: str,
-    max_rows: int = 12,
-) -> str:
-    if str(scope or "full").lower() == "none":
-        return "None"
-    rows = list(category_bank or [])
-    if not rows:
-        return "None"
-    clipped = rows[-max_rows:]
-    lines: List[str] = []
-    for row in clipped:
-        label = str(row.get("label", "")).strip()
-        hint = str(row.get("hint", "")).strip()
-        iter_idx = row.get("iter")
-        if not label:
-            continue
-        if hint:
-            lines.append(f"- iter={iter_idx} label={label}: {hint}")
-        else:
-            lines.append(f"- iter={iter_idx} label={label}")
-    return "\n".join(lines) if lines else "None"
-
-
-def _format_selected_categories(categories: Sequence[Dict[str, str]]) -> str:
-    lines: List[str] = []
-    for row in categories:
-        label = str(row.get("label", "")).strip()
-        hint = str(row.get("hint", "")).strip()
-        if not label:
-            continue
-        if hint:
-            lines.append(f"- {label}: {hint}")
-        else:
-            lines.append(f"- {label}")
-    return "\n".join(lines) if lines else "- theory\n- entity\n- example"
-
-
-def _format_selected_category_schema(categories: Sequence[Dict[str, str]]) -> str:
-    labels = [str(row.get("label", "")).strip() for row in categories if str(row.get("label", "")).strip()]
-    if not labels:
-        labels = list(DEFAULT_CATEGORY_LABELS)
-    lines: List[str] = []
-    for idx, label in enumerate(labels):
-        suffix = "," if idx < (len(labels) - 1) else ""
-        lines.append(f'    "{label}": "..."{suffix}')
-    return "\n".join(lines)
 
 
 def _collect_branch_descs_from_selected(
@@ -358,44 +229,6 @@ def _collect_branch_descs_from_selected(
     return descs
 
 
-def _is_leaf_cluster_trigger(
-    selected_paths: Sequence[Tuple[int, ...]],
-    path_to_node: Dict[Tuple[int, ...], object],
-) -> bool:
-    for path in selected_paths:
-        node = path_to_node.get(tuple(path))
-        if node is None:
-            continue
-        children = list(getattr(node, "child", []) or [])
-        if children and all(bool(getattr(child, "is_leaf", False)) for child in children):
-            return True
-    return False
-
-
-def _align_docs_to_categories(
-    docs: Dict[str, str],
-    categories: Sequence[Dict[str, str]],
-) -> Dict[str, str]:
-    if not docs:
-        return {}
-    categories_by_norm: Dict[str, str] = {}
-    for row in categories:
-        label = str(row.get("label", "")).strip()
-        if label:
-            categories_by_norm[_normalize_category_label(label)] = label
-
-    aligned: Dict[str, str] = {}
-    for key, val in docs.items():
-        norm = _normalize_category_label(key)
-        if (not norm) or (norm not in categories_by_norm):
-            continue
-        canonical = categories_by_norm[norm]
-        text = str(val or "").strip()
-        if text:
-            aligned[canonical] = text
-    return aligned
-
-
 def _format_rewrite_prompt(
     template: str,
     *,
@@ -404,11 +237,7 @@ def _format_rewrite_prompt(
     leaf_descs: Sequence[str],
     branch_descs: Sequence[str],
     domain_route_hint: str = "",
-    category_history: str = "",
-    selected_categories: str = "",
-    selected_category_schema: str = "",
-    stability_hint: str = "",
-    category_k: int = 3,
+    relevance_definition: str = "",
 ) -> str:
     leaf_blob = "\n".join([x for x in leaf_descs if x])
     branch_blob = "\n".join([x for x in branch_descs if x])
@@ -429,13 +258,8 @@ def _format_rewrite_prompt(
             branch_descs=branch_blob,
             gate_descs=gate_blob,
             domain_route_hint=domain_route_hint or "",
+            relevance_definition=relevance_definition or "",
             corpus_categories="",
-            category_history=category_history or "",
-            selected_categories=selected_categories or "",
-            selected_category_schema=selected_category_schema or "",
-            stability_hint=stability_hint or "",
-            drift_hint=stability_hint or "",
-            category_k=int(category_k),
         )
     except KeyError:
         return (
@@ -447,13 +271,8 @@ def _format_rewrite_prompt(
             .replace("{branch_descs}", branch_blob)
             .replace("{gate_descs}", gate_blob)
             .replace("{domain_route_hint}", domain_route_hint or "")
+            .replace("{relevance_definition}", relevance_definition or "")
             .replace("{corpus_categories}", "")
-            .replace("{category_history}", category_history or "")
-            .replace("{selected_categories}", selected_categories or "")
-            .replace("{selected_category_schema}", selected_category_schema or "")
-            .replace("{stability_hint}", stability_hint or "")
-            .replace("{drift_hint}", stability_hint or "")
-            .replace("{category_k}", str(int(category_k)))
         )
 
 
@@ -1045,75 +864,36 @@ def _compute_branch_metrics_from_samples(samples: Sequence[InferSample]) -> pd.D
 hp = HyperParams.from_args()
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-round5_mode = str(getattr(hp, "ROUND5_MODE", "legacy") or "legacy").strip().lower()
-if round5_mode not in {"legacy", "category"}:
-    raise ValueError(f'Unsupported --round5_mode "{round5_mode}". Allowed: legacy|category')
-hp.add_param("round5_mode", round5_mode)
+startup_warnings: List[str] = []
+requested_round5_mode = str(getattr(hp, "ROUND5_MODE", "legacy") or "legacy").strip().lower()
+if requested_round5_mode not in {"legacy", "category"}:
+    raise ValueError(f'Unsupported --round5_mode "{requested_round5_mode}". Allowed: legacy|category')
+if requested_round5_mode != "legacy":
+    # Intent: keep round6 execution legacy-only even when legacy category flags are provided.
+    startup_warnings.append(f'Ignoring --round5_mode "{requested_round5_mode}" in run_round6.py (forced to legacy).')
+if any(arg.startswith("--round5_category_") for arg in sys.argv[1:]):
+    # Intent: make ignored category controls explicit to avoid silent config drift.
+    startup_warnings.append("Ignoring --round5_category_* arguments in run_round6.py (legacy-only runtime).")
+round5_mode = "legacy"
 
 if hp.REWRITE_PROMPT_PATH:
-    print("Ignoring --rewrite_prompt_path in run_round5.py (template path override is disabled).")
+    print("Ignoring --rewrite_prompt_path in run_round6.py (template path override is disabled).")
 
 round5_rewrite_prompt_name = "agent_executor_v1"
-round5_category_generator_prompt_name: Optional[str] = None
-round5_category_k = max(1, int(getattr(hp, "ROUND5_CATEGORY_K", 3) or 3))
-round5_category_history_scope = str(getattr(hp, "ROUND5_CATEGORY_HISTORY_SCOPE", "full") or "full").lower()
-round5_category_drift_trigger = str(getattr(hp, "ROUND5_CATEGORY_DRIFT_TRIGGER", "leaf_cluster") or "leaf_cluster").lower()
-round5_category_fallback_on_parse_fail = True
-round5_category_partial_ok = True
-
-if round5_mode == "legacy":
-    requested_prompt_name = str(hp.REWRITE_PROMPT_NAME or "").strip()
-    if requested_prompt_name:
-        round5_rewrite_prompt_name = requested_prompt_name
-    # Intent: legacy mode accepts any registered rewrite template so prompt ablations can reuse --rewrite_prompt_name.
-    if round5_rewrite_prompt_name not in REWRITE_PROMPT_TEMPLATES:
-        raise ValueError(
-            f'Unknown --rewrite_prompt_name "{round5_rewrite_prompt_name}" in run_round5.py legacy mode. '
-            f"Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}"
-        )
-else:
-    if hp.REWRITE_PROMPT_NAME:
-        print(
-            f'Ignoring --rewrite_prompt_name="{hp.REWRITE_PROMPT_NAME}" in run_round5.py '
-            '(category mode uses --round5_category_rewrite_prompt_name).'
-        )
-    round5_category_generator_prompt_name = str(
-        getattr(hp, "ROUND5_CATEGORY_GENERATOR_PROMPT_NAME", "round5_category_generator_v1") or "round5_category_generator_v1"
-    ).strip()
-    round5_rewrite_prompt_name = str(
-        getattr(hp, "ROUND5_CATEGORY_REWRITE_PROMPT_NAME", "round5_agent_executor_category_v1") or "round5_agent_executor_category_v1"
-    ).strip()
-    if round5_category_generator_prompt_name not in REWRITE_PROMPT_TEMPLATES:
-        raise ValueError(
-            f'Unknown --round5_category_generator_prompt_name "{round5_category_generator_prompt_name}". '
-            f'Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}'
-        )
-    if round5_rewrite_prompt_name not in REWRITE_PROMPT_TEMPLATES:
-        raise ValueError(
-            f'Unknown --round5_category_rewrite_prompt_name "{round5_rewrite_prompt_name}". '
-            f'Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}'
-        )
-    if round5_category_history_scope not in {"full", "none"}:
-        raise ValueError(
-            f'Unsupported --round5_category_history_scope "{round5_category_history_scope}". Allowed: full|none'
-        )
-    if round5_category_drift_trigger not in {"leaf_cluster", "none"}:
-        raise ValueError(
-            f'Unsupported --round5_category_drift_trigger "{round5_category_drift_trigger}". Allowed: leaf_cluster|none'
-        )
-
-hp.add_param("round5_category_fallback_on_parse_fail", round5_category_fallback_on_parse_fail)
-hp.add_param("round5_category_partial_ok", round5_category_partial_ok)
+requested_prompt_name = str(hp.REWRITE_PROMPT_NAME or "").strip()
+if requested_prompt_name:
+    round5_rewrite_prompt_name = requested_prompt_name
+# Intent: legacy mode accepts any registered rewrite template so prompt ablations can reuse --rewrite_prompt_name.
+if round5_rewrite_prompt_name not in REWRITE_PROMPT_TEMPLATES:
+    raise ValueError(
+        f'Unknown --rewrite_prompt_name "{round5_rewrite_prompt_name}" in run_round6.py legacy mode. '
+        f"Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}"
+    )
 
 hp.add_param("rewrite_prompt_name", round5_rewrite_prompt_name)
-hp.add_param("round5_category_k", round5_category_k)
-hp.add_param("round5_category_history_scope", round5_category_history_scope)
-hp.add_param("round5_category_drift_trigger", round5_category_drift_trigger)
-hp.add_param("round5_category_generator_prompt_name", round5_category_generator_prompt_name)
-hp.add_param("round5_category_rewrite_prompt_name", round5_rewrite_prompt_name)
 
 if str(hp.ROUND3_SUMMARIZED_CONTEXT or "off").lower() != "off":
-    print("Ignoring --round3_summarized_context in run_round5.py (fixed to off).")
+    print("Ignoring --round3_summarized_context in run_round6.py (fixed to off).")
 hp.add_param("round3_summarized_context", "off")
 
 round5_mrr_pool_k = max(1, int(getattr(hp, "ROUND5_MRR_POOL_K", 100) or 100))
@@ -1133,15 +913,15 @@ if os.path.exists(RESULTS_DIR) and os.listdir(RESULTS_DIR):
     raise SystemExit(0)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-logger = setup_logger("lattice_runner_round5", f"{RESULTS_DIR}/run.log", logging.INFO)
+logger = setup_logger("lattice_runner_round6", f"{RESULTS_DIR}/run.log", logging.INFO)
 with open(f"{RESULTS_DIR}/hparams.json", "w", encoding="utf-8") as f:
     json.dump(vars(hp), f, indent=2, ensure_ascii=True, sort_keys=True)
+for warning in startup_warnings:
+    logger.warning(warning)
 logger.info(
-    "Round5 config | mode=%s | rewrite_prompt=%s | category_generator_prompt=%s | category_k=%d | selector_mode=%s | selector_topk=%d",
-    round5_mode,
+    "Round6 config | mode=%s | rewrite_prompt=%s | selector_mode=%s | selector_topk=%d",
+    "legacy",
     round5_rewrite_prompt_name,
-    str(round5_category_generator_prompt_name or "none"),
-    int(round5_category_k),
     round5_selector_mode,
     int(round5_mrr_pool_k),
 )
@@ -1149,7 +929,7 @@ logger.info(
 if not hp.REWRITE_CACHE_PATH:
     cache_root = os.path.join(BASE_DIR, "cache", "rewrite")
     os.makedirs(cache_root, exist_ok=True)
-    cache_mode_tag = "round5_category" if round5_mode == "category" else "round5_legacy"
+    cache_mode_tag = "round5_legacy"
     cache_name = f"{hp.SUBSET}_{round5_rewrite_prompt_name}_{cache_mode_tag}_{hp.exp_hash(8)}.jsonl"
     hp.add_param("rewrite_cache_path", os.path.join(cache_root, cache_name))
 
@@ -1260,20 +1040,17 @@ if node_embs is None:
     node_embs = normalize_embeddings(node_embs)
 
 rewrite_template = REWRITE_PROMPT_TEMPLATES[round5_rewrite_prompt_name]
-category_generator_template = (
-    REWRITE_PROMPT_TEMPLATES[round5_category_generator_prompt_name]
-    if round5_mode == "category" and round5_category_generator_prompt_name
-    else ""
-)
 subset_domain_route_hint = _build_domain_route_hint(hp.SUBSET)
+# Intent: keep rewrite rubric text aligned with the canonical subset relevance definition.
+subset_relevance_definition = _get_relevance_definition(hp.SUBSET)
 rewrite_map, docs_map = _load_rewrite_cache(hp.REWRITE_CACHE_PATH, hp.REWRITE_FORCE_REFRESH)
 
 if hp.LLM_API_BACKEND == "genai":
     llm_api = GenAIAPI(hp.LLM, logger=logger, timeout=hp.LLM_API_TIMEOUT, max_retries=hp.LLM_API_MAX_RETRIES)
 elif hp.LLM_API_BACKEND == "vllm":
     vllm_base_url, vllm_base_url_src = _resolve_vllm_base_url(BASE_DIR)
-    logger.info("Round5 vLLM endpoints source: %s", vllm_base_url_src)
-    logger.info("Round5 vLLM endpoints: %s", vllm_base_url)
+    logger.info("Round6 vLLM endpoints source: %s", vllm_base_url_src)
+    logger.info("Round6 vLLM endpoints: %s", vllm_base_url)
     llm_api = VllmAPI(
         hp.LLM,
         logger=logger,
@@ -1318,8 +1095,6 @@ for i in range(num_samples):
     sample.original_query = original_query
     sample.gold_doc_ids = list(gold_doc_ids)
     sample.last_rewrite_raw = ""
-    sample.last_category_labels = []
-    sample.category_bank = []
     sample.rewrite_history = []
     sample.iter_records = []
     if "original_query" not in sample.SAVE_LIST:
@@ -1328,10 +1103,6 @@ for i in range(num_samples):
         sample.SAVE_LIST.append("gold_doc_ids")
     if "last_rewrite_raw" not in sample.SAVE_LIST:
         sample.SAVE_LIST.append("last_rewrite_raw")
-    if "last_category_labels" not in sample.SAVE_LIST:
-        sample.SAVE_LIST.append("last_category_labels")
-    if "category_bank" not in sample.SAVE_LIST:
-        sample.SAVE_LIST.append("category_bank")
     if "iter_records" not in sample.SAVE_LIST:
         sample.SAVE_LIST.append("iter_records")
     all_eval_samples.append(sample)
@@ -1339,7 +1110,7 @@ for i in range(num_samples):
 all_eval_metric_dfs: List[pd.DataFrame] = []
 cumulative_leaf_indices_by_sample: List[Set[int]] = [set() for _ in all_eval_samples]
 for iter_idx in range(hp.NUM_ITERS):
-    logger.info("Round5 iteration %d", iter_idx)
+    logger.info("Round6 iteration %d", iter_idx)
 
     # Intent: keep cumulative leaf pools from all previously reached leaves per sample.
     for sample_idx, sample in enumerate(all_eval_samples):
@@ -1351,8 +1122,6 @@ for iter_idx in range(hp.NUM_ITERS):
 
     rewrite_prompts: List[str] = []
     rewrite_meta: List[Dict[str, Any]] = []
-    category_prompts: List[str] = []
-    category_meta: List[Dict[str, Any]] = []
     rewrite_state_by_sample_idx: Dict[int, Dict[str, Any]] = {}
     retrieval_rows: List[Dict[str, float]] = []
 
@@ -1385,22 +1154,6 @@ for iter_idx in range(hp.NUM_ITERS):
             max_desc_len=hp.MAX_DOC_DESC_CHAR_LEN,
             topk=hp.REWRITE_CONTEXT_TOPK,
         )
-        # Intent: keep full historical category memory available to generator so labels remain stable over iterations.
-        category_history_text = _format_category_history(
-            category_bank=getattr(sample, "category_bank", []),
-            scope=round5_category_history_scope,
-        )
-        leaf_cluster_triggered = (
-            round5_mode == "category"
-            and round5_category_drift_trigger == "leaf_cluster"
-            and _is_leaf_cluster_trigger(selected_before, path_to_node)
-        )
-        # Intent: when near leaf-cluster regions, add a soft category-stability reminder instead of hard constraints.
-        stability_hint = (
-            "- Keep the last category labels unless Topic Cluster Summaries clearly indicate a new, query-relevant perspective not covered by the current labels.\n"
-            if leaf_cluster_triggered
-            else "\n"
-        )
 
         rewrite_state_by_sample_idx[sample_idx] = {
             "cache_key": "",
@@ -1420,144 +1173,38 @@ for iter_idx in range(hp.NUM_ITERS):
             "pre_hit_doc_ids": list(pre_hit_doc_ids),
             "eval_paths": [],
             "eval_doc_ids": [],
-            "selected_categories": [],
-            "category_prompt": "",
-            "category_raw_output": "",
-            "category_history": category_history_text,
-            "leaf_cluster_triggered": bool(leaf_cluster_triggered),
-            "stability_hint": stability_hint,
         }
 
-        if round5_mode == "category":
-            cat_prompt = _format_rewrite_prompt(
-                category_generator_template,
-                original_query=str(sample.original_query),
-                previous_rewrite=str(getattr(sample, "last_rewrite_raw", "") or ""),
-                leaf_descs=leaf_descs,
-                branch_descs=branch_descs,
-                domain_route_hint=subset_domain_route_hint,
-                category_history=category_history_text,
-                stability_hint=stability_hint,
-                category_k=round5_category_k,
+        prompt = _format_rewrite_prompt(
+            rewrite_template,
+            original_query=str(sample.original_query),
+            previous_rewrite=str(getattr(sample, "last_rewrite_raw", "") or ""),
+            leaf_descs=leaf_descs,
+            branch_descs=[],
+            domain_route_hint=subset_domain_route_hint,
+            relevance_definition=subset_relevance_definition,
+        )
+        cache_key = _prompt_cache_key("round5", prompt)
+        cache_hit = (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map)
+        rewrite_state_by_sample_idx[sample_idx]["cache_key"] = cache_key
+        rewrite_state_by_sample_idx[sample_idx]["cache_hit"] = bool(cache_hit)
+        rewrite_state_by_sample_idx[sample_idx]["cached_rewrite"] = str(rewrite_map.get(cache_key, "") or "")
+        rewrite_state_by_sample_idx[sample_idx]["cached_docs"] = (
+            _clean_docs_map(docs_map.get(cache_key, {})) if cache_hit else {}
+        )
+        if not cache_hit:
+            rewrite_prompts.append(prompt)
+            rewrite_meta.append(
+                {
+                    "sample_idx": sample_idx,
+                    "cache_key": cache_key,
+                    "prompt": prompt,
+                    "leaf_descs": leaf_descs,
+                    "branch_descs": [],
+                    "query_pre": query_pre,
+                    "mode": "legacy",
+                }
             )
-            rewrite_state_by_sample_idx[sample_idx]["category_prompt"] = cat_prompt
-            category_prompts.append(cat_prompt)
-            category_meta.append({"sample_idx": sample_idx})
-        else:
-            prompt = _format_rewrite_prompt(
-                rewrite_template,
-                original_query=str(sample.original_query),
-                previous_rewrite=str(getattr(sample, "last_rewrite_raw", "") or ""),
-                leaf_descs=leaf_descs,
-                branch_descs=[],
-                domain_route_hint=subset_domain_route_hint,
-            )
-            cache_key = _prompt_cache_key("round5", prompt)
-            cache_hit = (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map)
-            rewrite_state_by_sample_idx[sample_idx]["cache_key"] = cache_key
-            rewrite_state_by_sample_idx[sample_idx]["cache_hit"] = bool(cache_hit)
-            rewrite_state_by_sample_idx[sample_idx]["cached_rewrite"] = str(rewrite_map.get(cache_key, "") or "")
-            rewrite_state_by_sample_idx[sample_idx]["cached_docs"] = (
-                _clean_docs_map(docs_map.get(cache_key, {})) if cache_hit else {}
-            )
-            if not cache_hit:
-                rewrite_prompts.append(prompt)
-                rewrite_meta.append(
-                    {
-                        "sample_idx": sample_idx,
-                        "cache_key": cache_key,
-                        "prompt": prompt,
-                        "leaf_descs": leaf_descs,
-                        "branch_descs": [],
-                        "query_pre": query_pre,
-                        "mode": round5_mode,
-                    }
-                )
-
-    if round5_mode == "category":
-        if category_prompts:
-            logger.info("Iter %d: starting category batch (%d prompts)", iter_idx, len(category_prompts))
-            cat_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(cat_loop)
-            try:
-                category_outputs = cat_loop.run_until_complete(llm_api.run_batch(category_prompts, **llm_api_kwargs))
-            finally:
-                cat_loop.close()
-                asyncio.set_event_loop(None)
-        else:
-            category_outputs = []
-
-        for meta, out in zip(category_meta, category_outputs):
-            sample_idx = int(meta["sample_idx"])
-            sample = all_eval_samples[sample_idx]
-            info = rewrite_state_by_sample_idx[sample_idx]
-            parsed_categories = _parse_category_output(out, round5_category_k)
-            if not parsed_categories and round5_category_fallback_on_parse_fail:
-                prev_labels = [str(x).strip() for x in (getattr(sample, "last_category_labels", []) or []) if str(x).strip()]
-                fallback_labels = prev_labels[:round5_category_k] if prev_labels else list(DEFAULT_CATEGORY_LABELS[:round5_category_k])
-                parsed_categories = [{"label": _normalize_category_label(x), "hint": ""} for x in fallback_labels if _normalize_category_label(x)]
-            if (not round5_category_partial_ok) and len(parsed_categories) < round5_category_k:
-                missing = [x for x in DEFAULT_CATEGORY_LABELS if x not in {c.get("label", "") for c in parsed_categories}]
-                for label in missing:
-                    parsed_categories.append({"label": label, "hint": ""})
-                    if len(parsed_categories) >= round5_category_k:
-                        break
-            parsed_categories = parsed_categories[:round5_category_k]
-            if not parsed_categories:
-                parsed_categories = [{"label": x, "hint": ""} for x in DEFAULT_CATEGORY_LABELS[:round5_category_k]]
-            info["selected_categories"] = parsed_categories
-            info["category_raw_output"] = str(out or "")
-            sample.last_category_labels = [str(row.get("label", "")).strip() for row in parsed_categories if str(row.get("label", "")).strip()]
-            for row in parsed_categories:
-                label = str(row.get("label", "")).strip()
-                if not label:
-                    continue
-                # Intent: keep full per-iter category bank to stabilize later generation near leaf clusters.
-                sample.category_bank.append(
-                    {
-                        "iter": int(iter_idx),
-                        "label": label,
-                        "hint": str(row.get("hint", "")).strip(),
-                    }
-                )
-
-        for sample_idx, sample in enumerate(all_eval_samples):
-            info = rewrite_state_by_sample_idx[sample_idx]
-            selected_categories = info.get("selected_categories", []) or []
-            selected_categories_text = _format_selected_categories(selected_categories)
-            selected_category_schema = _format_selected_category_schema(selected_categories)
-            prompt = _format_rewrite_prompt(
-                rewrite_template,
-                original_query=str(sample.original_query),
-                previous_rewrite=str(getattr(sample, "last_rewrite_raw", "") or ""),
-                leaf_descs=info.get("leaf_descs", []),
-                branch_descs=[],
-                domain_route_hint=subset_domain_route_hint,
-                category_history=info.get("category_history", "None"),
-                selected_categories=selected_categories_text,
-                selected_category_schema=selected_category_schema,
-                stability_hint=info.get("stability_hint", ""),
-                category_k=round5_category_k,
-            )
-            cache_key = _prompt_cache_key("round5_category", prompt)
-            cache_hit = (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map)
-            info["cache_key"] = cache_key
-            info["cache_hit"] = bool(cache_hit)
-            info["cached_rewrite"] = str(rewrite_map.get(cache_key, "") or "")
-            info["cached_docs"] = _clean_docs_map(docs_map.get(cache_key, {})) if cache_hit else {}
-            if not cache_hit:
-                rewrite_prompts.append(prompt)
-                rewrite_meta.append(
-                    {
-                        "sample_idx": sample_idx,
-                        "cache_key": cache_key,
-                        "prompt": prompt,
-                        "leaf_descs": info.get("leaf_descs", []),
-                        "branch_descs": [],
-                        "query_pre": info.get("query_pre", ""),
-                        "mode": round5_mode,
-                    }
-                )
 
     generated_by_key: Dict[str, Dict[str, Any]] = {}
     new_cache_records: List[Dict[str, Any]] = []
@@ -1574,26 +1221,8 @@ for iter_idx in range(hp.NUM_ITERS):
 
         for meta, out in zip(rewrite_meta, rewrite_outputs):
             sample_idx = int(meta.get("sample_idx", -1))
-            info = rewrite_state_by_sample_idx.get(sample_idx, {})
             docs_out, rewrite_out = _parse_possible_answer_docs(out)
             docs_out = _clean_docs_map(docs_out)
-            if round5_mode == "category":
-                aligned_docs = _align_docs_to_categories(
-                    docs=docs_out,
-                    categories=info.get("selected_categories", []),
-                )
-                if aligned_docs:
-                    docs_out = aligned_docs
-                elif round5_category_fallback_on_parse_fail:
-                    selected_categories = info.get("selected_categories", [])
-                    fallback_text = str(rewrite_out or _flatten_docs(docs_out) or "").strip()
-                    if selected_categories:
-                        primary_label = str(selected_categories[0].get("label", "theory")).strip() or "theory"
-                        docs_out = {primary_label: fallback_text} if fallback_text else {}
-                    else:
-                        docs_out = {}
-                else:
-                    docs_out = {}
 
             if not rewrite_out:
                 rewrite_out = _flatten_docs(docs_out)
@@ -1619,7 +1248,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     "leaf_descs": meta.get("leaf_descs", []),
                     "branch_descs": meta.get("branch_descs", []),
                     "query_pre": meta.get("query_pre", ""),
-                    "mode": meta.get("mode", round5_mode),
+                    "mode": "legacy",
                 }
             )
 
@@ -1685,12 +1314,6 @@ for iter_idx in range(hp.NUM_ITERS):
                 "query_post": query_post,
                 "rewrite": rewrite_blob,
                 "possible_answer_docs": rewrite_docs,
-                "selected_categories": info.get("selected_categories", []),
-                "category_prompt": info.get("category_prompt", ""),
-                "category_raw_output": info.get("category_raw_output", ""),
-                "category_source": "llm_generator",
-                "leaf_cluster_triggered": bool(info.get("leaf_cluster_triggered", False)),
-                "category_stability_hint": str(info.get("stability_hint", "")),
                 "leaf_descs": info.get("leaf_descs", []),
                 "branch_descs": info.get("branch_descs", []),
                 "raw_output": raw_output,
@@ -1882,9 +1505,6 @@ for iter_idx in range(hp.NUM_ITERS):
                 "rewrite_leaf_descs_count": int(len(info.get("leaf_descs", []))),
                 "rewrite_branch_descs_count": int(len(info.get("branch_descs", []))),
                 "possible_answer_docs": info.get("rewrite_docs", {}),
-                "selected_categories": info.get("selected_categories", []),
-                "category_source": "llm_generator",
-                "leaf_cluster_triggered": bool(info.get("leaf_cluster_triggered", False)),
                 "selected_branches_before": [list(p) for p in selected_before_by_idx.get(sample_idx, [])],
                 "selected_branches_after": [list(p) for p in selected_after],
                 "selector_mode": round5_selector_mode,
@@ -1928,4 +1548,4 @@ save_exp(
     allow_overwrite=True,
     save_llm_api_history=True,
 )
-logger.info("Saved Round5 results to %s", RESULTS_DIR)
+logger.info("Saved Round6 results to %s", RESULTS_DIR)
