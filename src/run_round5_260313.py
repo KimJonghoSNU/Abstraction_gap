@@ -591,101 +591,6 @@ def _paths_to_ranked_doc_ids(
     return ranked
 
 
-def _bank_entry_from_hits(
-    *,
-    hits: Sequence[FlatHit],
-    gold_doc_ids: Sequence[str],
-    path_to_doc_id: Dict[Tuple[int, ...], str],
-    iter_idx: int,
-    query_post: str,
-) -> Dict[str, Any]:
-    registry_indices = np.asarray([int(hit.registry_idx) for hit in hits], dtype=np.int32)
-    scores = np.asarray([float(hit.score) for hit in hits], dtype=np.float32)
-    doc_ids = _paths_to_ranked_doc_ids([tuple(hit.path) for hit in hits], path_to_doc_id)
-    run_ndcg10 = compute_ndcg(doc_ids[:10], list(gold_doc_ids), k=10) * 100.0
-    return {
-        "iter": int(iter_idx),
-        "query_post": str(query_post or ""),
-        "registry_indices": registry_indices,
-        "scores": scores,
-        "ndcg10": float(run_ndcg10),
-        "top_doc_ids": list(doc_ids[:10]),
-    }
-
-
-def _compute_retrieval_metrics(
-    doc_ids: Sequence[str],
-    gold_doc_ids: Sequence[str],
-) -> Dict[str, float]:
-    ranked_doc_ids = list(doc_ids)
-    gold_ranked_doc_ids = list(gold_doc_ids)
-    return {
-        "nDCG@10": compute_ndcg(ranked_doc_ids[:10], gold_ranked_doc_ids, k=10) * 100,
-        "Recall@10": compute_recall(ranked_doc_ids[:10], gold_ranked_doc_ids, k=10) * 100,
-        "Recall@100": compute_recall(ranked_doc_ids[:100], gold_ranked_doc_ids, k=100) * 100,
-        "Recall@all": compute_recall(ranked_doc_ids, gold_ranked_doc_ids, k=len(ranked_doc_ids)) * 100,
-        "Coverage": float(len(ranked_doc_ids)),
-    }
-
-
-def _fuse_bank_entries(
-    *,
-    bank_entries: Sequence[Dict[str, Any]],
-    node_registry: Sequence[object],
-    topk: int,
-    rrf_k: int,
-    blocked_leaf_indices: Optional[Set[int]] = None,
-    allowed_leaf_indices: Optional[Set[int]] = None,
-) -> List[FlatHit]:
-    fused_scores: Dict[int, float] = {}
-    best_rank: Dict[int, int] = {}
-    blocked = {int(x) for x in list(blocked_leaf_indices or [])}
-    allowed = None if allowed_leaf_indices is None else {int(x) for x in list(allowed_leaf_indices)}
-
-    for entry in bank_entries:
-        registry_indices = np.asarray(entry.get("registry_indices", []), dtype=np.int64)
-        scores = np.asarray(entry.get("scores", []), dtype=np.float32)
-        for rank_idx, (registry_idx, score) in enumerate(zip(registry_indices.tolist(), scores.tolist()), start=1):
-            ridx = int(registry_idx)
-            if ridx in blocked:
-                continue
-            if (allowed is not None) and (ridx not in allowed):
-                continue
-            best_rank[ridx] = min(best_rank.get(ridx, rank_idx), rank_idx)
-            fused_scores[ridx] = fused_scores.get(ridx, 0.0) + (1.0 / float(rrf_k + rank_idx))
-
-    if not fused_scores:
-        return []
-
-    ordered = sorted(
-        fused_scores.items(),
-        key=lambda kv: (-float(kv[1]), int(best_rank.get(int(kv[0]), 10**9)), int(kv[0])),
-    )[: max(1, int(topk))]
-    hits: List[FlatHit] = []
-    for registry_idx, score in ordered:
-        node = node_registry[int(registry_idx)]
-        hits.append(
-            FlatHit(
-                registry_idx=int(registry_idx),
-                path=tuple(node.path),
-                score=float(score),
-                is_leaf=node.is_leaf,
-            )
-        )
-    return hits
-
-
-def _summarize_bank_entries(bank_entries: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        {
-            "iter": int(entry.get("iter", -1)),
-            "ndcg10": float(entry.get("ndcg10", 0.0)),
-            "top_doc_ids": list(entry.get("top_doc_ids", [])),
-        }
-        for entry in bank_entries
-    ]
-
-
 def _build_tree_leaf_support_maps(
     node_registry: Sequence[object],
 ) -> Tuple[List[int], List[Tuple[int, ...]], Dict[Tuple[int, ...], List[int]], Dict[Tuple[int, ...], List[Tuple[int, ...]]]]:
@@ -1220,13 +1125,6 @@ if round5_selector_mode not in {"retriever_slate", "maxscore_global", "meanscore
         "Allowed: retriever_slate|maxscore_global|meanscore_global|max_hit_global"
     )
 hp.add_param("round5_selector_mode", round5_selector_mode)
-round5_fused_memory = bool(getattr(hp, "ROUND5_FUSED_MEMORY", False))
-if round5_fused_memory and round5_selector_mode == "retriever_slate":
-    raise ValueError(
-        "--round5_fused_memory requires a score-based --round5_selector_mode "
-        "(maxscore_global|meanscore_global|max_hit_global)."
-    )
-hp.add_param("round5_fused_memory", round5_fused_memory)
 
 exp_dir_name = str(hp)
 RESULTS_DIR = f"{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/round5/{exp_dir_name}/"
@@ -1239,14 +1137,13 @@ logger = setup_logger("lattice_runner_round5", f"{RESULTS_DIR}/run.log", logging
 with open(f"{RESULTS_DIR}/hparams.json", "w", encoding="utf-8") as f:
     json.dump(vars(hp), f, indent=2, ensure_ascii=True, sort_keys=True)
 logger.info(
-    "Round5 config | mode=%s | rewrite_prompt=%s | category_generator_prompt=%s | category_k=%d | selector_mode=%s | selector_topk=%d | fused_memory=%s",
+    "Round5 config | mode=%s | rewrite_prompt=%s | category_generator_prompt=%s | category_k=%d | selector_mode=%s | selector_topk=%d",
     round5_mode,
     round5_rewrite_prompt_name,
     str(round5_category_generator_prompt_name or "none"),
     int(round5_category_k),
     round5_selector_mode,
     int(round5_mrr_pool_k),
-    str(round5_fused_memory).lower(),
 )
 
 if not hp.REWRITE_CACHE_PATH:
@@ -1425,8 +1322,6 @@ for i in range(num_samples):
     sample.category_bank = []
     sample.rewrite_history = []
     sample.iter_records = []
-    # Intent: fused-memory mode reuses completed retrieval runs without persisting raw numpy arrays to saved sample dicts.
-    sample.round5_fusion_bank_all_iters = []
     if "original_query" not in sample.SAVE_LIST:
         sample.SAVE_LIST.append("original_query")
     if "gold_doc_ids" not in sample.SAVE_LIST:
@@ -1467,7 +1362,7 @@ for iter_idx in range(hp.NUM_ITERS):
         if not cumulative_pool:
             cumulative_pool = list(leaf_indices)
 
-        local_pre_hits = _retrieve_leaf_hits(
+        pre_hits = _retrieve_leaf_hits(
             query=query_pre,
             leaf_pool_indices=cumulative_pool,
             retriever=retriever,
@@ -1475,35 +1370,12 @@ for iter_idx in range(hp.NUM_ITERS):
             node_registry=node_registry,
             topk=round5_mrr_pool_k,
         )
-        local_pre_hit_paths = [tuple(hit.path) for hit in local_pre_hits]
-        local_pre_hit_doc_ids = _paths_to_ranked_doc_ids(local_pre_hit_paths, path_to_doc_id)
-        pre_hits = list(local_pre_hits)
-        pre_hit_source = "local_current"
-        previous_bank_entries = list(getattr(sample, "round5_fusion_bank_all_iters", []) or [])
-        if round5_fused_memory and previous_bank_entries:
-            fused_pre_hits = _fuse_bank_entries(
-                bank_entries=previous_bank_entries,
-                node_registry=node_registry,
-                topk=10,
-                rrf_k=max(1, int(getattr(hp, "ROUND3_RRF_K", 60) or 60)),
-                blocked_leaf_indices=None,
-                allowed_leaf_indices=None,
-            )
-            if fused_pre_hits:
-                # Intent: fused-memory mode rewrites against prior official evidence rather than fresh local retrieval.
-                pre_hits = list(fused_pre_hits)
-                pre_hit_source = "fusion_bank:rrf:prev_iters"
-            else:
-                pre_hit_source = "fusion_bank_empty_after_fuse_fallback_local"
-        elif round5_fused_memory:
-            pre_hit_source = "fusion_bank_empty_fallback_local"
-
         pre_hit_paths = [tuple(hit.path) for hit in pre_hits]
         pre_hit_doc_ids = _paths_to_ranked_doc_ids(pre_hit_paths, path_to_doc_id)
         leaf_descs = _hits_to_context_descs(
             pre_hits,
             node_registry,
-            topk=(10 if round5_fused_memory else hp.REWRITE_CONTEXT_TOPK),
+            topk=hp.REWRITE_CONTEXT_TOPK,
             max_desc_len=hp.MAX_DOC_DESC_CHAR_LEN,
         )
         selected_before = _selected_branch_paths_from_sample(sample)
@@ -1546,23 +1418,14 @@ for iter_idx in range(hp.NUM_ITERS):
             # Intent: persist rewrite-time retrieval evidence (query_pre) for off-branch/noise attribution analysis.
             "pre_hit_paths": [list(p) for p in pre_hit_paths],
             "pre_hit_doc_ids": list(pre_hit_doc_ids),
-            "pre_hit_local_paths": [list(p) for p in local_pre_hit_paths],
-            "pre_hit_local_doc_ids": list(local_pre_hit_doc_ids),
-            "pre_hit_source": str(pre_hit_source),
-            "fusion_bank_prev_size": int(len(previous_bank_entries)),
             "eval_paths": [],
             "eval_doc_ids": [],
-            "active_eval_paths": [],
-            "active_eval_doc_ids": [],
             "selected_categories": [],
             "category_prompt": "",
             "category_raw_output": "",
             "category_history": category_history_text,
             "leaf_cluster_triggered": bool(leaf_cluster_triggered),
             "stability_hint": stability_hint,
-            "current_run_metrics": {},
-            "active_eval_metrics": {},
-            "fusion_bank_runs": [],
         }
 
         if round5_mode == "category":
@@ -1800,59 +1663,19 @@ for iter_idx in range(hp.NUM_ITERS):
         eval_paths = [tuple(hit.path) for hit in eval_hits]
         eval_doc_ids = _paths_to_ranked_doc_ids(eval_paths, path_to_doc_id)
         gold_doc_ids = [str(x) for x in sample.gold_doc_ids]
-        current_run_bank_entry = _bank_entry_from_hits(
-            hits=eval_hits,
-            gold_doc_ids=gold_doc_ids,
-            path_to_doc_id=path_to_doc_id,
-            iter_idx=iter_idx,
-            query_post=query_post,
+        retrieval_rows.append(
+            {
+                "nDCG@10": compute_ndcg(eval_doc_ids[:10], gold_doc_ids, k=10) * 100,
+                "Recall@10": compute_recall(eval_doc_ids[:10], gold_doc_ids, k=10) * 100,
+                "Recall@100": compute_recall(eval_doc_ids[:100], gold_doc_ids, k=100) * 100,
+                "Recall@all": compute_recall(eval_doc_ids, gold_doc_ids, k=len(eval_doc_ids)) * 100,
+                "Coverage": float(len(eval_doc_ids)),
+            }
         )
-        current_run_metrics = _compute_retrieval_metrics(eval_doc_ids, gold_doc_ids)
-        active_eval_hits = list(eval_hits)
-        active_eval_doc_ids = list(eval_doc_ids)
-        active_eval_metrics = dict(current_run_metrics)
-        if round5_fused_memory:
-            fused_hits = _fuse_bank_entries(
-                bank_entries=list(getattr(sample, "round5_fusion_bank_all_iters", []) or []) + [current_run_bank_entry],
-                node_registry=node_registry,
-                topk=max(1, int(hp.FLAT_TOPK)),
-                rrf_k=max(1, int(getattr(hp, "ROUND3_RRF_K", 60) or 60)),
-                blocked_leaf_indices=None,
-                allowed_leaf_indices=None,
-            )
-            fused_doc_ids = _paths_to_ranked_doc_ids([tuple(hit.path) for hit in fused_hits], path_to_doc_id)
-            active_eval_hits = list(fused_hits)
-            active_eval_doc_ids = list(fused_doc_ids)
-            active_eval_metrics = _compute_retrieval_metrics(fused_doc_ids, gold_doc_ids)
-            retrieval_rows.append(
-                {
-                    "nDCG@10": float(active_eval_metrics["nDCG@10"]),
-                    "nDCG@10_iter": float(current_run_metrics["nDCG@10"]),
-                    "Recall@10": float(current_run_metrics["Recall@10"]),
-                    "Recall@100": float(current_run_metrics["Recall@100"]),
-                    "Recall@all": float(current_run_metrics["Recall@all"]),
-                    "Coverage": float(current_run_metrics["Coverage"]),
-                }
-            )
-        else:
-            retrieval_rows.append(
-                {
-                    "nDCG@10": float(current_run_metrics["nDCG@10"]),
-                    "Recall@10": float(current_run_metrics["Recall@10"]),
-                    "Recall@100": float(current_run_metrics["Recall@100"]),
-                    "Recall@all": float(current_run_metrics["Recall@all"]),
-                    "Coverage": float(current_run_metrics["Coverage"]),
-                }
-            )
         info["cumulative_pool_eval_size"] = int(len(cumulative_pool_eval))
         info["eval_paths"] = [list(p) for p in eval_paths]
         info["eval_doc_ids"] = list(eval_doc_ids)
-        info["active_eval_paths"] = [list(tuple(hit.path)) for hit in active_eval_hits] if active_eval_hits else list(info.get("eval_paths", []))
-        info["active_eval_doc_ids"] = list(active_eval_doc_ids)
         info["gold_doc_ids"] = list(gold_doc_ids)
-        info["current_run_bank_entry"] = current_run_bank_entry
-        info["current_run_metrics"] = {str(k): float(v) for k, v in current_run_metrics.items()}
-        info["active_eval_metrics"] = {str(k): float(v) for k, v in active_eval_metrics.items()}
         sample.rewrite_history.append(
             {
                 "iter": iter_idx,
@@ -1908,16 +1731,13 @@ for iter_idx in range(hp.NUM_ITERS):
 
     selected_before_by_idx: Dict[int, List[Tuple[int, ...]]] = {}
     selector_pick_reason_by_idx: Dict[int, str] = {}
-    selector_source_by_idx: Dict[int, str] = {}
     selector_candidate_paths_by_idx: Dict[int, List[Tuple[int, ...]]] = {}
     selector_scored_rows_by_idx: Dict[int, List[Dict[str, Any]]] = {}
     for sample_idx, sample in enumerate(all_eval_samples):
-        info = rewrite_state_by_sample_idx[sample_idx]
         selected_before = _selected_branch_paths_from_sample(sample)
         selected_before_by_idx[sample_idx] = selected_before
         sample.update(slates[sample_idx], response_jsons[sample_idx], rel_fn=sample.get_rel_fn())
         selector_pick_reason = "retriever_slate_default"
-        selector_source = "retriever_slate"
         selector_candidate_paths: List[Tuple[int, ...]] = []
         selector_scored_rows: List[Dict[str, Any]] = []
         if round5_selector_mode in {"maxscore_global", "meanscore_global", "max_hit_global"}:
@@ -1946,36 +1766,14 @@ for iter_idx in range(hp.NUM_ITERS):
                     or sample.query
                     or getattr(sample, "original_query", "")
                 )
-                if round5_fused_memory:
-                    selector_source = "fusion_bank:rrf:prev_iters"
-                    selector_local_hits = _fuse_bank_entries(
-                        bank_entries=list(getattr(sample, "round5_fusion_bank_all_iters", []) or []),
-                        node_registry=node_registry,
-                        topk=round5_mrr_pool_k,
-                        rrf_k=max(1, int(getattr(hp, "ROUND3_RRF_K", 60) or 60)),
-                        blocked_leaf_indices=None,
-                        allowed_leaf_indices=set(selector_local_pool),
-                    )
-                    if not selector_local_hits:
-                        selector_source = "current_local_retrieval_fallback"
-                        selector_local_hits = _retrieve_leaf_hits(
-                            query=selector_query,
-                            leaf_pool_indices=selector_local_pool,
-                            retriever=retriever,
-                            node_embs=node_embs,
-                            node_registry=node_registry,
-                            topk=round5_mrr_pool_k,
-                        )
-                else:
-                    selector_source = "current_local_retrieval"
-                    selector_local_hits = _retrieve_leaf_hits(
-                        query=selector_query,
-                        leaf_pool_indices=selector_local_pool,
-                        retriever=retriever,
-                        node_embs=node_embs,
-                        node_registry=node_registry,
-                        topk=round5_mrr_pool_k,
-                    )
+                selector_local_hits = _retrieve_leaf_hits(
+                    query=selector_query,
+                    leaf_pool_indices=selector_local_pool,
+                    retriever=retriever,
+                    node_embs=node_embs,
+                    node_registry=node_registry,
+                    topk=round5_mrr_pool_k,
+                )
                 if not selector_local_hits:
                     selector_pick_reason = "no_local_hits"
                 else:
@@ -2033,7 +1831,6 @@ for iter_idx in range(hp.NUM_ITERS):
                                 else f"{round5_selector_mode}_applied_partial_fill"
                             )
         selector_pick_reason_by_idx[sample_idx] = selector_pick_reason
-        selector_source_by_idx[sample_idx] = selector_source
         selector_candidate_paths_by_idx[sample_idx] = selector_candidate_paths
         selector_scored_rows_by_idx[sample_idx] = [
             {
@@ -2053,12 +1850,6 @@ for iter_idx in range(hp.NUM_ITERS):
             ridx = int(getattr(node, "registry_idx", -1))
             if ridx >= 0:
                 cumulative_leaf_indices_by_sample[sample_idx].add(ridx)
-        if round5_fused_memory and info.get("current_run_bank_entry"):
-            # Intent: append the completed current run only after branch selection so selector sees previous-bank memory only.
-            sample.round5_fusion_bank_all_iters.append(dict(info.get("current_run_bank_entry", {})))
-        info["fusion_bank_runs"] = _summarize_bank_entries(
-            list(getattr(sample, "round5_fusion_bank_all_iters", []) or [])
-        )
 
     iter_df = pd.DataFrame(retrieval_rows)
     branch_metric_df = _compute_branch_metrics_from_samples(all_eval_samples)
@@ -2087,7 +1878,7 @@ for iter_idx in range(hp.NUM_ITERS):
                 "query_pre": str(info.get("query_pre", "")),
                 "query_post": str(info.get("query_post", "")),
                 "rewrite": str(info.get("rewrite", "")),
-                "rewrite_context_topk": int(10 if round5_fused_memory else hp.REWRITE_CONTEXT_TOPK),
+                "rewrite_context_topk": int(hp.REWRITE_CONTEXT_TOPK),
                 "rewrite_leaf_descs_count": int(len(info.get("leaf_descs", []))),
                 "rewrite_branch_descs_count": int(len(info.get("branch_descs", []))),
                 "possible_answer_docs": info.get("rewrite_docs", {}),
@@ -2097,28 +1888,16 @@ for iter_idx in range(hp.NUM_ITERS):
                 "selected_branches_before": [list(p) for p in selected_before_by_idx.get(sample_idx, [])],
                 "selected_branches_after": [list(p) for p in selected_after],
                 "selector_mode": round5_selector_mode,
-                "selector_source": str(selector_source_by_idx.get(sample_idx, "retriever_slate")),
                 "selector_pick_reason": str(selector_pick_reason_by_idx.get(sample_idx, "retriever_slate_default")),
                 "selector_candidate_branch_count": int(len(selector_candidate_paths_by_idx.get(sample_idx, []))),
                 "selector_scored_top": selector_scored_rows_by_idx.get(sample_idx, []),
                 "candidate_branch_count": int(sum(len(x) for x in slates[sample_idx])) if sample_idx < len(slates) else 0,
                 "cumulative_pool_pre_size": int(info.get("cumulative_pool_pre_size", 0)),
                 "cumulative_pool_eval_size": int(info.get("cumulative_pool_eval_size", 0)),
-                "pre_hit_source": str(info.get("pre_hit_source", "")),
                 "pre_hit_paths": info.get("pre_hit_paths", []),
                 "pre_hit_doc_ids": info.get("pre_hit_doc_ids", []),
-                "pre_hit_local_paths": info.get("pre_hit_local_paths", []),
-                "pre_hit_local_doc_ids": info.get("pre_hit_local_doc_ids", []),
                 "local_paths": info.get("eval_paths", []),
                 "local_doc_ids": info.get("eval_doc_ids", []),
-                "active_eval_paths": info.get("active_eval_paths", []),
-                "active_eval_doc_ids": info.get("active_eval_doc_ids", []),
-                "current_run_metrics": info.get("current_run_metrics", {}),
-                "active_eval_metrics": info.get("active_eval_metrics", {}),
-                "fusion_mode_active": "rrf" if round5_fused_memory else "",
-                "fusion_bank_size": int(len(info.get("fusion_bank_runs", []))),
-                "fusion_bank_source_iters": [int(x.get("iter", -1)) for x in info.get("fusion_bank_runs", [])],
-                "fusion_bank_runs": info.get("fusion_bank_runs", []),
                 "gold_doc_ids": info.get("gold_doc_ids", []),
                 "metrics": metrics,
             }
@@ -2127,29 +1906,16 @@ for iter_idx in range(hp.NUM_ITERS):
     all_eval_metric_dfs.append(iter_df)
 
     if not iter_df.empty:
-        if round5_fused_memory and ("nDCG@10_iter" in iter_df.columns):
-            logger.info(
-                "Iter %d | nDCG@10=%.2f | nDCG@10_iter=%.2f | Recall@100=%.2f | Coverage=%.2f | BranchHit@B=%.2f | BranchPrecision@B=%.2f | NumSelectedBranches=%.2f",
-                iter_idx,
-                float(iter_df["nDCG@10"].mean()),
-                float(iter_df["nDCG@10_iter"].mean()),
-                float(iter_df["Recall@100"].mean()),
-                float(iter_df["Coverage"].mean()),
-                float(iter_df["BranchHit@B"].mean()),
-                float(iter_df["BranchPrecision@B"].mean()),
-                float(iter_df["NumSelectedBranches"].mean()),
-            )
-        else:
-            logger.info(
-                "Iter %d | nDCG@10=%.2f | Recall@100=%.2f | Coverage=%.2f | BranchHit@B=%.2f | BranchPrecision@B=%.2f | NumSelectedBranches=%.2f",
-                iter_idx,
-                float(iter_df["nDCG@10"].mean()),
-                float(iter_df["Recall@100"].mean()),
-                float(iter_df["Coverage"].mean()),
-                float(iter_df["BranchHit@B"].mean()),
-                float(iter_df["BranchPrecision@B"].mean()),
-                float(iter_df["NumSelectedBranches"].mean()),
-            )
+        logger.info(
+            "Iter %d | nDCG@10=%.2f | Recall@100=%.2f | Coverage=%.2f | BranchHit@B=%.2f | BranchPrecision@B=%.2f | NumSelectedBranches=%.2f",
+            iter_idx,
+            float(iter_df["nDCG@10"].mean()),
+            float(iter_df["Recall@100"].mean()),
+            float(iter_df["Coverage"].mean()),
+            float(iter_df["BranchHit@B"].mean()),
+            float(iter_df["BranchPrecision@B"].mean()),
+            float(iter_df["NumSelectedBranches"].mean()),
+        )
     else:
         logger.info("Iter %d | no rows", iter_idx)
 

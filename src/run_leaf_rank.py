@@ -22,6 +22,7 @@ from utils import (
     compute_recall,
     get_all_leaf_nodes_with_path,
     get_node_id,
+    resolve_node_emb_registry_indices,
     setup_logger,
 )
 
@@ -198,13 +199,6 @@ tree_dict = pkl.load(open(f"{BASE_DIR}/trees/{hp.DATASET}/{hp.SUBSET}/tree-{hp.T
 semantic_root_node = SemanticNode().load_dict(tree_dict) if isinstance(tree_dict, dict) else tree_dict
 full_node_registry = compute_node_registry(semantic_root_node)
 node_registry = full_node_registry
-leaf_registry_indices = None
-if hp.LEAF_ONLY_RETRIEVAL:
-    leaf_registry_indices = [
-        idx for idx, node in enumerate(full_node_registry)
-        if (not node.child) or (len(node.child) == 0)
-    ]
-    node_registry = [full_node_registry[idx] for idx in leaf_registry_indices]
 all_leaf_nodes = get_all_leaf_nodes_with_path(semantic_root_node)
 doc_id_to_path = {get_node_id(leaf.id, docs_df): path for leaf, path in all_leaf_nodes}
 path_to_doc_id = {tuple(path): str(doc_id) for doc_id, path in doc_id_to_path.items()}
@@ -263,12 +257,26 @@ if hp.REWRITE_CACHE_PATH and os.path.exists(hp.REWRITE_CACHE_PATH) and (not hp.R
 from retrievers.diver import DiverEmbeddingModel
 
 node_embs = np.load(hp.NODE_EMB_PATH, allow_pickle=False)
+emb_registry_indices = resolve_node_emb_registry_indices(full_node_registry, int(node_embs.shape[0]))
 if node_embs.shape[0] != len(full_node_registry):
-    raise ValueError(f"node_embs rows ({node_embs.shape[0]}) must match node_registry size ({len(full_node_registry)})")
+    logger.warning(
+        "Resolved node embedding row mismatch via legacy registry alignment: emb_rows=%d registry_rows=%d",
+        int(node_embs.shape[0]),
+        len(full_node_registry),
+    )
+aligned_node_registry = [full_node_registry[int(idx)] for idx in emb_registry_indices.tolist()]
 if hp.LEAF_ONLY_RETRIEVAL:
-    if not leaf_registry_indices:
+    leaf_row_indices = [
+        row_idx for row_idx, node in enumerate(aligned_node_registry)
+        if (not node.child) or (len(node.child) == 0)
+    ]
+    if not leaf_row_indices:
         raise ValueError("leaf-only retrieval requested but no leaf nodes were found.")
-    node_embs = node_embs[leaf_registry_indices]
+    # Intent: keep row-to-node alignment stable even when legacy embeddings skipped blank-description nodes.
+    node_embs = node_embs[leaf_row_indices]
+    node_registry = [aligned_node_registry[row_idx] for row_idx in leaf_row_indices]
+else:
+    node_registry = aligned_node_registry
 retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
 
 samples = []

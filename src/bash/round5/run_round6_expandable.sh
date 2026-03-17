@@ -1,23 +1,20 @@
 #!/bin/bash
 
 mkdir -p ../logs
-LOG_FILE="../logs/run_round6_$(date '+%Y_%m_%d').log"
+LOG_FILE="../logs/run_round6_expandable_$(date '+%Y_%m_%d').log"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting run_round6.sh script"
+log "Starting run_round6_expandable.sh script"
 
 RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
 NODE_EMB_BASE="../trees/BRIGHT"
 ROUND5_DISABLE_CALIBRATION="${ROUND5_DISABLE_CALIBRATION:-1}"
-ROUND5_SELECTOR_MODES="${ROUND5_SELECTOR_MODES:-meanscore_global}" # retriever_slate maxscore_global meanscore_global  max_hit_global
-ROUND6_GLOBAL_ESCAPE="${ROUND6_GLOBAL_ESCAPE:-0}"
-ROUND6_GLOBAL_ESCAPE_SLOTS="${ROUND6_GLOBAL_ESCAPE_SLOTS:-2}"
+ROUND5_SELECTOR_MODES="${ROUND5_SELECTOR_MODES:-meanscore_global}" # retriever_slate maxscore_global meanscore_global max_hit_global
+ROUND6_EXPANDABLE_MODE="${ROUND6_EXPANDABLE_MODE:-ended_reseat}"
 ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2}"
-# ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2_rubric}"
-# ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-thinkqe_round3}"
 
 COMMON_PARAMS=(
     --reasoning_in_traversal_prompt -1
@@ -39,24 +36,25 @@ COMMON_PARAMS=(
 )
 
 if [[ "$ROUND5_DISABLE_CALIBRATION" == "1" ]]; then
-    # Intent: default to retriever-score-only branch logic in round5 legacy runs.
+    # Intent: default to retriever-score-only branch logic in the expandable reseat ablation.
     COMMON_PARAMS+=(--disable_calibration)
 fi
 
 RUN_SUBSETS=(
-    "biology"
-    "psychology"
-    "economics"
-    "earth_science"
-    "robotics"
-    "sustainable_living"
-    "stackoverflow"
-    "theoremqa_questions"
-    "theoremqa_theorems"
-    "pony"
+    # "biology"
+    # "psychology"
+    # "economics"
+    # "earth_science"
+    # "robotics"
+    # "sustainable_living"
+    # "stackoverflow"
+    # "theoremqa_questions"
+    # "theoremqa_theorems"
+    # "pony"
+    "aops"
+    "leetcode"
 )
 
-# subset -> tree_version
 declare -A TREE_VERSION_MAP=(
     ["aops"]="top-down"
     ["biology"]="bottom-up"
@@ -74,7 +72,6 @@ declare -A TREE_VERSION_MAP=(
 
 QUERY_SOURCES=(
     "original"
-    # "gpt4"
 )
 
 read -r -a SELECTOR_MODES <<< "$ROUND5_SELECTOR_MODES"
@@ -93,12 +90,8 @@ for selector_mode in "${SELECTOR_MODES[@]}"; do
                 exit 1
             fi
 
-            # Intent: append selector mode to suffix so each selector run remains clearly separable in logs/results.
-            suffix="round6_mrr_selector_accum_${selector_mode}"
-            if [[ "$ROUND6_GLOBAL_ESCAPE" == "1" ]]; then
-                # Intent: tag method1 runs explicitly so global-escape results are separable from local-only runs.
-                suffix="${suffix}_gescape${ROUND6_GLOBAL_ESCAPE_SLOTS}"
-            fi
+            # Intent: keep the ended-beam reseat ablation in result paths separate from both round6 legacy and method2 runs.
+            suffix="round6_mrr_selector_accum_${selector_mode}_expandable_${ROUND6_EXPANDABLE_MODE}"
 
             final_args=()
             i=0
@@ -114,17 +107,14 @@ for selector_mode in "${SELECTOR_MODES[@]}"; do
             done
 
             final_args+=("--round5_selector_mode" "$selector_mode")
+            final_args+=("--round6_expandable_mode" "$ROUND6_EXPANDABLE_MODE")
             final_args+=("--subset" "$subset")
             final_args+=("--tree_version" "$tree_version")
             final_args+=("--node_emb_path" "$NODE_EMB_PATH")
             final_args+=("--query_source" "$query_source")
             final_args+=("--suffix" "$suffix")
-            if [[ "$ROUND6_GLOBAL_ESCAPE" == "1" ]]; then
-                final_args+=("--round6_global_escape")
-                final_args+=("--round6_global_escape_slots" "$ROUND6_GLOBAL_ESCAPE_SLOTS")
-            fi
             if [[ -n "$ROUND5_REWRITE_PROMPT_NAME" ]]; then
-                # Intent: expose rewrite prompt override without changing default legacy behavior.
+                # Intent: expose the rewrite prompt override while keeping the ablation focused on beam replacement only.
                 final_args+=("--rewrite_prompt_name" "$ROUND5_REWRITE_PROMPT_NAME")
             fi
 

@@ -133,6 +133,26 @@ def _load_leaf_metrics(metrics_path: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _extract_last_ndcg(grouped: pd.Series) -> Tuple[Optional[float], Optional[int]]:
+    if grouped.empty:
+        return None, None
+    last_iter = int(grouped.index.max())
+    return float(grouped.loc[last_iter]), last_iter
+
+
+def _extract_max_ndcg(grouped: pd.Series) -> Tuple[Optional[float], Optional[int]]:
+    if grouped.empty:
+        return None, None
+    max_iter = int(grouped.idxmax())
+    return float(grouped.loc[max_iter]), max_iter
+
+
+def _round_or_none(value: Optional[float], digits: int = 2) -> Optional[float]:
+    if value is None:
+        return None
+    return round(value, digits)
+
+
 def collect_ndcg_results(
     base_dir: str,
     drop_map: Dict[str, str],
@@ -153,14 +173,14 @@ def collect_ndcg_results(
         grouped = df.groupby("iter")["nDCG@10"].mean()
         if grouped.empty:
             continue
-        iter0 = float(grouped.loc[0]) if 0 in grouped.index else None
-        max_iter = int(grouped.idxmax())
-        max_ndcg = float(grouped.loc[max_iter])
+        # Intent: mirror the main collector by reporting the terminal leaf-ranking score, not the initial iteration score.
+        end_ndcg, _end_iter = _extract_last_ndcg(grouped)
+        max_ndcg, max_iter = _extract_max_ndcg(grouped)
         records.append({
             "category": category,
             "experiment": exp_id,
-            "ndcg_iter0": round(iter0, 2) if iter0 is not None else None,
-            "ndcg_max": round(max_ndcg, 2),
+            "ndcg_end": _round_or_none(end_ndcg),
+            "ndcg_max": _round_or_none(max_ndcg),
             "ndcg_max_iter": max_iter,
         })
     return pd.DataFrame(records)
@@ -172,16 +192,46 @@ def _format_wide_results(df: pd.DataFrame) -> pd.DataFrame:
     wide = df.pivot_table(
         index="experiment",
         columns="category",
-        values=["ndcg_iter0", "ndcg_max", "ndcg_max_iter"],
+        values=["ndcg_end", "ndcg_max", "ndcg_max_iter"],
         aggfunc="first",
     )
     ordered_categories = [cat for cat in categories if cat in df["category"].unique()]
-    metric_order = ["ndcg_iter0", "ndcg_max", "ndcg_max_iter"]
+    metric_order = ["ndcg_end", "ndcg_max", "ndcg_max_iter"]
     wide = wide.reindex(columns=pd.MultiIndex.from_product([metric_order, ordered_categories]))
     wide.columns = pd.MultiIndex.from_tuples([(cat, metric) for metric, cat in wide.columns])
     wide = wide.sort_index(axis=1, level=[0, 1], sort_remaining=False)
     wide = wide.reset_index()
     return wide
+
+
+def _append_ndcg_mean_columns(wide_df: pd.DataFrame) -> pd.DataFrame:
+    if wide_df.empty:
+        return wide_df
+    ndcg_end_cols: List[object] = []
+    ndcg_max_cols: List[object] = []
+    for col in wide_df.columns:
+        if isinstance(col, tuple):
+            metric_name = col[1] if len(col) > 1 else ""
+        else:
+            metric_name = str(col)
+        if metric_name == "ndcg_end":
+            ndcg_end_cols.append(col)
+        if metric_name == "ndcg_max":
+            ndcg_max_cols.append(col)
+
+    out_df = wide_df.copy()
+    # Intent: keep the leaf summary aligned with the main collector's experiment-level terminal/max averages.
+    if ndcg_end_cols:
+        ndcg_end_vals = out_df[ndcg_end_cols].apply(pd.to_numeric, errors="coerce")
+        out_df[("overall", "avg_ndcg_end")] = ndcg_end_vals.mean(axis=1)
+    else:
+        out_df[("overall", "avg_ndcg_end")] = pd.NA
+    if ndcg_max_cols:
+        ndcg_max_vals = out_df[ndcg_max_cols].apply(pd.to_numeric, errors="coerce")
+        out_df[("overall", "avg_ndcg_max")] = ndcg_max_vals.mean(axis=1)
+    else:
+        out_df[("overall", "avg_ndcg_max")] = pd.NA
+    return out_df
 
 # python scripts/collect_ndcg_results_leaf.py --include_dir *baseline*
 def main() -> None:
@@ -229,7 +279,7 @@ def main() -> None:
     print(f"Collecting leaf-only nDCG@10 results from {base_dir}...")
     drop_map = _build_drop_map(args.drop_param)
     df = collect_ndcg_results(base_dir, drop_map, args.exclude_subdir, args.include_dir)
-    wide_df = _format_wide_results(df)
+    wide_df = _append_ndcg_mean_columns(_format_wide_results(df))
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     wide_df.to_csv(out_csv, index=False)
     print(f"Wrote {len(wide_df)} rows to {out_csv}")

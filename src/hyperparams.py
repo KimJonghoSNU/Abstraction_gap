@@ -143,6 +143,36 @@ class HyperParams(argparse.Namespace):
         # Intent: keep naming stable when round5 selector top-k uses default depth.
         if int(payload.get('round5_mrr_pool_k', 100) or 100) == 100:
             payload.pop('round5_mrr_pool_k', None)
+        if not bool(payload.get('round5_fused_memory', False)):
+            payload.pop('round5_fused_memory', None)
+        if not bool(payload.get('round6_global_escape', False)):
+            payload.pop('round6_global_escape', None)
+            payload.pop('round6_global_escape_slots', None)
+        elif int(payload.get('round6_global_escape_slots', 2) or 2) == 2:
+            payload.pop('round6_global_escape_slots', None)
+        if str(payload.get('round6_expandable_mode', 'off')).lower() == 'off':
+            payload.pop('round6_expandable_mode', None)
+        if not bool(payload.get('round6_method2', False)):
+            payload.pop('round6_method2', None)
+            payload.pop('round6_method2_mode', None)
+            payload.pop('round6_expandable_pool_freeze_terminal_beam', None)
+            payload.pop('round6_fusion_mode', None)
+            payload.pop('round6_explore_prompt_name', None)
+        else:
+            round6_method2_mode = str(payload.get('round6_method2_mode', 'archive_replace')).lower()
+            if round6_method2_mode == 'archive_replace':
+                payload.pop('round6_expandable_pool_freeze_terminal_beam', None)
+                payload.pop('round6_method2_mode', None)
+                if str(payload.get('round6_fusion_mode', 'rrf')).lower() == 'rrf':
+                    payload.pop('round6_fusion_mode', None)
+                if str(payload.get('round6_explore_prompt_name', 'agent_executor_v1_icl2_explore')).lower() == 'agent_executor_v1_icl2_explore':
+                    payload.pop('round6_explore_prompt_name', None)
+            else:
+                # Intent: expandable_pool uses current retrieval as the official controller, so fusion/prompt args are diagnostic only.
+                if not bool(payload.get('round6_expandable_pool_freeze_terminal_beam', False)):
+                    payload.pop('round6_expandable_pool_freeze_terminal_beam', None)
+                payload.pop('round6_fusion_mode', None)
+                payload.pop('round6_explore_prompt_name', None)
         if not bool(payload.get('disable_calibration', False)):
             payload.pop('disable_calibration', None)
         if str(payload.get('round5_category_oracle', 'none')).lower() == 'none':
@@ -300,6 +330,68 @@ class HyperParams(argparse.Namespace):
             help='Top-K local leaf retrieval size used to score branch candidates for --round5_selector_mode=maxscore_global|meanscore_global|max_hit_global',
         )
         parser.add_argument(
+            '--round6_global_escape',
+            default=False,
+            action='store_true',
+            help='Enable method1 global-escape branch replacement on top of score-based round6 selector modes',
+        )
+        parser.add_argument(
+            '--round6_global_escape_slots',
+            type=int,
+            default=2,
+            help='Number of beam slots reserved for conditional global-escape replacement in round6 method1',
+        )
+        parser.add_argument(
+            '--round6_expandable_mode',
+            type=str,
+            default='off',
+            choices=['off', 'ended_reseat'],
+            help=(
+                'Round6 expandable-beam ablation mode: '
+                'off=disable expandable-beam ablations; '
+                'ended_reseat=keep legacy rewrite flow but replace only locally ended beam slots using retrieval-scored leftover expandable paths'
+            ),
+        )
+        parser.add_argument(
+            '--round6_method2',
+            default=False,
+            action='store_true',
+            help='Enable method2 archive-conditioned explore step with fusion-memory controller in round6',
+        )
+        parser.add_argument(
+            '--round6_method2_mode',
+            type=str,
+            default='archive_replace',
+            choices=['archive_replace', 'expandable_pool'],
+            help=(
+                'Method2 explore semantics in round6: '
+                'archive_replace=return to archived sibling states and replace the live beam; '
+                'expandable_pool=keep normal prompt/query flow but widen rewrite/selector pool to all current expandable paths'
+            ),
+        )
+        parser.add_argument(
+            '--round6_expandable_pool_freeze_terminal_beam',
+            default=False,
+            action='store_true',
+            help=(
+                'Only for --round6_method2_mode=expandable_pool: when the current beam has no direct non-leaf child branches, '
+                'process the leaf slates once but do not reseat the beam to other remaining expandable paths'
+            ),
+        )
+        parser.add_argument(
+            '--round6_fusion_mode',
+            type=str,
+            default='rrf',
+            choices=['rrf', 'max_score', 'sum_score'],
+            help='Active fusion mode for method2 controller and final ranking diagnostics',
+        )
+        parser.add_argument(
+            '--round6_explore_prompt_name',
+            type=str,
+            default='agent_executor_v1_icl2_explore',
+            help='Rewrite prompt used only on method2 explore steps',
+        )
+        parser.add_argument(
             '--round5_mode',
             type=str,
             default='legacy',
@@ -352,6 +444,17 @@ class HyperParams(argparse.Namespace):
                 'none=use selected beam branches; '
                 'gold_branch_v1=use gold branches from candidate child branches when available; '
                 'gold_branch_v2=use gold branches within current selected branches when available'
+            ),
+        )
+        parser.add_argument(
+            '--round5_fused_memory',
+            default=False,
+            action='store_true',
+            help=(
+                'Enable fused-memory mode in run_round5.py: '
+                'official nDCG@10 uses previous-bank RRF fusion, '
+                'next rewrite evidence uses previous-bank fused top documents, '
+                'and this mode is valid only with score-based round5 selectors'
             ),
         )
         parser.add_argument('--round3_rrf_k', type=int, default=60, help='RRF k for fusing local/global ranked lists')

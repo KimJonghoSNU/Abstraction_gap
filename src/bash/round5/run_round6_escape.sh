@@ -13,8 +13,8 @@ RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
 NODE_EMB_BASE="../trees/BRIGHT"
 ROUND5_DISABLE_CALIBRATION="${ROUND5_DISABLE_CALIBRATION:-1}"
 ROUND5_SELECTOR_MODES="${ROUND5_SELECTOR_MODES:-meanscore_global}" # retriever_slate maxscore_global meanscore_global  max_hit_global
-ROUND6_GLOBAL_ESCAPE="${ROUND6_GLOBAL_ESCAPE:-0}"
-ROUND6_GLOBAL_ESCAPE_SLOTS="${ROUND6_GLOBAL_ESCAPE_SLOTS:-2}"
+ROUND6_GLOBAL_ESCAPE="${ROUND6_GLOBAL_ESCAPE:-1}"
+ROUND6_GLOBAL_ESCAPE_SLOTS="${ROUND6_GLOBAL_ESCAPE_SLOTS:-5}"
 ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2}"
 # ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2_rubric}"
 # ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-thinkqe_round3}"
@@ -49,11 +49,11 @@ RUN_SUBSETS=(
     "economics"
     "earth_science"
     "robotics"
-    "sustainable_living"
-    "stackoverflow"
-    "theoremqa_questions"
-    "theoremqa_theorems"
-    "pony"
+    # "sustainable_living"
+    # "stackoverflow"
+    # "theoremqa_questions"
+    # "theoremqa_theorems"
+    # "pony"
 )
 
 # subset -> tree_version

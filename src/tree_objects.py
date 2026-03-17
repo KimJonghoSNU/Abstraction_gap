@@ -603,6 +603,12 @@ class InferSample(object):
     self.update_next_beam_states(rel_fn)
     self.num_iters += 1
 
+  def update_keep_beam(self, beam_slates, beam_response_jsons):
+    # Intent: consume the current beam's slate once without jumping to unrelated expandable paths.
+    self.process_beam_response_jsons(beam_slates, beam_response_jsons)
+    self.beam_state_paths_history.append(self.beam_state_paths)
+    self.num_iters += 1
+
   def get_expandable_paths_rerank_prompts(self, rel_fn = None):
     rel_fn = rel_fn or self.get_rel_fn()
     all_expandable_paths = self.get_all_expandable_paths(self.prediction_tree)

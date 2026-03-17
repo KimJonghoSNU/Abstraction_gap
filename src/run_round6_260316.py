@@ -27,7 +27,6 @@ from utils import (
     compute_recall,
     get_node_id,
     normalize_embeddings,
-    pad_node_embeddings_to_registry,
     save_exp,
     setup_logger,
 )
@@ -1531,16 +1530,9 @@ if hp.NODE_EMB_PATH:
         logger.warning("node_emb_path not found: %s; fallback to on-the-fly encoding", hp.NODE_EMB_PATH)
     else:
         loaded = np.load(hp.NODE_EMB_PATH, allow_pickle=False)
-        try:
-            aligned = pad_node_embeddings_to_registry(loaded, node_registry)
-            node_embs = normalize_embeddings(aligned)
-            if loaded.shape[0] != len(node_registry):
-                logger.warning(
-                    "Resolved node_emb row mismatch via legacy blank-desc padding (got=%d expected=%d)",
-                    loaded.shape[0],
-                    len(node_registry),
-                )
-        except ValueError:
+        if loaded.shape[0] == len(node_registry):
+            node_embs = normalize_embeddings(loaded)
+        else:
             logger.warning(
                 "node_emb rows mismatch (got=%d expected=%d); fallback to on-the-fly encoding",
                 loaded.shape[0],

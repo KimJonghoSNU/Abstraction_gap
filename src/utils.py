@@ -26,6 +26,44 @@ def normalize_embeddings(embs: np.ndarray) -> np.ndarray:
     embs /= norms
     return embs
 
+
+def resolve_node_emb_registry_indices(node_registry, num_emb_rows: int) -> np.ndarray:
+    num_registry = len(node_registry)
+    if num_emb_rows == num_registry:
+        return np.arange(num_registry, dtype=np.int64)
+
+    non_empty_desc_indices = np.array(
+        [idx for idx, node in enumerate(node_registry) if str(getattr(node, "desc", "") or "").strip()],
+        dtype=np.int64,
+    )
+    if num_emb_rows == int(non_empty_desc_indices.shape[0]):
+        # Intent: preserve alignment for legacy embedding exports that silently dropped blank descriptions.
+        return non_empty_desc_indices
+
+    if num_emb_rows == (num_registry - 1):
+        first_path = tuple(getattr(node_registry[0], "path", ()) or ())
+        if len(first_path) == 0:
+            return np.arange(1, num_registry, dtype=np.int64)
+
+    raise ValueError(
+        f"Cannot align embeddings to registry: emb_rows={num_emb_rows}, "
+        f"registry_rows={num_registry}, non_empty_desc_rows={int(non_empty_desc_indices.shape[0])}"
+    )
+
+
+def pad_node_embeddings_to_registry(node_embs: np.ndarray, node_registry) -> np.ndarray:
+    emb_registry_indices = resolve_node_emb_registry_indices(node_registry, int(node_embs.shape[0]))
+    if int(emb_registry_indices.shape[0]) == len(node_registry):
+        return node_embs.astype(np.float32, copy=False)
+
+    if node_embs.ndim != 2:
+        raise ValueError(f"node_embs must be 2D, got shape={node_embs.shape}")
+
+    padded = np.zeros((len(node_registry), node_embs.shape[1]), dtype=np.float32)
+    # Intent: preserve full registry indexing when legacy embedding exports skipped blank-description nodes.
+    padded[emb_registry_indices] = node_embs.astype(np.float32, copy=False)
+    return padded
+
 #region Eval metric functions
 def compute_ndcg(sorted_preds: list, gold: list, k: int = 10) -> float:
     if not sorted_preds or not gold:

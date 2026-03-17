@@ -13,8 +13,9 @@ RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
 NODE_EMB_BASE="../trees/BRIGHT"
 ROUND5_DISABLE_CALIBRATION="${ROUND5_DISABLE_CALIBRATION:-1}"
 ROUND5_SELECTOR_MODES="${ROUND5_SELECTOR_MODES:-meanscore_global}" # retriever_slate maxscore_global meanscore_global  max_hit_global
-# ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2}"
-ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-thinkqe_round3}"
+ROUND5_FUSED_MEMORY="${ROUND5_FUSED_MEMORY:-0}"
+ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2}"
+# ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-thinkqe_round3}"
 
 COMMON_PARAMS=(
     --reasoning_in_traversal_prompt -1
@@ -41,11 +42,11 @@ if [[ "$ROUND5_DISABLE_CALIBRATION" == "1" ]]; then
 fi
 
 RUN_SUBSETS=(
-    "biology"
-    "psychology"
-    "economics"
-    "earth_science"
-    "robotics"
+    # "biology"
+    # "psychology"
+    # "economics"
+    # "earth_science"
+    # "robotics"
     "sustainable_living"
     "stackoverflow"
     "theoremqa_questions"
@@ -92,6 +93,10 @@ for selector_mode in "${SELECTOR_MODES[@]}"; do
 
             # Intent: append selector mode to suffix so each selector run remains clearly separable in logs/results.
             suffix="round5_mrr_selector_accum_${selector_mode}"
+            if [[ "$ROUND5_FUSED_MEMORY" == "1" ]]; then
+                # Intent: keep fused-memory runs in separate result directories from local-only round5 runs.
+                suffix="${suffix}_fused_memory"
+            fi
 
             final_args=()
             i=0
@@ -115,6 +120,9 @@ for selector_mode in "${SELECTOR_MODES[@]}"; do
             if [[ -n "$ROUND5_REWRITE_PROMPT_NAME" ]]; then
                 # Intent: expose rewrite prompt override without changing default legacy behavior.
                 final_args+=("--rewrite_prompt_name" "$ROUND5_REWRITE_PROMPT_NAME")
+            fi
+            if [[ "$ROUND5_FUSED_MEMORY" == "1" ]]; then
+                final_args+=("--round5_fused_memory")
             fi
 
             cmd=( python run_round5.py "${final_args[@]}" )

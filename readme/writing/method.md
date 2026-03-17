@@ -158,7 +158,6 @@ A practical implication is that Step 1 and Step 4 use the same retrieval query a
 
 ## Main-Paper Draft (Merged Retrieval Version)
 
-Below is a paper-facing draft that merges tree-constrained retrieval and post-rewrite retrieval into a single retrieval subsection.
 The intent is to make explicit that both stages use the same retriever, while the query state and reachable pool change with the search state.
 
 ```latex
@@ -223,3 +222,52 @@ This design directly targets the abstraction gap by encouraging the model to sea
 
 At the same time, unconstrained rewriting can generate abstractions that do not correspond to any recoverable corpus concept. Our method mitigates this by conditioning rewriting only on evidence retrieved from the currently reachable tree region.
 ```
+
+## Algorithm Draft (LaTeX)
+
+This version is intended for the main paper and follows the merged retrieval formulation above.
+It uses standard `algorithm` + `algpseudocode` notation.
+
+```latex
+% Requires:
+% \usepackage{algorithm}
+% \usepackage{algpseudocode}
+
+\begin{algorithm}[t]
+\caption{Tree-Constrained Adaptive Retrieval with Grounded Query Rewriting}
+\label{alg:tree_constrained_adaptive_retrieval}
+\begin{algorithmic}[1]
+\Require query $q$, corpus tree $\mathcal{T}$, retriever $\mathrm{Ret}$, rewrite model $f_{\mathrm{rw}}$, beam size $B$, iterations $T$, evidence budget $k$, ranking budget $m$
+\State $r_{-1} \gets \emptyset$
+\State $B_0 \gets \{\mathrm{root}\}$
+\State $\mathcal{L}_{\mathrm{seen}} \gets \emptyset$
+\For{$t = 0$ to $T-1$}
+    \State $(\mathcal{P}^{\mathrm{ctx}}_t, \mathcal{P}^{\mathrm{ret}}_t) \gets \textsc{ReachablePools}(B_t, \mathcal{L}_{\mathrm{seen}}, \mathcal{T})$
+    \If{$t = 0$}
+        \State $u_t \gets q$
+    \Else
+        \State $u_t \gets q \oplus r_{t-1}$
+    \EndIf
+    \State $\mathcal{E}_t \gets \mathrm{Ret}_k(u_t, \mathcal{P}^{\mathrm{ctx}}_t)$
+    \State $r_t \gets f_{\mathrm{rw}}(q, r_{t-1}, \mathcal{E}_t)$
+    \State $\tilde{q}_t \gets q \oplus r_t$
+    \State $\mathcal{H}_t \gets \mathrm{Ret}_m(\tilde{q}_t, \mathcal{P}^{\mathrm{ret}}_t)$
+    \State compute retrieval metrics from $\mathcal{H}_t$
+    \State $\mathcal{C}_t \gets \textsc{Children}(B_t)$
+    \ForAll{$c \in \mathcal{C}_t$}
+        \State $\mathcal{L}(c) \gets \{\ell \in \mathcal{H}_t : \ell \text{ is a descendant of } c\}$
+        \State $s(c) \gets \textsc{BranchScore}(\tilde{q}_t, \mathcal{L}(c))$
+    \EndFor
+    \State $B_{t+1} \gets \textsc{TopB}(\mathcal{C}_t, s, B)$
+    \State $\mathcal{L}_{\mathrm{seen}} \gets \mathcal{L}_{\mathrm{seen}} \cup \mathcal{H}_t$
+\EndFor
+\State \Return $\{\mathcal{H}_t\}_{t=0}^{T-1}$, $\{B_t\}_{t=1}^{T}$, $\{r_t\}_{t=0}^{T-1}$
+\end{algorithmic}
+\end{algorithm}
+```
+
+Notes:
+
+- `\textsc{ReachablePools}` returns all corpus leaves at `t=0`; afterwards it restricts retrieval to the tree region induced by the current beam and the reached leaf set.
+- `\textsc{BranchScore}` can instantiate the selector in the text, e.g. `max` or `mean` over descendant-hit similarities.
+- If space is tight, the metric-computation line can be dropped from the algorithm and left in the main text.

@@ -67,19 +67,31 @@ def _find_metrics_files(base_dir: str, include_dir: Optional[str]) -> List[str]:
     return metrics_files
 
 
-def _extract_ndcg_means(df: pd.DataFrame, iter_idx: int, metric: str) -> Optional[float]:
+def _extract_last_ndcg(
+    df: pd.DataFrame,
+    metric: str,
+    max_iter: Optional[int] = None,
+) -> Tuple[Optional[float], Optional[int]]:
     if hasattr(df.columns, "levels"):
-        iter_key = f"Iter {iter_idx}"
-        if iter_key not in df.columns.levels[0]:
-            return None
-        if metric not in df[iter_key].columns:
-            return None
-        return float(df[iter_key][metric].mean())
-    if iter_idx != 0:
-        return None
+        last_val = None
+        last_iter = None
+        for iter_key in df.columns.levels[0]:
+            if not isinstance(iter_key, str) or not iter_key.startswith("Iter "):
+                continue
+            if metric not in df[iter_key].columns:
+                continue
+            iter_idx = int(iter_key.split("Iter ")[-1])
+            if max_iter is not None and iter_idx >= int(max_iter):
+                continue
+            if last_iter is None or iter_idx > last_iter:
+                last_iter = iter_idx
+                last_val = float(df[iter_key][metric].mean())
+        return last_val, last_iter
+    if max_iter is not None and int(max_iter) <= 0:
+        return None, None
     if metric not in df.columns:
-        return None
-    return float(df[metric].mean())
+        return None, None
+    return float(df[metric].mean()), 0
 
 
 def _extract_max_ndcg(
@@ -109,6 +121,12 @@ def _extract_max_ndcg(
     if metric not in df.columns:
         return None, None
     return float(df[metric].mean()), 0
+
+
+def _round_or_none(value: Optional[float], digits: int = 2) -> Optional[float]:
+    if value is None:
+        return None
+    return round(value, digits)
 
 
 def _build_drop_map(drop_params: List[str]) -> Dict[str, str]:
@@ -177,12 +195,15 @@ def collect_ndcg_results(
             print(f"Warning: Failed to read metrics file: {metrics_path}")
             continue
         category, exp_id = _relative_experiment_id(base_dir, metrics_path, drop_map)
+        # Intent: report the terminal score rather than the initial score while keeping max-score diagnostics.
+        end_ndcg, end_iter_idx = _extract_last_ndcg(df, metric, max_iter=max_iter)
         max_ndcg, max_iter_idx = _extract_max_ndcg(df, metric, max_iter=max_iter)
         records.append({
             "category": category,
             "experiment": exp_id,
-            "ndcg_iter0": round(_extract_ndcg_means(df, 0, metric), 2),
-            "ndcg_max": round(max_ndcg, 2),
+            "ndcg_end": _round_or_none(end_ndcg),
+            # "ndcg_end_iter": end_iter_idx,
+            "ndcg_max": _round_or_none(max_ndcg),
             "ndcg_max_iter": max_iter_idx,
         })
     return pd.DataFrame(records)
@@ -194,11 +215,11 @@ def _format_wide_results(df: pd.DataFrame) -> pd.DataFrame:
     wide = df.pivot_table(
         index="experiment",
         columns="category",
-        values=["ndcg_iter0", "ndcg_max", "ndcg_max_iter"],
+        values=["ndcg_end", "ndcg_max", "ndcg_max_iter"], # "ndcg_end_iter", 
         aggfunc="first",
     )
     ordered_categories = [cat for cat in categories if cat in df["category"].unique()]
-    metric_order = ["ndcg_iter0", "ndcg_max", "ndcg_max_iter"]
+    metric_order = ["ndcg_end", "ndcg_max", "ndcg_max_iter"] # "ndcg_end_iter", 
     wide = wide.reindex(columns=pd.MultiIndex.from_product([metric_order, ordered_categories]))
     wide.columns = pd.MultiIndex.from_tuples([(cat, metric) for metric, cat in wide.columns])
     wide = wide.sort_index(axis=1, level=[0, 1], sort_remaining=False)
@@ -206,22 +227,30 @@ def _format_wide_results(df: pd.DataFrame) -> pd.DataFrame:
     return wide
 
 
-def _append_ndcg_max_mean_column(wide_df: pd.DataFrame) -> pd.DataFrame:
+def _append_ndcg_mean_columns(wide_df: pd.DataFrame) -> pd.DataFrame:
     if wide_df.empty:
         return wide_df
+    ndcg_end_cols: List[object] = []
     ndcg_max_cols: List[object] = []
     for col in wide_df.columns:
         if isinstance(col, tuple):
             metric_name = col[1] if len(col) > 1 else ""
         else:
             metric_name = str(col)
+        if metric_name == "ndcg_end":
+            ndcg_end_cols.append(col)
         if metric_name == "ndcg_max":
             ndcg_max_cols.append(col)
 
     out_df = wide_df.copy()
+    # Intent: expose both terminal-performance and best-iteration summaries at the experiment level.
+    if ndcg_end_cols:
+        ndcg_end_vals = out_df[ndcg_end_cols].apply(pd.to_numeric, errors="coerce")
+        out_df[("overall", "avg_ndcg_end")] = ndcg_end_vals.mean(axis=1)
+    else:
+        out_df[("overall", "avg_ndcg_end")] = pd.NA
     if ndcg_max_cols:
         ndcg_vals = out_df[ndcg_max_cols].apply(pd.to_numeric, errors="coerce")
-        # Intent: provide per-experiment mean nDCG over available subset columns as a dedicated summary column.
         out_df[("overall", "avg_ndcg_max")] = ndcg_vals.mean(axis=1)
     else:
         out_df[("overall", "avg_ndcg_max")] = pd.NA
@@ -231,7 +260,7 @@ def _append_ndcg_max_mean_column(wide_df: pd.DataFrame) -> pd.DataFrame:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect nDCG result summaries from all_eval_metrics.pkl files.")
     parser.add_argument("--base_dir", type=str, default="results/BRIGHT", help="Base results directory")
-    parser.add_argument("--out_csv", type=str, default="results/BRIGHT/ndcg_summary.csv", help="Output CSV path")
+    parser.add_argument("--out_csv", type=str, default="results/BRIGHT/ndcg_end_summary.csv", help="Output CSV path")
     parser.add_argument("--exclude_subdir", action="append", default=["260116", "260121"], help="Subdirectory name to exclude")
     parser.add_argument("--metric", type=str, default="nDCG@10", help="Metric column to aggregate")
     parser.add_argument(
@@ -290,7 +319,7 @@ def main() -> None:
         args.metric,
         args.max_iter,
     )
-    wide_df = _append_ndcg_max_mean_column(_format_wide_results(df))
+    wide_df = _append_ndcg_mean_columns(_format_wide_results(df))
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     wide_df.to_csv(out_csv, index=False)
     print(f"Wrote {len(wide_df)} rows to {out_csv}")

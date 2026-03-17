@@ -13,7 +13,18 @@ log() {
 
 log "Starting run_baseline1_tree_only.sh script"
 
+# Intent: default to the prompt template used for branch-policy training, but allow quick override via env.
+TRAVERSAL_PROMPT_TEMPLATE_PATH="${TRAVERSAL_PROMPT_TEMPLATE_PATH:-/data4/jongho/lattice/scripts/train/prompts/evidence_support_v1.txt}"
+if [[ -n "${TRAVERSAL_PROMPT_TEMPLATE_PATH}" ]] && [[ ! -f "${TRAVERSAL_PROMPT_TEMPLATE_PATH}" ]]; then
+    log "Error: traversal prompt template not found: ${TRAVERSAL_PROMPT_TEMPLATE_PATH}"
+    exit 1
+fi
 RUN_SUFFIX="baseline1_tree_only"
+if [[ -n "${TRAVERSAL_PROMPT_TEMPLATE_PATH}" ]] && [[ -f "${TRAVERSAL_PROMPT_TEMPLATE_PATH}" ]]; then
+    # Intent: include traversal prompt template identity in save dir naming using filename only (never full path).
+    TRAVERSAL_PROMPT_TEMPLATE_FILE="$(basename "${TRAVERSAL_PROMPT_TEMPLATE_PATH}")"
+    RUN_SUFFIX="${RUN_SUFFIX}-TPTF=${TRAVERSAL_PROMPT_TEMPLATE_FILE}"
+fi
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
@@ -27,6 +38,9 @@ COMMON_PARAMS=(
     --llm_api_timeout 60
     --llm_api_max_retries 3
 )
+if [[ -n "${TRAVERSAL_PROMPT_TEMPLATE_PATH}" ]]; then
+    COMMON_PARAMS+=(--traversal_prompt_template_path "${TRAVERSAL_PROMPT_TEMPLATE_PATH}")
+fi
 # --llm /data2/da02/models/Qwen3-4B-Instruct-2507
 
 # Define RUNS directly as strings (space-separated args)
