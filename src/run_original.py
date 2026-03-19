@@ -13,7 +13,7 @@ from hyperparams import HyperParams
 from tree_objects import SemanticNode, InferSample
 from llm_apis import GenAIAPI, VllmAPI
 from prompts import get_traversal_prompt_response_constraint, get_reranking_prompt
-from retrievers.diver import DiverEmbeddingModel
+from retrievers import build_retriever
 from utils import (
     setup_logger, 
     compute_node_registry,
@@ -73,7 +73,7 @@ if hp.USE_RETRIEVER_TRAVERSAL:
     if node_embs.shape[0] != len(node_registry):
         raise ValueError(f"node_embs rows ({node_embs.shape[0]}) must match node_registry size ({len(node_registry)})")
     node_embs = normalize_embeddings(node_embs)
-    retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
+    retriever = build_retriever(hp.RETRIEVER_MODEL_PATH, subset=hp.SUBSET, local_files_only=True)
 #endregion
 
 #region Setup LLM API and Eval Samples

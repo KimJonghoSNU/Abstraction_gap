@@ -3,7 +3,6 @@ import json
 import os
 import sys
 from typing import List
-import torch
 import numpy as np
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -11,7 +10,9 @@ SRC_DIR = os.path.join(REPO_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
+from retrievers import is_reasonembed_model_path
 from retrievers.diver import DiverEmbeddingModel
+from retrievers.reasonembed import ReasonEmbedEmbeddingModel
 
 
 def read_jsonl(path: str) -> List[dict]:
@@ -26,7 +27,7 @@ def read_jsonl(path: str) -> List[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Embed node catalog (desc field) using Diver-Retriever style embeddings")
+    parser = argparse.ArgumentParser(description="Embed node catalog descriptions using a local dense retriever checkpoint")
     parser.add_argument("--node_catalog_jsonl", type=str, required=True)
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--out_npy", type=str, required=True)
@@ -39,10 +40,19 @@ def main() -> None:
         return
     catalog = read_jsonl(args.node_catalog_jsonl)
     texts = [str(rec.get("desc", "")) for rec in catalog]
-    model = DiverEmbeddingModel(args.model_path, local_files_only=True)
-    # with torch.infererence_mode():
+    model_path_lower = args.model_path.lower()
+    if "diver" in model_path_lower:
+        model = DiverEmbeddingModel(args.model_path, local_files_only=True)
+        encode_kwargs = {}
+    elif is_reasonembed_model_path(model_path_lower):
+        model = ReasonEmbedEmbeddingModel(args.model_path, local_files_only=True)
+        # Intent: preserve blank node rows so saved node embeddings stay aligned with node_catalog.jsonl.
+        encode_kwargs = {"keep_empty_rows": True}
+    else:
+        raise ValueError(f"Unsupported model_path for node catalog embedding: {args.model_path}")
+
     print("Computing embeddings...")
-    embs = model.encode_docs(texts, max_length=args.max_length, batch_size=args.batch_size)
+    embs = model.encode_docs(texts, max_length=args.max_length, batch_size=args.batch_size, **encode_kwargs)
 
     os.makedirs(os.path.dirname(args.out_npy) or ".", exist_ok=True)
     np.save(args.out_npy, embs.astype(np.float32, copy=False))

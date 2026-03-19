@@ -49,16 +49,18 @@ if [[ "$ROUND5_DISABLE_CALIBRATION" == "1" ]]; then
 fi
 
 RUN_SUBSETS=(
-    "biology"
-    "psychology"
-    "economics"
-    "earth_science"
-    "robotics"
-    "sustainable_living"
-    "stackoverflow"
-    "theoremqa_questions"
-    "theoremqa_theorems"
-    "pony"
+    # "biology"
+    # "psychology"
+    # "economics"
+    # "earth_science"
+    # "robotics"
+    # "sustainable_living"
+    # "stackoverflow"
+    # "theoremqa_questions"
+    # "theoremqa_theorems"
+    # "pony"
+    "aops"
+    "leetcode"
 )
 
 # subset -> tree_version

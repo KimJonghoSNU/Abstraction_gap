@@ -19,3 +19,15 @@ baseline: round6-RInTP=-1-PlTau=5.0-DC=True-RCF=0.5-NumI=10-MaxBS=10-S=round6_mr
 
 ## Writing
 
+
+260318
+- Average next-step change after the first reseat:
+  - `nDCG(iter t+1) - nDCG(iter t) = -2.69`
+
+  Baseline per-iteration mean:
+
+- `30.97, 31.26, 31.52, 31.68, 31.66, 31.41, 31.35, 31.42, 31.38, 31.40`
+
+Round6 per-iteration mean:
+
+- `31.07, 31.50, 31.45, 29.24, 29.63, 32.66, 32.42, 32.30, 32.25, 32.09`

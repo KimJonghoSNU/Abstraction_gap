@@ -15,7 +15,8 @@ log "Starting run_baseline3_leaf_only_loop.sh script"
 log "run_leaf_rank.py will emit leaf_iter_records.jsonl with retrieved/rewrite-context doc ids and paths per iteration."
 
 # Edit these paths for your setup
-RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
+# RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
+RETRIEVER_MODEL_PATH="/data2/pretrained_models/reason-embed-qwen3-8b-0928"
 NODE_EMB_BASE="../trees/BRIGHT"
 
 # Common params (key value pairs or flags). Run-specific params override these.
@@ -34,20 +35,21 @@ COMMON_PARAMS=(
     --leaf_only_retrieval
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
-    --rewrite_prompt_name agent_executor_v1_icl2
+    # --rewrite_prompt_name agent_executor_v1_icl2
+    --rewrite_prompt_name thinkqe
     --rewrite_context_topk 10
 )
 
 # Define RUNS directly as strings (space-separated args)
 RUNS=(
-    # "--subset biology --tree_version bottom-up"
-    # "--subset economics --tree_version bottom-up"
-    # "--subset earth_science --tree_version bottom-up"
-    # "--subset psychology --tree_version bottom-up"
-    # "--subset robotics --tree_version bottom-up"
-    # "--subset stackoverflow --tree_version bottom-up"
-    # "--subset sustainable_living --tree_version bottom-up"
-    # "--subset theoremqa_theorems --tree_version top-down"
+    "--subset biology --tree_version bottom-up"
+    "--subset economics --tree_version bottom-up"
+    "--subset earth_science --tree_version bottom-up"
+    "--subset psychology --tree_version bottom-up"
+    "--subset robotics --tree_version bottom-up"
+    "--subset stackoverflow --tree_version bottom-up"
+    "--subset sustainable_living --tree_version bottom-up"
+    "--subset theoremqa_theorems --tree_version top-down"
     "--subset theoremqa_questions --tree_version top-down"
     "--subset pony --tree_version bottom-up"
     "--subset leetcode --tree_version top-down"

@@ -29,9 +29,9 @@ def compress_hparam_string(hparam_str: str, chunk_size: int = 5) -> str:
         if "=" in part:
             key, val = part.split("=", 1)
             if val and val.lower() not in ['false', 'none']:
-                # Intent: preserve numeric/string values (e.g., 0.035) while shortening path-like values only.
+                # Intent: keep retriever/model path values in run names while collapsing them to the final path token.
                 if "/" in val or "\\" in val:
-                    val = os.path.splitext(os.path.basename(val))[0]
+                    val = os.path.splitext(os.path.basename(os.path.normpath(val)))[0]
                 compressed_parts.append(f"{abbreviate_key(key)}={val}")
         else:
             # Handle flag-only parameters
@@ -60,7 +60,6 @@ class HyperParams(argparse.Namespace):
         'llm_api_max_retries',
         'llm_api_staggering_delay',
         # avoid excessively long log filenames
-        'retriever_model_path',
         'node_emb_path',
         'traversal_prompt_template_path',
         'rewrite_prompt_path',

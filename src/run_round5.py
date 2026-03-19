@@ -18,6 +18,7 @@ from cache_utils import _prompt_cache_key, append_jsonl
 from flat_then_tree import FlatHit
 from hyperparams import HyperParams
 from llm_apis import GenAIAPI, VllmAPI
+from retrievers import build_retriever
 from retrievers.diver import DiverEmbeddingModel
 from rewrite_prompts import REWRITE_PROMPT_TEMPLATES
 from tree_objects import InferSample, SemanticNode
@@ -1340,7 +1341,7 @@ for doc_id, paths in doc_id_to_paths.items():
 
 if not hp.RETRIEVER_MODEL_PATH:
     raise ValueError("--retriever_model_path is required")
-retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
+retriever = build_retriever(hp.RETRIEVER_MODEL_PATH, subset=hp.SUBSET, local_files_only=True)
 
 node_embs: Optional[np.ndarray] = None
 if hp.NODE_EMB_PATH:

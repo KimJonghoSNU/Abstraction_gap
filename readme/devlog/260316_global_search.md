@@ -286,3 +286,453 @@ round6 `expandable_pool`은 leaf hit 다음 iteration을 명시적인 explore st
 - `src/bash/round5/run_round6_expandable.sh`
 
 이렇게 분리한 이유는 기존 `run_round6.sh`의 legacy / global escape / method2 실험과 섞이지 않게 하기 위해서다.
+
+### 현재 결과
+
+현재 이 구현으로 나온 결과 row는 아래 실험이다.
+
+- `round6-RInTP=-1-PlTau=5.0-DC=True-RCF=0.5-NumI=10-MaxBS=10-S=round6_mrr_selector_accum_meanscore_global_expandable_ended_reseat-FT=1000-PreFRS=branch-RPN=agent_executor_v1_icl2-RM=concat-RE=1-RCT=10-RCS=mixed-RGT=10-RSM=meanscore_global-REM=ended_reseat-RRrfK=60-RRC=leaf-REM=replace`
+
+`results/BRIGHT/ndcg_end_summaryround6.csv` 기준 주요 값은:
+
+- overall: `32.09 / 34.07` (`end / max`)
+- biology: `62.71 / 63.03`
+- earth_science: `59.02 / 60.64`
+- psychology: `42.66 / 46.88`
+- theoremqa_theorems: `43.94 / 44.84`
+
+해석할 때 주의할 점:
+
+- 이 row는 `aops`, `leetcode`까지 포함된 summary라서,
+- 앞에서 적은 `expandable_pool`, `freeze_terminal`의 BRIGHT subset 중심 overall과는 직접 평균 비교를 하면 안 된다.
+
+그래도 방향성은 읽을 수 있다.
+
+- ended beam만 retrieval-driven으로 reseat한다고 해서 바로 강한 성능 이득이 생기지는 않았다.
+- 즉 문제를 "whole-beam explore가 너무 공격적이다"로만 볼 수는 없고,
+- ended slot만 바꾸는 더 보수적인 variant 역시 아직 충분히 강하지 않다.
+
+현재 이 ablation이 주는 메시지는:
+
+- `path_relevance` 대신 retrieval score로 ended slot만 고르는 것만으로는 충분하지 않다.
+- 이후에는
+    - 어떤 leftover expandable candidate를 evidence로 볼지
+    - ended slot replacement를 어느 시점에 허용할지
+    - local beam continuity와 global candidate scoring을 어떻게 더 정교하게 묶을지
+  를 더 봐야 한다.
+
+# 2026-03-18 Why `round6 ... ended_reseat` peaks high but degrades by the end
+
+## Goal
+
+Compare these two runs and identify why the tree-based run reaches much higher intermediate performance but does not preserve enough of that gain by the final iteration.
+
+- Baseline:
+  - `RInTP=-1-PlTau=5.0-RCF=0.5-NumI=10-S=baseline3_leaf_only_loop-PreFRS=branch-RPN=agent_executor_v1_icl2-RM=concat-RE=1-RCT=10-RCS=mixed-LOR=True-RGT=10-RRrfK=60-RRC=leaf-REM=replace-RSC=on`
+- Round6:
+  - `round6-RInTP=-1-PlTau=5.0-DC=True-RCF=0.5-NumI=10-MaxBS=10-S=round6_mrr_selector_accum_meanscore_global_expandable_ended_reseat-FT=1000-PreFRS=branch-RPN=agent_executor_v1_icl2-RM=concat-RE=1-RCT=10-RCS=mixed-RGT=10-RSM=meanscore_global-REM=ended_reseat-RRrfK=60-RRC=leaf-REM=replace`
+
+---
+
+## Metric definitions
+
+There are two different ways to summarize iterative performance here, and they should not be mixed.
+
+### 1. Summary-style metric
+
+This is the canonical top-line metric used by the summary CSVs.
+
+- For each subset, compute mean `nDCG@10` at each iteration.
+- `ndcg_end` = last-iteration mean.
+- `ndcg_max` = max over iteration means.
+
+This matches:
+
+- `results/BRIGHT/ndcg_summary_leaf.csv`
+- `results/BRIGHT/ndcg_end_summaryround6.csv`
+
+### 2. Per-query diagnostic metric
+
+This is useful for instability diagnosis, but it is not the same quantity.
+
+- For each query, track its own per-iteration `nDCG@10`.
+- Take `max` over that query's iterations.
+- Average those per-query maxima.
+
+This is `mean(max per query)`, not `max(iteration mean)`.
+
+Important:
+
+- `mean(max per query)` is usually larger than `max(iteration mean)`.
+- So the earlier `39.70`-style number is not wrong, but it is not comparable to the summary CSV top-line.
+
+---
+
+## Correct top-line comparison: summary-style
+
+These are the canonical numbers aligned to the summary CSVs.
+
+### Baseline
+
+- `ndcg_end = 31.3967`
+- `ndcg_max = 31.9792`
+- drop `max -> end = -0.5825`
+
+### Round6 ended_reseat
+
+- `ndcg_end = 32.0925`
+- `ndcg_max = 34.0742`
+- drop `max -> end = -1.9817`
+
+### Interpretation
+
+- Round6 is still better than baseline on both `ndcg_end` and `ndcg_max`.
+- But round6 loses much more of its gain by the final iteration.
+- So the right question is not "does tree help?" but "why does the tree gain fail to persist?"
+
+---
+
+## Additional view: `mean(max per query)`
+
+This view is useful for diagnosis because it shows whether the method finds strong intermediate states at the query level.
+
+### Baseline
+
+- `mean(end per query) = 31.42`
+- `mean(max per query) = 35.93`
+- drop `max -> end = -4.51`
+
+### Round6 ended_reseat
+
+- `mean(end per query) = 32.09`
+- `mean(max per query) = 41.64`
+- drop `max -> end = -9.55`
+
+### Interpretation
+
+- Round6 reaches much stronger intermediate query-level states than baseline.
+- But a large fraction of that gain disappears later.
+- This supports the claim that the issue is not early retrieval quality, but trajectory instability after a later transition.
+
+---
+
+## Where the drop starts
+
+The per-query event analysis points to one stage very clearly: the first `ended_beam_reseat`.
+
+### Findings
+
+- In this round6 run, every query eventually hits `ended_beam_reseat`.
+- Average first reseat iteration: `3.18`
+- Average per-query best iteration: `1.61`
+- For `947 / 1384` queries, the best score happens **before** the first reseat.
+- Average next-step change after the first reseat:
+  - `nDCG(iter t+1) - nDCG(iter t) = -2.69`
+
+### Mean trajectory comparison
+
+These iteration means use the same aggregation as the summary CSVs: compute a subset mean at each iteration, then average subsets with equal weight.
+
+Baseline per-iteration mean:
+
+- `30.97, 31.26, 31.52, 31.68, 31.66, 31.41, 31.35, 31.42, 31.38, 31.40`
+
+Round6 per-iteration mean:
+
+- `31.07, 31.50, 31.45, 29.24, 29.63, 32.66, 32.42, 32.30, 32.25, 32.09`
+
+Diagnostic note:
+
+- Earlier per-iteration lines in this note used pooled per-query means across all subsets. Those values are still useful for instability diagnosis, but they are not directly comparable to `results/BRIGHT/ndcg_summary_leaf.csv` or `results/BRIGHT/ndcg_end_summaryround6.csv`.
+
+### Interpretation
+
+- Baseline is smooth.
+- Round6 has a clear cliff around iter `3 -> 4`.
+- That timing lines up with the first `ended_beam_reseat` transition.
+
+So the degradation is not generic late-iteration drift. It is strongly associated with the first reseat stage.
+
+---
+
+## Which reseat regime is harmful
+
+The first reseat is not equally harmful in all cases. The number of ended beam slots matters.
+
+### `1-2` ended beams (`n = 530`)
+
+- Round6 next-step delta: `-7.85`
+- Baseline same-step delta on the same queries: `-0.14`
+- Round6 `max -> end`: `-11.86`
+- Baseline `max -> end`: `-4.08`
+
+### `3-5` ended beams (`n = 329`)
+
+- Round6 next-step delta: `+0.09`
+
+### `6-10` ended beams (`n = 525`)
+
+- Round6 next-step delta: `+0.79`
+
+### Interpretation
+
+The harmful case is not "explore" in general.
+
+The harmful case is **partial reseat**:
+
+- only `1-2` beam slots end
+- those slots are replaced by retrieval-scored expandable branches
+- the rest of the beam stays on the old local trajectory
+
+This creates a mixed frontier. That mixed state is where the sharp degradation happens.
+
+---
+
+## Conclusion
+
+The tree method is genuinely useful here.
+
+- It improves the final score slightly over the no-tree baseline.
+- It improves the intermediate best score much more strongly.
+
+But the gain is unstable.
+
+The main failure is not generic late-iteration drift. The main failure is the **first ended-beam reseat transition**, especially when only `1-2` beam slots are replaced.
+
+My current interpretation is:
+
+- early iterations find stronger states because the tree constrains retrieval well
+- later, partial reseat moves only part of the beam to new expandable branches
+- but the rewrite/retrieval state is still anchored to the previous local trajectory
+
+So the likely failure mode is **state mismatch after partial reseat**, not the mere existence of tree exploration.
+
+That means the next method question is not:
+
+- "should we explore?"
+
+but rather:
+
+- "how should the system transition from exploit to explore without creating a mixed local/global state?"
+
+---
+
+## Partial reseat deep dive: where the next top-10 actually comes from
+
+To test the partial-reseat hypothesis more directly, I added:
+
+- `scripts/analysis/analyze_round6_partial_reseat.py`
+
+Purpose:
+
+- analyze the **first** `ended_beam_reseat` per query
+- focus on the `partial` case (`ended_beam_count in {1,2}`)
+- check whether the next-step drop happens because newly reseated-branch documents take over the ranking, or whether the drop happens even while the ranking is still dominated by the old subtree
+
+How to run:
+
+```bash
+python scripts/analysis/analyze_round6_partial_reseat.py \
+    --out_prefix results/BRIGHT/analysis/round6_partial_reseat
+```
+
+Outputs:
+
+- `results/BRIGHT/analysis/round6_partial_reseat_rows.csv`
+- `results/BRIGHT/analysis/round6_partial_reseat_group_summary.csv`
+- `results/BRIGHT/analysis/round6_partial_reseat_subset_summary.csv`
+- `results/BRIGHT/analysis/round6_partial_reseat_examples.csv`
+
+### What the script checks
+
+For the first reseat iteration `t` and next iteration `t+1`, it measures:
+
+- round6 next-step `nDCG@10`, `Recall@10`, `Recall@100`, `Coverage`, `BranchHit@B`
+- same-step baseline3 delta for the same `(subset, query_idx)`
+- where `top-10` documents at `t+1` live under the tree:
+    - `old_ended`
+    - `old_active`
+    - `new_reseated`
+    - `other`
+- DCG contribution by the same buckets
+- where `pre_hit_paths[:10]` at `t+1` come from, using the same bucket split
+
+### Current result
+
+For the `partial reseat` cases (`ended_beam_count in {1,2}`, `n = 530`):
+
+- round6 next-step delta:
+  - `nDCG@10(t+1) - nDCG@10(t) = -7.85`
+- baseline same-step delta on the same queries:
+  - `-0.14`
+
+And the next-iteration top-10 average bucket counts are:
+
+- `old_ended = 9.13`
+- `old_active = 0.04`
+- `new_reseated = 0.00`
+- `other = 0.01`
+
+This matters.
+
+- The next top-10 is still almost entirely dominated by the **old ended subtree**.
+- The newly reseated branch does **not** enter top-10 in the partial-reseat cases.
+
+The next rewrite-evidence pool shows the same pattern:
+
+- `next_prehit_old_ended = 9.13`
+- `next_prehit_old_active = 0.05`
+- `next_prehit_new_reseated = 0.00`
+- `next_prehit_other = 0.01`
+
+So the current evidence weakens the simplest hypothesis:
+
+- not "new branch docs immediately enter top-10 and ruin the ranking"
+
+and strengthens the more likely one:
+
+- the system changes beam state, but the effective retrieval / rewrite state is still dominated by the old ended subtree
+
+In other words, the failure looks more like a **transition mismatch** than a bad new-branch takeover.
+
+### Prevention ideas suggested by this result
+
+If this interpretation is right, the next methods to try are not generic "better explore" changes, but transition-control changes:
+
+1. **Evidence-aligned reseat**
+   - if a new branch is reseated in, force the next rewrite evidence to include its descendants
+   - do not let the next rewrite remain almost entirely dominated by the old ended subtree
+
+2. **Thresholded reseat**
+   - do not reseat when only `1–2` beam slots end
+   - keep local exploit until a larger fraction of the beam has actually terminated
+
+3. **Delayed commit / shadow reseat**
+   - score the reseated branch for one step without fully committing it to the active beam
+   - only promote it if it starts contributing competitive evidence
+
+4. **Old-subtree cap**
+   - after reseat, cap how much of the next rewrite evidence can still come from the ended subtree
+
+At this point, the most useful next distinction is:
+
+- whether partial reseat fails because old-subtree dominance persists with weaker gold/DCG contribution,
+- or whether the drop is driven by deeper mismatch between branch state and retrieval context even before rank takeover changes.
+
+### Follow-up: why partial reseat can still beat `freeze_terminal` later
+
+I followed up on exactly one question:
+
+- if `partial reseat` is clearly worse at `t+1`, why can it still end up better than `freeze_terminal` by the end?
+
+For the same `partial reseat` cases (`ended_beam_count in {1,2}`, `n = 530`), I aligned each query to:
+
+- the first `ended_beam_reseat` iteration in `round6 ... expandable_ended_reseat`
+- the same `(subset, query_idx, iter)` in `round6 ... method2_expandable_pool_freeze_terminal`
+
+Then I tracked relative `nDCG@10` advantage over time:
+
+- advantage at reseat iteration `t`:
+  - `reseat - freeze = +0.04`
+- advantage at `t+1`:
+  - `-1.90`
+- advantage at `t+2`:
+  - `+1.60`
+- advantage at `t+3`:
+  - `+2.04`
+- final end advantage:
+  - `+1.75`
+- post-reseat future max advantage:
+  - `+1.11`
+
+This is the key pattern:
+
+- `partial reseat` does **not** beat `freeze_terminal` immediately
+- it loses at `t+1`
+- then it overtakes at `t+2` and stays ahead on average afterward
+
+So the gain is not an immediate retrieval benefit. It is a **delayed benefit**.
+
+I then checked when the newly reseated branch actually becomes visible in retrieval.
+
+At `t+1`:
+
+- new reseated branch inside `selected_branches_before`:
+  - `1.40`
+- new reseated branch inside `selected_branches_after`:
+  - `0.40`
+- new reseated docs in `pre_hit top-10`:
+  - `0.00`
+- new reseated docs in `pre_hit top-100`:
+  - `0.00`
+- new reseated docs in `active_eval top-10`:
+  - `0.00`
+- new reseated docs in `active_eval top-100`:
+  - `0.00`
+
+At `t+2`:
+
+- new reseated branch inside `selected_branches_before`:
+  - `0.40`
+- new reseated branch inside `selected_branches_after`:
+  - `0.08`
+- new reseated docs in `pre_hit top-10`:
+  - `0.44`
+- new reseated docs in `pre_hit top-100`:
+  - `10.85`
+- new reseated docs in `active_eval top-10`:
+  - `0.44`
+- new reseated docs in `active_eval top-100`:
+  - `10.87`
+
+At `t+3`:
+
+- new reseated docs in `pre_hit top-10`:
+  - `0.49`
+- new reseated docs in `pre_hit top-100`:
+  - `8.96`
+- new reseated docs in `active_eval top-10`:
+  - `0.49`
+- new reseated docs in `active_eval top-100`:
+  - `8.96`
+
+This strongly suggests the following mechanism:
+
+- `partial reseat` inserts a new branch into the beam state at iteration `t`
+- that branch does **not** affect retrieval immediately at `t+1`
+- but it survives as a latent beam state for one step
+- and only at `t+2` does it begin to contribute actual retrieval evidence
+
+So the best current explanation is:
+
+- the cost of partial reseat is immediate transition mismatch at `t+1`
+- the benefit of partial reseat is delayed branch activation at `t+2` and later
+
+In other words, `partial reseat` can beat `freeze_terminal` by the end **without** helping right away, because it keeps a live alternative branch around long enough for that branch to become retrievable one step later.
+
+This is a much more precise statement than:
+
+- "new branch docs immediately enter top-10 and help"
+
+The current data says that statement is false.
+
+The more accurate statement is:
+
+- "the new reseated branch is initially invisible to retrieval, but partial reseat preserves it in the beam, and that preserved state starts affecting retrieval one iteration later"
+
+One caution:
+
+- this delayed-activation story explains the average time pattern well
+- but it does not yet explain all query-level variance
+- for example, win-vs-loss query splits do not show a dramatically different amount of new-branch mass at `t+2/t+3`
+
+So this should be treated as the **best-supported current mechanism**, not a fully closed causal proof.
+
+## Assumptions
+
+- `query_idx` is aligned across the two runs within each subset.
+- The comparison set is the 12 subsets where both artifacts exist.
+- Summary-style numbers are the canonical top-line numbers.
+- Per-query numbers are used only for diagnosis.
+
+---

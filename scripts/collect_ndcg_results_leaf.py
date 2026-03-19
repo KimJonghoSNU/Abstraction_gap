@@ -133,14 +133,24 @@ def _load_leaf_metrics(metrics_path: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _extract_last_ndcg(grouped: pd.Series) -> Tuple[Optional[float], Optional[int]]:
+def _extract_last_ndcg(
+    grouped: pd.Series,
+    max_iter: Optional[int] = None,
+) -> Tuple[Optional[float], Optional[int]]:
+    if max_iter is not None:
+        grouped = grouped[grouped.index < int(max_iter)]
     if grouped.empty:
         return None, None
     last_iter = int(grouped.index.max())
     return float(grouped.loc[last_iter]), last_iter
 
 
-def _extract_max_ndcg(grouped: pd.Series) -> Tuple[Optional[float], Optional[int]]:
+def _extract_max_ndcg(
+    grouped: pd.Series,
+    max_iter: Optional[int] = None,
+) -> Tuple[Optional[float], Optional[int]]:
+    if max_iter is not None:
+        grouped = grouped[grouped.index < int(max_iter)]
     if grouped.empty:
         return None, None
     max_iter = int(grouped.idxmax())
@@ -158,6 +168,7 @@ def collect_ndcg_results(
     drop_map: Dict[str, str],
     exclude_subdirs: List[str],
     include_dir: Optional[str],
+    max_iter: Optional[int],
 ) -> pd.DataFrame:
     records: List[Dict[str, object]] = []
     for metrics_path in tqdm(sorted(_find_metrics_files(base_dir, include_dir))):
@@ -174,14 +185,14 @@ def collect_ndcg_results(
         if grouped.empty:
             continue
         # Intent: mirror the main collector by reporting the terminal leaf-ranking score, not the initial iteration score.
-        end_ndcg, _end_iter = _extract_last_ndcg(grouped)
-        max_ndcg, max_iter = _extract_max_ndcg(grouped)
+        end_ndcg, _end_iter = _extract_last_ndcg(grouped, max_iter=max_iter)
+        max_ndcg, max_iter_idx = _extract_max_ndcg(grouped, max_iter=max_iter)
         records.append({
             "category": category,
             "experiment": exp_id,
             "ndcg_end": _round_or_none(end_ndcg),
             "ndcg_max": _round_or_none(max_ndcg),
-            "ndcg_max_iter": max_iter,
+            "ndcg_max_iter": max_iter_idx,
         })
     return pd.DataFrame(records)
 
@@ -246,6 +257,12 @@ def main() -> None:
         help="Only scan directories matching this glob (e.g., baseline or *baseline*)",
     )
     parser.add_argument(
+        "--max_iter",
+        type=int,
+        default=None,
+        help="If set, compute ndcg_end/ndcg_max using only iterations with index < max_iter (e.g., 5 => iter 0..4).",
+    )
+    parser.add_argument(
         "--drop_param",
         action="append",
         default=[
@@ -276,9 +293,11 @@ def main() -> None:
         out_csv = os.path.join(os.path.dirname(os.path.dirname(__file__)), out_csv)
     if args.include_dir:
         out_csv = out_csv[:-4] + args.include_dir.replace("*", "") + out_csv[-4:]
+    if args.max_iter is not None:
+        out_csv = out_csv[:-4] + f"_maxiter{int(args.max_iter)}" + out_csv[-4:]
     print(f"Collecting leaf-only nDCG@10 results from {base_dir}...")
     drop_map = _build_drop_map(args.drop_param)
-    df = collect_ndcg_results(base_dir, drop_map, args.exclude_subdir, args.include_dir)
+    df = collect_ndcg_results(base_dir, drop_map, args.exclude_subdir, args.include_dir, args.max_iter)
     wide_df = _append_ndcg_mean_columns(_format_wide_results(df))
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     wide_df.to_csv(out_csv, index=False)

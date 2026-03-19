@@ -14,7 +14,7 @@ NODE_EMB_BASE="../trees/BRIGHT"
 ROUND5_DISABLE_CALIBRATION="${ROUND5_DISABLE_CALIBRATION:-1}"
 ROUND5_SELECTOR_MODES="${ROUND5_SELECTOR_MODES:-meanscore_global}" # retriever_slate maxscore_global meanscore_global  max_hit_global
 ROUND6_GLOBAL_ESCAPE="${ROUND6_GLOBAL_ESCAPE:-1}"
-ROUND6_GLOBAL_ESCAPE_SLOTS="${ROUND6_GLOBAL_ESCAPE_SLOTS:-5}"
+ROUND6_GLOBAL_ESCAPE_SLOTS="${ROUND6_GLOBAL_ESCAPE_SLOTS:-2}"
 ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2}"
 # ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2_rubric}"
 # ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-thinkqe_round3}"
@@ -44,16 +44,18 @@ if [[ "$ROUND5_DISABLE_CALIBRATION" == "1" ]]; then
 fi
 
 RUN_SUBSETS=(
-    "biology"
-    "psychology"
-    "economics"
-    "earth_science"
-    "robotics"
+    # "biology"
+    # "psychology"
+    # "economics"
+    # "earth_science"
+    # "robotics"
     # "sustainable_living"
     # "stackoverflow"
     # "theoremqa_questions"
     # "theoremqa_theorems"
     # "pony"
+    "leetcode"
+    "aops"
 )
 
 # subset -> tree_version

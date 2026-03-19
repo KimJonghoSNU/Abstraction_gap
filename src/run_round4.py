@@ -17,6 +17,7 @@ from flat_then_tree import FlatHit, gate_hit, is_prefix
 from history_prompts import prepend_history_to_prompt
 from hyperparams import HyperParams
 from llm_apis import GenAIAPI, VllmAPI
+from retrievers import build_retriever
 from retrievers.diver import DiverEmbeddingModel
 from rewrite_prompts import REWRITE_PROMPT_TEMPLATES
 from tree_objects import SemanticNode
@@ -1150,7 +1151,7 @@ if node_embs.shape[0] != len(node_registry):
     raise ValueError(f"node_embs rows ({node_embs.shape[0]}) must match node_registry size ({len(node_registry)})")
 node_embs = normalize_embeddings(node_embs)
 
-retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
+retriever = build_retriever(hp.RETRIEVER_MODEL_PATH, subset=hp.SUBSET, local_files_only=True)
 category_emb_cache: Dict[str, np.ndarray] = {}
 
 leaf_indices = [idx for idx, node in enumerate(node_registry) if node.is_leaf]

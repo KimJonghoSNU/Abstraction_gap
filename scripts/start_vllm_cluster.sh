@@ -20,7 +20,7 @@ MODEL="${1:-/data2/da02/models/Qwen3-4B-Instruct-2507}"
 MODE="${2:-data}"  # "data" or "tensor"
 TP_PER_SERVER_ARG="${3:-auto}"
 BASE_PORT=8000
-GPU_MEM_UTIL=0.95
+GPU_MEM_UTIL=0.75
 # Specify GPU IDs to use
 GPU_IDS=(4 5 6 7)
 MAX_MODEL_LEN=128000
@@ -123,7 +123,6 @@ if [[ "$MODE" == "tensor" ]]; then
         --disable-log-requests \
         --max-model-len "$MAX_MODEL_LEN" \
         --trust-remote-code \
-        --gpu-memory-utilization 0.8 \
         > "$LOG_FILE" 2>&1 &
 
     PID=$!
@@ -246,7 +245,6 @@ else
             --max-model-len "$DATA_MAX_MODEL_LEN" \
             --trust-remote-code \
             --max_num_seqs "$DATA_MAX_NUM_SEQS" \
-            --gpu-memory-utilization 0.8 \
             $ENFORCE_EAGER_FLAG \
             > "$LOG_FILE" 2>&1 &
 

@@ -15,6 +15,7 @@ from tqdm.autonotebook import tqdm
 from flat_then_tree import flat_retrieve_hits
 from hyperparams import HyperParams
 from llm_apis import GenAIAPI, VllmAPI
+from retrievers import build_retriever
 from tree_objects import SemanticNode
 from utils import (
     compute_ndcg,
@@ -173,6 +174,18 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 exp_dir_name = str(hp)
 RESULTS_DIR = f"{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/{exp_dir_name}/"
 os.makedirs(RESULTS_DIR, exist_ok=True)
+metrics_path = f"{RESULTS_DIR}/leaf_iter_metrics.jsonl"
+iter_records_path = f"{RESULTS_DIR}/leaf_iter_records.jsonl"
+done_marker_path = f"{RESULTS_DIR}/leaf_iter_done.json"
+# Intent: let batch launchers skip only completed runs while allowing incomplete runs to restart cleanly.
+if os.path.exists(done_marker_path):
+    print(f"Skipping run because completion marker already exists: {done_marker_path}")
+    raise SystemExit(0)
+stale_leaf_outputs = [path for path in [metrics_path, iter_records_path] if os.path.exists(path)]
+if stale_leaf_outputs:
+    print(f"Removing stale leaf output files before restart: {stale_leaf_outputs}")
+    for stale_path in stale_leaf_outputs:
+        os.remove(stale_path)
 log_path = f"{RESULTS_DIR}/run.log"
 os.makedirs(os.path.dirname(log_path), exist_ok=True)
 logger = setup_logger("leaf_rank_runner", log_path, logging.INFO)
@@ -254,8 +267,6 @@ if hp.REWRITE_CACHE_PATH and os.path.exists(hp.REWRITE_CACHE_PATH) and (not hp.R
             if "key" in rec and "rewritten_query" in rec:
                 rewrite_map[str(rec["key"])] = str(rec["rewritten_query"])
 
-from retrievers.diver import DiverEmbeddingModel
-
 node_embs = np.load(hp.NODE_EMB_PATH, allow_pickle=False)
 emb_registry_indices = resolve_node_emb_registry_indices(full_node_registry, int(node_embs.shape[0]))
 if node_embs.shape[0] != len(full_node_registry):
@@ -277,7 +288,7 @@ if hp.LEAF_ONLY_RETRIEVAL:
     node_registry = [aligned_node_registry[row_idx] for row_idx in leaf_row_indices]
 else:
     node_registry = aligned_node_registry
-retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
+retriever = build_retriever(hp.RETRIEVER_MODEL_PATH, subset=hp.SUBSET, local_files_only=True)
 
 samples = []
 for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
@@ -294,9 +305,6 @@ for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
     })
 
 logger.info(f"Loaded {len(samples)} eval samples.")
-
-metrics_path = f"{RESULTS_DIR}/leaf_iter_metrics.jsonl"
-iter_records_path = f"{RESULTS_DIR}/leaf_iter_records.jsonl"
 rewrite_records = []
 
 # Intent: preserve legacy behavior by default, while allowing no-initial-rewrite ablation via a flag.
@@ -524,4 +532,7 @@ for iter_idx in range(hp.NUM_ITERS):
 
 logger.info("Saved metrics to %s", metrics_path)
 logger.info("Saved retrieval records to %s", iter_records_path)
+with open(done_marker_path, "w", encoding="utf-8") as f:
+    json.dump({"status": "completed", "num_iters": int(hp.NUM_ITERS)}, f, ensure_ascii=True, indent=2)
+logger.info("Wrote completion marker to %s", done_marker_path)
 logger.info("Completed run_leaf_rank.py.")

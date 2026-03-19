@@ -17,6 +17,7 @@ from hyperparams import HyperParams
 from tree_objects import SemanticNode, InferSample
 from llm_apis import GenAIAPI, VllmAPI
 from prompts import get_traversal_prompt_response_constraint, get_reranking_prompt
+from retrievers import build_retriever
 from rewrite_prompts import REWRITE_PROMPT_TEMPLATES
 from qe_prompts import QE_PROMPT_TEMPLATES
 from rewrite_pipeline import SchemaGenerator
@@ -684,11 +685,10 @@ if True:
             raise ValueError('--retriever_model_path is required when --flat_then_tree is set')
         if not hp.NODE_EMB_PATH:
             raise ValueError('--node_emb_path is required when --flat_then_tree is set')
-        from retrievers.diver import DiverEmbeddingModel
         node_embs = np.load(hp.NODE_EMB_PATH, allow_pickle=False)
         if node_embs.shape[0] != len(node_registry):
             raise ValueError(f'node_embs rows ({node_embs.shape[0]}) must match node_registry size ({len(node_registry)})')
-        retriever = DiverEmbeddingModel(hp.RETRIEVER_MODEL_PATH, local_files_only=True)
+        retriever = build_retriever(hp.RETRIEVER_MODEL_PATH, subset=hp.SUBSET, local_files_only=True)
         schema_depth1_indices = [
             idx for idx, node in enumerate(node_registry)
             if (len(node.path) == 1 and (not node.is_leaf))
