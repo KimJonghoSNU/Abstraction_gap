@@ -25,6 +25,7 @@ from utils import (
     compute_ndcg,
     compute_node_registry,
     compute_recall,
+    filter_excluded_predictions,
     get_node_id,
     normalize_embeddings,
     save_exp,
@@ -563,6 +564,7 @@ def _bank_entry_from_hits(
     *,
     hits: Sequence[FlatHit],
     gold_doc_ids: Sequence[str],
+    excluded_doc_ids: Optional[Sequence[str]],
     path_to_doc_id: Dict[Tuple[int, ...], str],
     iter_idx: int,
     explore_step: bool,
@@ -571,7 +573,8 @@ def _bank_entry_from_hits(
     registry_indices = np.asarray([int(hit.registry_idx) for hit in hits], dtype=np.int32)
     scores = np.asarray([float(hit.score) for hit in hits], dtype=np.float32)
     doc_ids = _paths_to_ranked_doc_ids([tuple(hit.path) for hit in hits], path_to_doc_id)
-    run_ndcg10 = compute_ndcg(doc_ids[:10], list(gold_doc_ids), k=10) * 100.0
+    eval_doc_ids = filter_excluded_predictions(doc_ids, excluded_doc_ids)
+    run_ndcg10 = compute_ndcg(eval_doc_ids, list(gold_doc_ids), k=10) * 100.0
     return {
         "iter": int(iter_idx),
         "explore_step": bool(explore_step),
@@ -579,20 +582,21 @@ def _bank_entry_from_hits(
         "registry_indices": registry_indices,
         "scores": scores,
         "ndcg10": float(run_ndcg10),
-        "top_doc_ids": list(doc_ids[:10]),
+        "top_doc_ids": list(eval_doc_ids[:10]),
     }
 
 
 def _compute_retrieval_metrics(
     doc_ids: Sequence[str],
     gold_doc_ids: Sequence[str],
+    excluded_doc_ids: Optional[Sequence[str]] = None,
 ) -> Dict[str, float]:
-    ranked_doc_ids = list(doc_ids)
+    ranked_doc_ids = filter_excluded_predictions(list(doc_ids), excluded_doc_ids)
     gold_ranked_doc_ids = list(gold_doc_ids)
     return {
-        "nDCG@10": compute_ndcg(ranked_doc_ids[:10], gold_ranked_doc_ids, k=10) * 100,
-        "Recall@10": compute_recall(ranked_doc_ids[:10], gold_ranked_doc_ids, k=10) * 100,
-        "Recall@100": compute_recall(ranked_doc_ids[:100], gold_ranked_doc_ids, k=100) * 100,
+        "nDCG@10": compute_ndcg(ranked_doc_ids, gold_ranked_doc_ids, k=10) * 100,
+        "Recall@10": compute_recall(ranked_doc_ids, gold_ranked_doc_ids, k=10) * 100,
+        "Recall@100": compute_recall(ranked_doc_ids, gold_ranked_doc_ids, k=100) * 100,
         "Recall@all": compute_recall(ranked_doc_ids, gold_ranked_doc_ids, k=len(ranked_doc_ids)) * 100,
         "Coverage": float(len(ranked_doc_ids)),
     }
@@ -1964,19 +1968,26 @@ for iter_idx in range(hp.NUM_ITERS):
         )
         eval_paths = [tuple(hit.path) for hit in eval_hits]
         eval_doc_ids = _paths_to_ranked_doc_ids(eval_paths, path_to_doc_id)
+        eval_doc_ids_eval = filter_excluded_predictions(eval_doc_ids, getattr(sample, "excluded_ids_set", None))
         gold_doc_ids = [str(x) for x in sample.gold_doc_ids]
         bank_entry = _bank_entry_from_hits(
             hits=eval_hits,
             gold_doc_ids=gold_doc_ids,
+            excluded_doc_ids=list(getattr(sample, "excluded_ids_set", set()) or []),
             path_to_doc_id=path_to_doc_id,
             iter_idx=iter_idx,
             explore_step=bool(info.get("explore_effective", False)),
             query_post=query_post,
         )
-        current_run_metrics = _compute_retrieval_metrics(eval_doc_ids, gold_doc_ids)
+        current_run_metrics = _compute_retrieval_metrics(
+            eval_doc_ids,
+            gold_doc_ids,
+            excluded_doc_ids=getattr(sample, "excluded_ids_set", None),
+        )
         info["cumulative_pool_eval_size"] = int(len(cumulative_pool_eval))
         info["eval_paths"] = [list(p) for p in eval_paths]
         info["eval_doc_ids"] = list(eval_doc_ids)
+        info["eval_doc_ids_eval"] = list(eval_doc_ids_eval)
         info["gold_doc_ids"] = list(gold_doc_ids)
         info["current_run_bank_entry"] = bank_entry
         info["current_run_metrics"] = {str(k): float(v) for k, v in current_run_metrics.items()}
@@ -2475,7 +2486,7 @@ for iter_idx in range(hp.NUM_ITERS):
             for k, v in dict(info.get("current_run_metrics", {}) or {}).items()
         }
         active_eval_hits: List[FlatHit] = []
-        active_eval_doc_ids = list(info.get("eval_doc_ids", []))
+        active_eval_doc_ids = list(info.get("eval_doc_ids_eval", []))
         active_metrics = dict(current_run_metrics)
         leaf_trigger_active_hits: List[FlatHit] = []
         leaf_trigger_active_doc_ids: List[str] = []
@@ -2511,14 +2522,22 @@ for iter_idx in range(hp.NUM_ITERS):
                     [tuple(hit.path) for hit in fused_hits_all_iters],
                     path_to_doc_id,
                 )
-                metrics_all_iters = _compute_retrieval_metrics(fused_doc_ids_all_iters, info.get("gold_doc_ids", []))
+                fused_doc_ids_all_iters_eval = filter_excluded_predictions(
+                    fused_doc_ids_all_iters,
+                    getattr(sample, "excluded_ids_set", None),
+                )
+                metrics_all_iters = _compute_retrieval_metrics(
+                    fused_doc_ids_all_iters,
+                    info.get("gold_doc_ids", []),
+                    excluded_doc_ids=getattr(sample, "excluded_ids_set", None),
+                )
                 fusion_metrics_all_iters_by_mode[fusion_mode_name] = {
                     str(k): float(v) for k, v in metrics_all_iters.items()
                 }
                 fusion_diag_ndcg_by_mode_all_iters[fusion_mode_name].append(float(metrics_all_iters["nDCG@10"]))
                 if round6_method2_mode == "archive_replace" and fusion_mode_name == round6_fusion_mode:
                     active_eval_hits = list(fused_hits_all_iters)
-                    active_eval_doc_ids = list(fused_doc_ids_all_iters)
+                    active_eval_doc_ids = list(fused_doc_ids_all_iters_eval)
                     active_metrics = dict(metrics_all_iters)
 
                 if bank_entries_leaf_trigger_only:
@@ -2537,6 +2556,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     metrics_leaf_trigger_only = _compute_retrieval_metrics(
                         fused_doc_ids_leaf_trigger_only,
                         info.get("gold_doc_ids", []),
+                        excluded_doc_ids=getattr(sample, "excluded_ids_set", None),
                     )
                 else:
                     fused_hits_leaf_trigger_only = []
@@ -2553,10 +2573,10 @@ for iter_idx in range(hp.NUM_ITERS):
             if round6_method2_mode != "archive_replace":
                 # Intent: expandable_pool uses fusion outputs as diagnostics only; official metrics stay on the current retrieval run.
                 active_eval_hits = []
-                active_eval_doc_ids = list(info.get("eval_doc_ids", []))
+                active_eval_doc_ids = list(info.get("eval_doc_ids_eval", []))
                 active_metrics = dict(current_run_metrics)
         else:
-            active_eval_doc_ids = list(info.get("eval_doc_ids", []))
+            active_eval_doc_ids = list(info.get("eval_doc_ids_eval", []))
             active_metrics = dict(current_run_metrics)
 
         active_eval_paths = [list(tuple(hit.path)) for hit in active_eval_hits]
@@ -2710,6 +2730,7 @@ for iter_idx in range(hp.NUM_ITERS):
                 "pre_hit_doc_ids": info.get("pre_hit_doc_ids", []),
                 "local_paths": info.get("eval_paths", []),
                 "local_doc_ids": info.get("eval_doc_ids", []),
+                "local_doc_ids_eval": info.get("eval_doc_ids_eval", []),
                 "active_eval_paths": info.get("active_eval_paths", []),
                 "active_eval_doc_ids": info.get("active_eval_doc_ids", []),
                 "active_eval_leaf_trigger_only_paths": info.get("active_eval_leaf_trigger_only_paths", []),

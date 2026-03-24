@@ -1,6 +1,13 @@
 import re, os, json, hashlib
 import argparse
 
+EMR_DEFAULT_MEMORY_MODE = 'accumulated'
+EMR_DEFAULT_HISTORY_RANK_TOPK = 10
+EMR_DEFAULT_DOC_TOPK = 10
+EMR_DEFAULT_SENT_TOPK = 10
+EMR_DEFAULT_COMPRESSION = 'on'
+EMR_DEFAULT_MEMORY_MAX_TOKENS = 0
+
 def abbreviate_key(key: str) -> str:
     """
     Systematically abbreviate a key by:
@@ -153,16 +160,31 @@ class HyperParams(argparse.Namespace):
             payload.pop('leaf_emr_compression', None)
             payload.pop('leaf_emr_memory_max_tokens', None)
         else:
-            if int(payload.get('leaf_emr_history_rank_topk', 10) or 10) == 10:
+            if int(payload.get('leaf_emr_history_rank_topk', EMR_DEFAULT_HISTORY_RANK_TOPK) or EMR_DEFAULT_HISTORY_RANK_TOPK) == EMR_DEFAULT_HISTORY_RANK_TOPK:
                 payload.pop('leaf_emr_history_rank_topk', None)
-            if int(payload.get('leaf_emr_doc_topk', 10) or 10) == 10:
+            if int(payload.get('leaf_emr_doc_topk', EMR_DEFAULT_DOC_TOPK) or EMR_DEFAULT_DOC_TOPK) == EMR_DEFAULT_DOC_TOPK:
                 payload.pop('leaf_emr_doc_topk', None)
-            if int(payload.get('leaf_emr_sent_topk', 10) or 10) == 10:
+            if int(payload.get('leaf_emr_sent_topk', EMR_DEFAULT_SENT_TOPK) or EMR_DEFAULT_SENT_TOPK) == EMR_DEFAULT_SENT_TOPK:
                 payload.pop('leaf_emr_sent_topk', None)
-            if str(payload.get('leaf_emr_compression', 'on')).lower() == 'on':
+            if str(payload.get('leaf_emr_compression', EMR_DEFAULT_COMPRESSION)).lower() == EMR_DEFAULT_COMPRESSION:
                 payload.pop('leaf_emr_compression', None)
-            if int(payload.get('leaf_emr_memory_max_tokens', 0) or 0) == 0:
+            if int(payload.get('leaf_emr_memory_max_tokens', EMR_DEFAULT_MEMORY_MAX_TOKENS) or EMR_DEFAULT_MEMORY_MAX_TOKENS) == EMR_DEFAULT_MEMORY_MAX_TOKENS:
                 payload.pop('leaf_emr_memory_max_tokens', None)
+        if not bool(payload.get('round6_emr_memory', False)):
+            payload.pop('round6_emr_memory', None)
+            payload.pop('round6_emr_topk', None)
+            payload.pop('round6_emr_sent_topk', None)
+            payload.pop('round6_emr_compression', None)
+            payload.pop('round6_emr_memory_max_tokens', None)
+        else:
+            if int(payload.get('round6_emr_topk', EMR_DEFAULT_DOC_TOPK) or EMR_DEFAULT_DOC_TOPK) == EMR_DEFAULT_DOC_TOPK:
+                payload.pop('round6_emr_topk', None)
+            if int(payload.get('round6_emr_sent_topk', EMR_DEFAULT_SENT_TOPK) or EMR_DEFAULT_SENT_TOPK) == EMR_DEFAULT_SENT_TOPK:
+                payload.pop('round6_emr_sent_topk', None)
+            if str(payload.get('round6_emr_compression', EMR_DEFAULT_COMPRESSION)).lower() == EMR_DEFAULT_COMPRESSION:
+                payload.pop('round6_emr_compression', None)
+            if int(payload.get('round6_emr_memory_max_tokens', EMR_DEFAULT_MEMORY_MAX_TOKENS) or EMR_DEFAULT_MEMORY_MAX_TOKENS) == EMR_DEFAULT_MEMORY_MAX_TOKENS:
+                payload.pop('round6_emr_memory_max_tokens', None)
         if not bool(payload.get('round6_global_escape', False)):
             payload.pop('round6_global_escape', None)
             payload.pop('round6_global_escape_slots', None)
@@ -355,32 +377,32 @@ class HyperParams(argparse.Namespace):
         parser.add_argument(
             '--leaf_emr_history_rank_topk',
             type=int,
-            default=10,
+            default=EMR_DEFAULT_HISTORY_RANK_TOPK,
             help='Number of retrieved doc ids recorded per rewrite step in EMR-style history for run_leaf_rank.py',
         )
         parser.add_argument(
             '--leaf_emr_doc_topk',
             type=int,
-            default=10,
+            default=EMR_DEFAULT_DOC_TOPK,
             help='Number of current retrieved docs admitted into EMR-style document memory per rewrite step',
         )
         parser.add_argument(
             '--leaf_emr_sent_topk',
             type=int,
-            default=10,
+            default=EMR_DEFAULT_SENT_TOPK,
             help='Number of globally selected sentences kept across the cumulative EMR document pool',
         )
         parser.add_argument(
             '--leaf_emr_compression',
             type=str,
-            default='on',
+            default=EMR_DEFAULT_COMPRESSION,
             choices=['on', 'off'],
             help='EMR memory compression mode: on=global sentence filtering, off=full document text with token-budget fitting',
         )
         parser.add_argument(
             '--leaf_emr_memory_max_tokens',
             type=int,
-            default=0,
+            default=EMR_DEFAULT_MEMORY_MAX_TOKENS,
             help='Maximum token budget for the EMR-style document memory block; 0 means auto-fit by model context window',
         )
         parser.add_argument('--use_retriever_traversal', default=False, action='store_true',
@@ -504,6 +526,37 @@ class HyperParams(argparse.Namespace):
             type=str,
             default='agent_executor_v1_icl2_explore',
             help='Rewrite prompt used only on method2 explore steps',
+        )
+        parser.add_argument(
+            '--round6_emr_memory',
+            default=False,
+            action='store_true',
+            help='Enable EMR-style rewrite memory in run_round6.py using cumulative eval-hit documents',
+        )
+        parser.add_argument(
+            '--round6_emr_topk',
+            type=int,
+            default=EMR_DEFAULT_DOC_TOPK,
+            help='Shared top-k for round6 EMR history ranks and eval-hit docs admitted into round6 EMR document memory per iteration',
+        )
+        parser.add_argument(
+            '--round6_emr_sent_topk',
+            type=int,
+            default=EMR_DEFAULT_SENT_TOPK,
+            help='Number of globally selected sentences kept across the cumulative round6 EMR document pool',
+        )
+        parser.add_argument(
+            '--round6_emr_compression',
+            type=str,
+            default=EMR_DEFAULT_COMPRESSION,
+            choices=['on', 'off'],
+            help='Round6 EMR memory compression mode: on=global sentence filtering, off=full document text with token-budget fitting',
+        )
+        parser.add_argument(
+            '--round6_emr_memory_max_tokens',
+            type=int,
+            default=EMR_DEFAULT_MEMORY_MAX_TOKENS,
+            help='Maximum token budget for the round6 EMR document memory block; 0 means auto-fit by model context window',
         )
         parser.add_argument(
             '--mcts_num_simulations',

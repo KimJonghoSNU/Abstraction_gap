@@ -17,8 +17,26 @@ from json_repair import repair_json
 from tqdm.autonotebook import tqdm
 
 from cache_utils import _prompt_cache_key, append_jsonl
+from emr_memory_utils import (
+    EMR_CROSS_ENCODER_MODEL_NAME,
+    EmrMemoryCompressor,
+    RewritePromptTokenBudgeter,
+    append_emr_history_entry as append_shared_emr_history_entry,
+    build_current_doc_memory_items as build_shared_current_doc_memory_items,
+    build_doc_text_map as build_shared_doc_text_map,
+    build_emr_prompt_memory as build_shared_emr_prompt_memory,
+    format_emr_history as format_shared_emr_history,
+    update_accumulated_doc_bank as update_shared_accumulated_doc_bank,
+)
 from flat_then_tree import FlatHit
-from hyperparams import HyperParams
+from hyperparams import (
+    EMR_DEFAULT_COMPRESSION,
+    EMR_DEFAULT_DOC_TOPK,
+    EMR_DEFAULT_HISTORY_RANK_TOPK,
+    EMR_DEFAULT_MEMORY_MAX_TOKENS,
+    EMR_DEFAULT_SENT_TOPK,
+    HyperParams,
+)
 from llm_apis import GenAIAPI, VllmAPI
 from retrievers import build_retriever
 from retrievers.diver import DiverEmbeddingModel
@@ -28,6 +46,7 @@ from utils import (
     compute_ndcg,
     compute_node_registry,
     compute_recall,
+    filter_excluded_predictions,
     get_node_id,
     normalize_embeddings,
     pad_node_embeddings_to_registry,
@@ -220,6 +239,8 @@ def _format_rewrite_prompt(
     domain_route_hint: str = "",
     relevance_definition: str = "",
     seen_direction_evidence: str = "",
+    history_actions: str = "",
+    memory_docs: str = "",
 ) -> str:
     leaf_blob = "\n".join([x for x in leaf_descs if x])
     gate_blob = leaf_blob
@@ -240,6 +261,8 @@ def _format_rewrite_prompt(
             domain_route_hint=domain_route_hint or "",
             relevance_definition=relevance_definition or "",
             seen_direction_evidence=seen_direction_evidence or "",
+            history_actions=history_actions or "",
+            memory_docs=memory_docs or "",
             corpus_categories="",
         )
     except KeyError:
@@ -254,6 +277,8 @@ def _format_rewrite_prompt(
             .replace("{domain_route_hint}", domain_route_hint or "")
             .replace("{relevance_definition}", relevance_definition or "")
             .replace("{seen_direction_evidence}", seen_direction_evidence or "")
+            .replace("{history_actions}", history_actions or "")
+            .replace("{memory_docs}", memory_docs or "")
             .replace("{corpus_categories}", "")
         )
 
@@ -567,6 +592,7 @@ def _bank_entry_from_hits(
     *,
     hits: Sequence[FlatHit],
     gold_doc_ids: Sequence[str],
+    excluded_doc_ids: Optional[Sequence[str]],
     path_to_doc_id: Dict[Tuple[int, ...], str],
     iter_idx: int,
     explore_step: bool,
@@ -575,7 +601,8 @@ def _bank_entry_from_hits(
     registry_indices = np.asarray([int(hit.registry_idx) for hit in hits], dtype=np.int32)
     scores = np.asarray([float(hit.score) for hit in hits], dtype=np.float32)
     doc_ids = _paths_to_ranked_doc_ids([tuple(hit.path) for hit in hits], path_to_doc_id)
-    run_ndcg10 = compute_ndcg(doc_ids[:10], list(gold_doc_ids), k=10) * 100.0
+    eval_doc_ids = filter_excluded_predictions(doc_ids, excluded_doc_ids)
+    run_ndcg10 = compute_ndcg(eval_doc_ids, list(gold_doc_ids), k=10) * 100.0
     return {
         "iter": int(iter_idx),
         "explore_step": bool(explore_step),
@@ -583,20 +610,22 @@ def _bank_entry_from_hits(
         "registry_indices": registry_indices,
         "scores": scores,
         "ndcg10": float(run_ndcg10),
-        "top_doc_ids": list(doc_ids[:10]),
+        "top_doc_ids": list(eval_doc_ids[:10]),
     }
 
 
 def _compute_retrieval_metrics(
     doc_ids: Sequence[str],
     gold_doc_ids: Sequence[str],
+    excluded_doc_ids: Optional[Sequence[str]] = None,
 ) -> Dict[str, float]:
-    ranked_doc_ids = list(doc_ids)
+    # Intent: BRIGHT excluded_ids should be removed before top-k truncation so official scores match benchmark evaluation.
+    ranked_doc_ids = filter_excluded_predictions(list(doc_ids), excluded_doc_ids)
     gold_ranked_doc_ids = list(gold_doc_ids)
     return {
-        "nDCG@10": compute_ndcg(ranked_doc_ids[:10], gold_ranked_doc_ids, k=10) * 100,
-        "Recall@10": compute_recall(ranked_doc_ids[:10], gold_ranked_doc_ids, k=10) * 100,
-        "Recall@100": compute_recall(ranked_doc_ids[:100], gold_ranked_doc_ids, k=100) * 100,
+        "nDCG@10": compute_ndcg(ranked_doc_ids, gold_ranked_doc_ids, k=10) * 100,
+        "Recall@10": compute_recall(ranked_doc_ids, gold_ranked_doc_ids, k=10) * 100,
+        "Recall@100": compute_recall(ranked_doc_ids, gold_ranked_doc_ids, k=100) * 100,
         "Recall@all": compute_recall(ranked_doc_ids, gold_ranked_doc_ids, k=len(ranked_doc_ids)) * 100,
         "Coverage": float(len(ranked_doc_ids)),
     }
@@ -1494,10 +1523,14 @@ round5_mode = "legacy"
 if hp.REWRITE_PROMPT_PATH:
     print("Ignoring --rewrite_prompt_path in run_round6.py (template path override is disabled).")
 
+round6_emr_memory = bool(getattr(hp, "ROUND6_EMR_MEMORY", False))
 round5_rewrite_prompt_name = "agent_executor_v1"
 requested_prompt_name = str(hp.REWRITE_PROMPT_NAME or "").strip()
 if requested_prompt_name:
     round5_rewrite_prompt_name = requested_prompt_name
+# Intent: keep the default round6 expandable prompt stable while auto-switching to the memory-aware variant only for EMR runs.
+if round6_emr_memory and round5_rewrite_prompt_name == "agent_executor_v1_icl2":
+    round5_rewrite_prompt_name = "agent_executor_v1_icl2_emr_memory"
 # Intent: legacy mode accepts any registered rewrite template so prompt ablations can reuse --rewrite_prompt_name.
 if round5_rewrite_prompt_name not in REWRITE_PROMPT_TEMPLATES:
     raise ValueError(
@@ -1609,6 +1642,17 @@ hp.add_param("round6_method2_mode", round6_method2_mode)
 hp.add_param("round6_expandable_pool_freeze_terminal_beam", round6_expandable_pool_freeze_terminal_beam)
 hp.add_param("round6_fusion_mode", round6_fusion_mode)
 hp.add_param("round6_explore_prompt_name", round6_explore_prompt_name)
+round6_emr_topk = max(1, int(getattr(hp, "ROUND6_EMR_TOPK", EMR_DEFAULT_DOC_TOPK) or EMR_DEFAULT_DOC_TOPK))
+round6_emr_sent_topk = max(1, int(getattr(hp, "ROUND6_EMR_SENT_TOPK", EMR_DEFAULT_SENT_TOPK) or EMR_DEFAULT_SENT_TOPK))
+round6_emr_compression = str(getattr(hp, "ROUND6_EMR_COMPRESSION", EMR_DEFAULT_COMPRESSION) or EMR_DEFAULT_COMPRESSION).strip().lower()
+if round6_emr_compression not in {"on", "off"}:
+    raise ValueError(f'Unsupported --round6_emr_compression "{round6_emr_compression}". Allowed: on|off')
+round6_emr_memory_max_tokens = int(getattr(hp, "ROUND6_EMR_MEMORY_MAX_TOKENS", EMR_DEFAULT_MEMORY_MAX_TOKENS) or EMR_DEFAULT_MEMORY_MAX_TOKENS)
+hp.add_param("round6_emr_memory", round6_emr_memory)
+hp.add_param("round6_emr_topk", round6_emr_topk)
+hp.add_param("round6_emr_sent_topk", round6_emr_sent_topk)
+hp.add_param("round6_emr_compression", round6_emr_compression)
+hp.add_param("round6_emr_memory_max_tokens", round6_emr_memory_max_tokens)
 
 exp_dir_name = str(hp)
 RESULTS_DIR = f"{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/round6/{exp_dir_name}/"
@@ -1645,6 +1689,14 @@ logger.info(
     round6_method2_mode,
     str(round6_expandable_pool_freeze_terminal_beam).lower(),
     round6_fusion_mode,
+)
+logger.info(
+    "Round6 EMR memory | enabled=%s | topk=%d | sent_topk=%d | compression=%s | max_memory_tokens=%d",
+    str(round6_emr_memory).lower(),
+    int(round6_emr_topk),
+    int(round6_emr_sent_topk),
+    round6_emr_compression,
+    int(round6_emr_memory_max_tokens),
 )
 
 if not hp.REWRITE_CACHE_PATH:
@@ -1755,6 +1807,7 @@ registry_idx_to_doc_id: Dict[int, str] = {}
 for path_t, doc_id in path_to_doc_id.items():
     if path_t in path_to_registry_idx:
         registry_idx_to_doc_id[int(path_to_registry_idx[path_t])] = str(doc_id)
+doc_text_by_id = build_shared_doc_text_map(docs_df)
 
 if not hp.RETRIEVER_MODEL_PATH:
     raise ValueError("--retriever_model_path is required")
@@ -1817,6 +1870,20 @@ llm_api_kwargs = {
     "temperature": 0.0,
 }
 
+round6_emr_compressor: Optional[EmrMemoryCompressor] = None
+round6_rewrite_prompt_budgeter: Optional[RewritePromptTokenBudgeter] = None
+if round6_emr_memory:
+    round6_emr_compressor = EmrMemoryCompressor(
+        model_name=EMR_CROSS_ENCODER_MODEL_NAME,
+        sent_topk=round6_emr_sent_topk,
+        logger=logger,
+    )
+    round6_rewrite_prompt_budgeter = RewritePromptTokenBudgeter(
+        model_name=str(hp.LLM),
+        backend=str(hp.LLM_API_BACKEND),
+        logger=logger,
+    )
+
 num_samples = min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)
 all_eval_samples: List[InferSample] = []
 for i in range(num_samples):
@@ -1846,6 +1913,9 @@ for i in range(num_samples):
     sample.last_rewrite_raw = ""
     sample.rewrite_history = []
     sample.iter_records = []
+    sample.round6_emr_history = []
+    sample.round6_emr_doc_bank = {}
+    sample.round6_emr_doc_bank_next_order = 0
     sample.round6_pending_explore = False
     # Intent: Go-Explore state is the archived parent decision and which child branches have already been taken there.
     sample.round6_archive_records = {}
@@ -2023,6 +2093,48 @@ for iter_idx in range(hp.NUM_ITERS):
             topk=hp.REWRITE_CONTEXT_TOPK,
             max_desc_len=hp.MAX_DOC_DESC_CHAR_LEN,
         )
+        emr_state = {
+            "history_text": format_shared_emr_history(getattr(sample, "round6_emr_history", []) or []),
+            "memory_text": "",
+            "memory_doc_ids": [],
+            "memory_items": [],
+            "overflow_dropped": [],
+            "memory_source": "off",
+            "memory_pool_doc_ids": [],
+            "selected_sentences": [],
+            "compression_mode": round6_emr_compression,
+            "prompt_total_tokens": None,
+            "memory_prompt_tokens": None,
+            "prompt_budget_tokens": None,
+            "model_context_tokens": (
+                round6_rewrite_prompt_budgeter.max_context_tokens
+                if round6_rewrite_prompt_budgeter is not None
+                else None
+            ),
+        }
+        if round6_emr_memory:
+            emr_state = build_shared_emr_prompt_memory(
+                mode="accumulated",
+                history_entries=list(getattr(sample, "round6_emr_history", []) or []),
+                doc_bank=dict(getattr(sample, "round6_emr_doc_bank", {}) or {}),
+                query_for_memory=query_pre,
+                compressor=round6_emr_compressor,
+                doc_text_by_id=doc_text_by_id,
+                render_prompt=lambda history_text, memory_text: _format_rewrite_prompt(
+                    prompt_template_for_iter,
+                    original_query=str(sample.original_query),
+                    previous_rewrite=str(getattr(sample, "last_rewrite_raw", "") or ""),
+                    leaf_descs=leaf_descs,
+                    domain_route_hint=subset_domain_route_hint,
+                    relevance_definition=subset_relevance_definition,
+                    history_actions=history_text,
+                    memory_docs=memory_text,
+                ),
+                prompt_budgeter=round6_rewrite_prompt_budgeter,
+                compression_mode=round6_emr_compression,
+                max_memory_tokens=round6_emr_memory_max_tokens,
+                memory_source_label="eval_hits_accumulated",
+            )
         rewrite_state_by_sample_idx[sample_idx] = {
             "cache_key": "",
             "cache_hit": False,
@@ -2074,6 +2186,21 @@ for iter_idx in range(hp.NUM_ITERS):
             # Intent: persist rewrite-time retrieval evidence (query_pre) for off-branch/noise attribution analysis.
             "pre_hit_paths": [list(p) for p in pre_hit_paths],
             "pre_hit_doc_ids": list(pre_hit_doc_ids),
+            "emr_history": list(getattr(sample, "round6_emr_history", []) or []),
+            "emr_memory_mode": "accumulated" if round6_emr_memory else "off",
+            "emr_memory_compression": round6_emr_compression,
+            "emr_history_prompt_text": emr_state["history_text"],
+            "emr_memory_source": emr_state["memory_source"],
+            "emr_memory_doc_ids": list(emr_state["memory_doc_ids"]),
+            "emr_memory_docs_count": int(len(emr_state["memory_doc_ids"])),
+            "emr_memory_prompt_text": emr_state["memory_text"],
+            "emr_memory_overflow_dropped": list(emr_state["overflow_dropped"]),
+            "emr_memory_pool_doc_ids": list(emr_state["memory_pool_doc_ids"]),
+            "emr_memory_selected_sentences": list(emr_state["selected_sentences"]),
+            "emr_memory_prompt_tokens": emr_state["memory_prompt_tokens"],
+            "emr_prompt_total_tokens": emr_state["prompt_total_tokens"],
+            "emr_prompt_budget_tokens": emr_state["prompt_budget_tokens"],
+            "emr_model_context_tokens": emr_state["model_context_tokens"],
             "eval_paths": [],
             "eval_doc_ids": [],
             "active_eval_paths": [],
@@ -2094,6 +2221,8 @@ for iter_idx in range(hp.NUM_ITERS):
             leaf_descs=leaf_descs,
             domain_route_hint=subset_domain_route_hint,
             relevance_definition=subset_relevance_definition,
+            history_actions=emr_state["history_text"],
+            memory_docs=emr_state["memory_text"],
         )
         cache_key = _prompt_cache_key("round5", prompt)
         cache_hit = (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map)
@@ -2201,19 +2330,26 @@ for iter_idx in range(hp.NUM_ITERS):
         )
         eval_paths = [tuple(hit.path) for hit in eval_hits]
         eval_doc_ids = _paths_to_ranked_doc_ids(eval_paths, path_to_doc_id)
+        eval_doc_ids_eval = filter_excluded_predictions(eval_doc_ids, getattr(sample, "excluded_ids_set", None))
         gold_doc_ids = [str(x) for x in sample.gold_doc_ids]
         bank_entry = _bank_entry_from_hits(
             hits=eval_hits,
             gold_doc_ids=gold_doc_ids,
+            excluded_doc_ids=list(getattr(sample, "excluded_ids_set", set()) or []),
             path_to_doc_id=path_to_doc_id,
             iter_idx=iter_idx,
             explore_step=bool(info.get("explore_effective", False)),
             query_post=query_post,
         )
-        current_run_metrics = _compute_retrieval_metrics(eval_doc_ids, gold_doc_ids)
+        current_run_metrics = _compute_retrieval_metrics(
+            eval_doc_ids,
+            gold_doc_ids,
+            excluded_doc_ids=getattr(sample, "excluded_ids_set", None),
+        )
         info["cumulative_pool_eval_size"] = int(len(cumulative_pool_eval))
         info["eval_paths"] = [list(p) for p in eval_paths]
         info["eval_doc_ids"] = list(eval_doc_ids)
+        info["eval_doc_ids_eval"] = list(eval_doc_ids_eval)
         info["gold_doc_ids"] = list(gold_doc_ids)
         info["current_run_bank_entry"] = bank_entry
         info["current_run_metrics"] = {str(k): float(v) for k, v in current_run_metrics.items()}
@@ -2848,7 +2984,7 @@ for iter_idx in range(hp.NUM_ITERS):
             for k, v in dict(info.get("current_run_metrics", {}) or {}).items()
         }
         active_eval_hits: List[FlatHit] = []
-        active_eval_doc_ids = list(info.get("eval_doc_ids", []))
+        active_eval_doc_ids = list(info.get("eval_doc_ids_eval", []))
         active_metrics = dict(current_run_metrics)
         leaf_trigger_active_hits: List[FlatHit] = []
         leaf_trigger_active_doc_ids: List[str] = []
@@ -2884,14 +3020,22 @@ for iter_idx in range(hp.NUM_ITERS):
                     [tuple(hit.path) for hit in fused_hits_all_iters],
                     path_to_doc_id,
                 )
-                metrics_all_iters = _compute_retrieval_metrics(fused_doc_ids_all_iters, info.get("gold_doc_ids", []))
+                fused_doc_ids_all_iters_eval = filter_excluded_predictions(
+                    fused_doc_ids_all_iters,
+                    getattr(sample, "excluded_ids_set", None),
+                )
+                metrics_all_iters = _compute_retrieval_metrics(
+                    fused_doc_ids_all_iters,
+                    info.get("gold_doc_ids", []),
+                    excluded_doc_ids=getattr(sample, "excluded_ids_set", None),
+                )
                 fusion_metrics_all_iters_by_mode[fusion_mode_name] = {
                     str(k): float(v) for k, v in metrics_all_iters.items()
                 }
                 fusion_diag_ndcg_by_mode_all_iters[fusion_mode_name].append(float(metrics_all_iters["nDCG@10"]))
                 if round6_method2_mode == "archive_replace" and fusion_mode_name == round6_fusion_mode:
                     active_eval_hits = list(fused_hits_all_iters)
-                    active_eval_doc_ids = list(fused_doc_ids_all_iters)
+                    active_eval_doc_ids = list(fused_doc_ids_all_iters_eval)
                     active_metrics = dict(metrics_all_iters)
 
                 if bank_entries_leaf_trigger_only:
@@ -2910,6 +3054,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     metrics_leaf_trigger_only = _compute_retrieval_metrics(
                         fused_doc_ids_leaf_trigger_only,
                         info.get("gold_doc_ids", []),
+                        excluded_doc_ids=getattr(sample, "excluded_ids_set", None),
                     )
                 else:
                     fused_hits_leaf_trigger_only = []
@@ -2920,16 +3065,21 @@ for iter_idx in range(hp.NUM_ITERS):
                 }
                 if fusion_mode_name == round6_fusion_mode:
                     leaf_trigger_active_hits = list(fused_hits_leaf_trigger_only)
-                    leaf_trigger_active_doc_ids = list(fused_doc_ids_leaf_trigger_only)
+                    leaf_trigger_active_doc_ids = list(
+                        filter_excluded_predictions(
+                            fused_doc_ids_leaf_trigger_only,
+                            getattr(sample, "excluded_ids_set", None),
+                        )
+                    )
                     leaf_trigger_active_metrics = dict(metrics_leaf_trigger_only)
                     fusion_diag_ndcg_leaf_trigger_only.append(float(metrics_leaf_trigger_only["nDCG@10"]))
             if round6_method2_mode != "archive_replace":
                 # Intent: expandable_pool uses fusion outputs as diagnostics only; official metrics stay on the current retrieval run.
                 active_eval_hits = []
-                active_eval_doc_ids = list(info.get("eval_doc_ids", []))
+                active_eval_doc_ids = list(info.get("eval_doc_ids_eval", []))
                 active_metrics = dict(current_run_metrics)
         else:
-            active_eval_doc_ids = list(info.get("eval_doc_ids", []))
+            active_eval_doc_ids = list(info.get("eval_doc_ids_eval", []))
             active_metrics = dict(current_run_metrics)
 
         active_eval_paths = [list(tuple(hit.path)) for hit in active_eval_hits]
@@ -2977,6 +3127,30 @@ for iter_idx in range(hp.NUM_ITERS):
             dict(getattr(sample, "round6_archive_records", {}) or {}),
             child_branch_paths_by_path,
         )
+        if round6_emr_memory:
+            appended_doc_ids = build_shared_current_doc_memory_items(
+                retrieved_doc_ids=info.get("eval_doc_ids", []),
+                doc_text_by_id=doc_text_by_id,
+                doc_topk=round6_emr_topk,
+            )
+            sample.round6_emr_doc_bank_next_order = update_shared_accumulated_doc_bank(
+                getattr(sample, "round6_emr_doc_bank", {}),
+                next_order=int(getattr(sample, "round6_emr_doc_bank_next_order", 0) or 0),
+                current_doc_ids=appended_doc_ids,
+                iter_idx=iter_idx,
+                query_for_memory=str(info.get("query_post", "") or ""),
+            )
+            append_shared_emr_history_entry(
+                getattr(sample, "round6_emr_history", []),
+                applied_query=str(info.get("query_post", "") or ""),
+                retrieved_doc_ids=info.get("eval_doc_ids", []),
+                history_rank_topk=round6_emr_topk,
+            )
+            info["emr_history_after_write"] = list(getattr(sample, "round6_emr_history", []) or [])
+            info["emr_memory_appended_doc_ids"] = list(appended_doc_ids)
+        else:
+            info["emr_history_after_write"] = list(getattr(sample, "round6_emr_history", []) or [])
+            info["emr_memory_appended_doc_ids"] = []
 
     iter_df = pd.DataFrame(retrieval_rows)
     branch_metric_df = _compute_branch_metrics_from_samples(all_eval_samples)
@@ -3091,10 +3265,28 @@ for iter_idx in range(hp.NUM_ITERS):
                 "cumulative_pool_pre_size": int(info.get("cumulative_pool_pre_size", 0)),
                 "masked_pool_pre_size": int(info.get("masked_pool_pre_size", 0)),
                 "cumulative_pool_eval_size": int(info.get("cumulative_pool_eval_size", 0)),
+                "emr_history": info.get("emr_history", []),
+                "emr_memory_mode": str(info.get("emr_memory_mode", "off")),
+                "emr_memory_compression": str(info.get("emr_memory_compression", round6_emr_compression)),
+                "emr_history_prompt_text": str(info.get("emr_history_prompt_text", "")),
+                "emr_history_after_write": info.get("emr_history_after_write", []),
+                "emr_memory_source": str(info.get("emr_memory_source", "off")),
+                "emr_memory_doc_ids": info.get("emr_memory_doc_ids", []),
+                "emr_memory_docs_count": int(info.get("emr_memory_docs_count", 0)),
+                "emr_memory_pool_doc_ids": info.get("emr_memory_pool_doc_ids", []),
+                "emr_memory_selected_sentences": info.get("emr_memory_selected_sentences", []),
+                "emr_memory_prompt_text": str(info.get("emr_memory_prompt_text", "")),
+                "emr_memory_overflow_dropped": info.get("emr_memory_overflow_dropped", []),
+                "emr_memory_prompt_tokens": info.get("emr_memory_prompt_tokens", None),
+                "emr_prompt_total_tokens": info.get("emr_prompt_total_tokens", None),
+                "emr_prompt_budget_tokens": info.get("emr_prompt_budget_tokens", None),
+                "emr_model_context_tokens": info.get("emr_model_context_tokens", None),
+                "emr_memory_appended_doc_ids": info.get("emr_memory_appended_doc_ids", []),
                 "pre_hit_paths": info.get("pre_hit_paths", []),
                 "pre_hit_doc_ids": info.get("pre_hit_doc_ids", []),
                 "local_paths": info.get("eval_paths", []),
                 "local_doc_ids": info.get("eval_doc_ids", []),
+                "local_doc_ids_eval": info.get("eval_doc_ids_eval", []),
                 "active_eval_paths": info.get("active_eval_paths", []),
                 "active_eval_doc_ids": info.get("active_eval_doc_ids", []),
                 "active_eval_leaf_trigger_only_paths": info.get("active_eval_leaf_trigger_only_paths", []),

@@ -103,6 +103,32 @@ def compute_recall(sorted_preds: list, gold: list, k: int = 10) -> float:
     num_relevant_items = len(gold)
     num_relevant_retrieved = sum([1 for pred_item in sorted_preds if pred_item in gold])
     return num_relevant_retrieved / num_relevant_items
+
+
+def filter_excluded_predictions(sorted_preds: list, excluded_items=None) -> list:
+    # Intent: BRIGHT excluded_ids must be removed before top-k truncation so later ranks can move up for evaluation.
+    if not sorted_preds:
+        return []
+    if not excluded_items:
+        return list(sorted_preds)
+
+    excluded_set = set()
+    for item in excluded_items:
+        if isinstance(item, str):
+            excluded_set.add(item.strip())
+        else:
+            excluded_set.add(item)
+
+    filtered = []
+    for pred_item in sorted_preds:
+        if isinstance(pred_item, str):
+            pred_key = pred_item.strip()
+        else:
+            pred_key = pred_item
+        if pred_key in excluded_set:
+            continue
+        filtered.append(pred_item)
+    return filtered
 #endregion
 
 def chain_path_rel_fn(cur_rel, path_rel, relevance_chain_factor):

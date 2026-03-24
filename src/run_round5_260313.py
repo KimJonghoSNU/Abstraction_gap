@@ -25,6 +25,7 @@ from utils import (
     compute_ndcg,
     compute_node_registry,
     compute_recall,
+    filter_excluded_predictions,
     get_node_id,
     normalize_embeddings,
     save_exp,
@@ -1662,19 +1663,21 @@ for iter_idx in range(hp.NUM_ITERS):
         )
         eval_paths = [tuple(hit.path) for hit in eval_hits]
         eval_doc_ids = _paths_to_ranked_doc_ids(eval_paths, path_to_doc_id)
+        eval_doc_ids_eval = filter_excluded_predictions(eval_doc_ids, getattr(sample, "excluded_ids_set", None))
         gold_doc_ids = [str(x) for x in sample.gold_doc_ids]
         retrieval_rows.append(
             {
-                "nDCG@10": compute_ndcg(eval_doc_ids[:10], gold_doc_ids, k=10) * 100,
-                "Recall@10": compute_recall(eval_doc_ids[:10], gold_doc_ids, k=10) * 100,
-                "Recall@100": compute_recall(eval_doc_ids[:100], gold_doc_ids, k=100) * 100,
-                "Recall@all": compute_recall(eval_doc_ids, gold_doc_ids, k=len(eval_doc_ids)) * 100,
-                "Coverage": float(len(eval_doc_ids)),
+                "nDCG@10": compute_ndcg(eval_doc_ids_eval, gold_doc_ids, k=10) * 100,
+                "Recall@10": compute_recall(eval_doc_ids_eval, gold_doc_ids, k=10) * 100,
+                "Recall@100": compute_recall(eval_doc_ids_eval, gold_doc_ids, k=100) * 100,
+                "Recall@all": compute_recall(eval_doc_ids_eval, gold_doc_ids, k=len(eval_doc_ids_eval)) * 100,
+                "Coverage": float(len(eval_doc_ids_eval)),
             }
         )
         info["cumulative_pool_eval_size"] = int(len(cumulative_pool_eval))
         info["eval_paths"] = [list(p) for p in eval_paths]
         info["eval_doc_ids"] = list(eval_doc_ids)
+        info["eval_doc_ids_eval"] = list(eval_doc_ids_eval)
         info["gold_doc_ids"] = list(gold_doc_ids)
         sample.rewrite_history.append(
             {
@@ -1898,6 +1901,7 @@ for iter_idx in range(hp.NUM_ITERS):
                 "pre_hit_doc_ids": info.get("pre_hit_doc_ids", []),
                 "local_paths": info.get("eval_paths", []),
                 "local_doc_ids": info.get("eval_doc_ids", []),
+                "local_doc_ids_eval": info.get("eval_doc_ids_eval", []),
                 "gold_doc_ids": info.get("gold_doc_ids", []),
                 "metrics": metrics,
             }
