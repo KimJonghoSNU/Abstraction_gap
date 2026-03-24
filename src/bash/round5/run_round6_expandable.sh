@@ -9,11 +9,15 @@ log() {
 
 log "Starting run_round6_expandable.sh script"
 
-RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
+# RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
+RETRIEVER_MODEL_PATH="/data2/pretrained_models/reason-embed-qwen3-8b-0928"
 NODE_EMB_BASE="../trees/BRIGHT"
 ROUND5_DISABLE_CALIBRATION="${ROUND5_DISABLE_CALIBRATION:-1}"
 ROUND5_SELECTOR_MODES="${ROUND5_SELECTOR_MODES:-meanscore_global}" # retriever_slate maxscore_global meanscore_global max_hit_global
 ROUND6_EXPANDABLE_MODE="${ROUND6_EXPANDABLE_MODE:-ended_reseat}"
+ROUND6_EXPANDABLE_CANDIDATE_MODE="${ROUND6_EXPANDABLE_CANDIDATE_MODE:-direct_children}"
+ROUND6_EXPANDABLE_ENDED_SCOPE="${ROUND6_EXPANDABLE_ENDED_SCOPE:-leftover_expandable}"
+ROUND6_EXPANDABLE_RESEAT_POLICY="${ROUND6_EXPANDABLE_RESEAT_POLICY:-score}"
 ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2}"
 
 COMMON_PARAMS=(
@@ -41,16 +45,16 @@ if [[ "$ROUND5_DISABLE_CALIBRATION" == "1" ]]; then
 fi
 
 RUN_SUBSETS=(
-    # "biology"
-    # "psychology"
-    # "economics"
-    # "earth_science"
-    # "robotics"
-    # "sustainable_living"
-    # "stackoverflow"
-    # "theoremqa_questions"
-    # "theoremqa_theorems"
-    # "pony"
+    "biology"
+    "psychology"
+    "economics"
+    "earth_science"
+    "robotics"
+    "sustainable_living"
+    "stackoverflow"
+    "theoremqa_questions"
+    "theoremqa_theorems"
+    "pony"
     "aops"
     "leetcode"
 )
@@ -84,14 +88,17 @@ for selector_mode in "${SELECTOR_MODES[@]}"; do
                 exit 1
             fi
 
-            NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.diver.npy"
+            NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.reasonembed8b.npy"
             if [[ ! -f "$NODE_EMB_PATH" ]]; then
                 log "Missing node embedding file for subset=${subset}: ${NODE_EMB_PATH}"
                 exit 1
             fi
 
-            # Intent: keep the ended-beam reseat ablation in result paths separate from both round6 legacy and method2 runs.
+            # Intent: keep score-policy naming stable, and add an explicit suffix only for the random control.
             suffix="round6_mrr_selector_accum_${selector_mode}_expandable_${ROUND6_EXPANDABLE_MODE}"
+            if [[ "${ROUND6_EXPANDABLE_RESEAT_POLICY}" != "score" ]]; then
+                suffix="${suffix}_${ROUND6_EXPANDABLE_RESEAT_POLICY}"
+            fi
 
             final_args=()
             i=0
@@ -108,6 +115,9 @@ for selector_mode in "${SELECTOR_MODES[@]}"; do
 
             final_args+=("--round5_selector_mode" "$selector_mode")
             final_args+=("--round6_expandable_mode" "$ROUND6_EXPANDABLE_MODE")
+            final_args+=("--round6_expandable_candidate_mode" "$ROUND6_EXPANDABLE_CANDIDATE_MODE")
+            final_args+=("--round6_expandable_ended_scope" "$ROUND6_EXPANDABLE_ENDED_SCOPE")
+            final_args+=("--round6_expandable_reseat_policy" "$ROUND6_EXPANDABLE_RESEAT_POLICY")
             final_args+=("--subset" "$subset")
             final_args+=("--tree_version" "$tree_version")
             final_args+=("--node_emb_path" "$NODE_EMB_PATH")

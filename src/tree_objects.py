@@ -214,6 +214,34 @@ class PredictionNode(object):
           parent=self,
           relevance_chain_factor=self.relevance_chain_factor))
 
+  def refresh_subtree_path_relevance(self):
+    if self.parent is None:
+      self.path_relevance = self.local_relevance
+    else:
+      self.path_relevance = chain_path_rel_fn(
+          self.local_relevance,
+          self.parent.path_relevance,
+          self.relevance_chain_factor)
+    if self.child:
+      for child in self.child:
+        child.refresh_subtree_path_relevance()
+
+  def upsert_children(self, child_relevances, reasoning, creation_step):
+    if self.child is None:
+      self.instantiate_children(child_relevances, reasoning, creation_step)
+      return
+    if len(self.child) != len(child_relevances):
+      raise ValueError(
+          f'Cannot refresh children for path {self.path}: '
+          f'existing {len(self.child)} vs new {len(child_relevances)}')
+    self.reasoning = reasoning
+    self.child_relevances = child_relevances
+    for i, child in enumerate(self.child):
+      # Intent: seeded gate paths may pre-create this child list, so real traversal must refresh scores instead of re-instantiating.
+      child.local_relevance = child_relevances[i]
+      child.creation_step = creation_step
+      child.refresh_subtree_path_relevance()
+
   def to_dict(self):
     return {
         **{k: v for k, v in self.__dict__.items() if k in self.SAVE_LIST},
@@ -274,7 +302,7 @@ class InferSample(object):
         'qe_expanded_query',
     ]
 
-  def seed_beam_from_gate_paths(self, gate_paths, gate_scores=None):
+  def seed_beam_from_gate_paths(self, gate_paths, gate_scores=None, reset_history=True):
     if not gate_paths:
       return
     gate_scores = gate_scores or {}
@@ -297,6 +325,7 @@ class InferSample(object):
       for idx, score in child_scores.items():
         if 0 <= idx < len(child_rels):
           child_rels[idx] = score
+      # Intent: materialize retrieval-chosen branch paths so the next traversal step can start from them.
       node.instantiate_children(child_rels, reasoning='seeded_gate', creation_step=0)
 
     beam_paths = []
@@ -317,7 +346,8 @@ class InferSample(object):
 
     if beam_paths:
       self.beam_state_paths = beam_paths
-      self.beam_state_paths_history = []
+      if reset_history:
+        self.beam_state_paths_history = []
       self.seeded_gate_paths = [tuple(p) for p in gate_paths]
 
   def _is_path_allowed(self, path):
@@ -501,7 +531,10 @@ class InferSample(object):
           # Intent: retriever-only ablations can skip calibration to keep selection logic score-pure.
           self.calib_model.add(relevance_scores)
         cur_node_child_rels = [relevance_scores.get(c.registry_idx, 0) for c in cur_semantic_node.child]
-        cur_state.instantiate_children(cur_node_child_rels, reasoning, creation_step=len(self.beam_state_paths_history)+1)
+        cur_state.upsert_children(
+            cur_node_child_rels,
+            reasoning,
+            creation_step=len(self.beam_state_paths_history)+1)
     if not self.disable_calibration:
       self.calib_model.fit()
       self.update_relevances(self.prediction_tree)

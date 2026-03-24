@@ -1,27 +1,45 @@
 #!/bin/bash
 
+conda activate lattice2
+
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+
 # Create log file with timestamp
-mkdir -p ../logs
-LOG_FILE="../logs/run_baseline3_leaf_only_loop_$(date '+%Y_%m_%d').log"
+mkdir -p "${REPO_ROOT}/logs"
+LOG_FILE="${REPO_ROOT}/logs/run_baseline3_leaf_only_loop_emr_$(date '+%Y_%m_%d').log"
+
+LEAF_EMR_MEMORY_MODE="${LEAF_EMR_MEMORY_MODE:-accumulated}"
+LEAF_EMR_HISTORY_RANK_TOPK="${LEAF_EMR_HISTORY_RANK_TOPK:-10}"
+LEAF_EMR_DOC_TOPK="${LEAF_EMR_DOC_TOPK:-10}"
+LEAF_EMR_SENT_TOPK="${LEAF_EMR_SENT_TOPK:-10}"
+LEAF_EMR_COMPRESSION="${LEAF_EMR_COMPRESSION:-on}"
+LEAF_EMR_MEMORY_MAX_TOKENS="${LEAF_EMR_MEMORY_MAX_TOKENS:-0}"
+REWRITE_PROMPT_NAME="${REWRITE_PROMPT_NAME:-agent_executor_v1_icl2}"
+if [[ "${LEAF_EMR_MEMORY_MODE}" != "off" && "${REWRITE_PROMPT_NAME}" == "agent_executor_v1_icl2" ]]; then
+    # Intent: keep baseline prompt stable while auto-switching to the memory-aware variant only for EMR runs.
+    REWRITE_PROMPT_NAME="agent_executor_v1_icl2_emr_memory"
+fi
 
 # Function to log with timestamp
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting run_baseline3_leaf_only_loop.sh script"
+log "Starting run_baseline3_leaf_only_loop_emr.sh script"
 log "run_leaf_rank.py will emit leaf_iter_records.jsonl with retrieved/rewrite-context doc ids and paths per iteration."
+log "leaf_emr_memory_mode=${LEAF_EMR_MEMORY_MODE} leaf_emr_compression=${LEAF_EMR_COMPRESSION} rewrite_prompt_name=${REWRITE_PROMPT_NAME} leaf_emr_memory_max_tokens=${LEAF_EMR_MEMORY_MAX_TOKENS}"
 
 # Edit these paths for your setup
 # RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
 RETRIEVER_MODEL_PATH="/data2/pretrained_models/reason-embed-qwen3-8b-0928"
-NODE_EMB_BASE="../trees/BRIGHT"
+NODE_EMB_BASE="${REPO_ROOT}/trees/BRIGHT"
 
 # Common params (key value pairs or flags). Run-specific params override these.
 COMMON_PARAMS=(
-    --suffix baseline3_leaf_only_loop
+    --suffix baseline3_leaf_only_loop_emr
     --reasoning_in_traversal_prompt -1
     --load_existing
     --num_iters 10
@@ -35,9 +53,15 @@ COMMON_PARAMS=(
     --leaf_only_retrieval
     --retriever_model_path "$RETRIEVER_MODEL_PATH"
     --flat_topk 100
-    # --rewrite_prompt_name agent_executor_v1_icl2
-    --rewrite_prompt_name thinkqe
+    --rewrite_prompt_name "$REWRITE_PROMPT_NAME"
+    # --rewrite_prompt_name thinkqe
     --rewrite_context_topk 10
+    --leaf_emr_memory_mode "$LEAF_EMR_MEMORY_MODE"
+    --leaf_emr_history_rank_topk "$LEAF_EMR_HISTORY_RANK_TOPK"
+    --leaf_emr_doc_topk "$LEAF_EMR_DOC_TOPK"
+    --leaf_emr_sent_topk "$LEAF_EMR_SENT_TOPK"
+    --leaf_emr_compression "$LEAF_EMR_COMPRESSION"
+    --leaf_emr_memory_max_tokens "$LEAF_EMR_MEMORY_MAX_TOKENS"
 )
 
 # Define RUNS directly as strings (space-separated args)
@@ -72,6 +96,7 @@ for idx in "${!RUNS[@]}"; do
         log "Missing --subset in RUNS entry: $iter_def"
         exit 1
     fi
+    # Intent: keep the non-memory retrieval/tree inputs aligned with the baseline launcher for cleaner ablation.
     NODE_EMB_PATH="${NODE_EMB_BASE}/${subset}/node_embs.reasonembed8b.npy"
 
     # Build final args: first common params, then iteration-specific params
@@ -94,7 +119,7 @@ for idx in "${!RUNS[@]}"; do
     # Append iteration-specific params
     final_args+=("${ITER_ARR[@]}")
 
-    cmd=( python run_leaf_rank.py "${final_args[@]}" )
+    cmd=( python "${REPO_ROOT}/src/run_leaf_rank.py" "${final_args[@]}" )
     printf -v cmd_str '%q ' "${cmd[@]}"
     log "Executing: $cmd_str"
 

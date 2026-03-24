@@ -144,6 +144,25 @@ class HyperParams(argparse.Namespace):
             payload.pop('round5_mrr_pool_k', None)
         if not bool(payload.get('round5_fused_memory', False)):
             payload.pop('round5_fused_memory', None)
+        leaf_emr_mode = str(payload.get('leaf_emr_memory_mode', 'off')).lower()
+        if leaf_emr_mode == 'off':
+            payload.pop('leaf_emr_memory_mode', None)
+            payload.pop('leaf_emr_history_rank_topk', None)
+            payload.pop('leaf_emr_doc_topk', None)
+            payload.pop('leaf_emr_sent_topk', None)
+            payload.pop('leaf_emr_compression', None)
+            payload.pop('leaf_emr_memory_max_tokens', None)
+        else:
+            if int(payload.get('leaf_emr_history_rank_topk', 10) or 10) == 10:
+                payload.pop('leaf_emr_history_rank_topk', None)
+            if int(payload.get('leaf_emr_doc_topk', 10) or 10) == 10:
+                payload.pop('leaf_emr_doc_topk', None)
+            if int(payload.get('leaf_emr_sent_topk', 10) or 10) == 10:
+                payload.pop('leaf_emr_sent_topk', None)
+            if str(payload.get('leaf_emr_compression', 'on')).lower() == 'on':
+                payload.pop('leaf_emr_compression', None)
+            if int(payload.get('leaf_emr_memory_max_tokens', 0) or 0) == 0:
+                payload.pop('leaf_emr_memory_max_tokens', None)
         if not bool(payload.get('round6_global_escape', False)):
             payload.pop('round6_global_escape', None)
             payload.pop('round6_global_escape_slots', None)
@@ -151,6 +170,16 @@ class HyperParams(argparse.Namespace):
             payload.pop('round6_global_escape_slots', None)
         if str(payload.get('round6_expandable_mode', 'off')).lower() == 'off':
             payload.pop('round6_expandable_mode', None)
+            payload.pop('round6_expandable_candidate_mode', None)
+            payload.pop('round6_expandable_ended_scope', None)
+            payload.pop('round6_expandable_reseat_policy', None)
+        else:
+            if str(payload.get('round6_expandable_candidate_mode', 'direct_children')).lower() == 'direct_children':
+                payload.pop('round6_expandable_candidate_mode', None)
+            if str(payload.get('round6_expandable_ended_scope', 'leftover_expandable')).lower() == 'leftover_expandable':
+                payload.pop('round6_expandable_ended_scope', None)
+            if str(payload.get('round6_expandable_reseat_policy', 'score')).lower() == 'score':
+                payload.pop('round6_expandable_reseat_policy', None)
         if not bool(payload.get('round6_method2', False)):
             payload.pop('round6_method2', None)
             payload.pop('round6_method2_mode', None)
@@ -172,6 +201,16 @@ class HyperParams(argparse.Namespace):
                     payload.pop('round6_expandable_pool_freeze_terminal_beam', None)
                 payload.pop('round6_fusion_mode', None)
                 payload.pop('round6_explore_prompt_name', None)
+        if int(payload.get('mcts_num_simulations', 32) or 32) == 32:
+            payload.pop('mcts_num_simulations', None)
+        if float(payload.get('mcts_exploration_c', 1.4) or 1.4) == 1.4:
+            payload.pop('mcts_exploration_c', None)
+        if str(payload.get('mcts_reward_mode', 'mean_score')).lower() == 'mean_score':
+            payload.pop('mcts_reward_mode', None)
+        if int(payload.get('mcts_rollout_topk', 100) or 100) == 100:
+            payload.pop('mcts_rollout_topk', None)
+        if str(payload.get('mcts_state_init', 'root')).lower() == 'root':
+            payload.pop('mcts_state_init', None)
         if not bool(payload.get('disable_calibration', False)):
             payload.pop('disable_calibration', None)
         if str(payload.get('round5_category_oracle', 'none')).lower() == 'none':
@@ -302,6 +341,48 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--leaf_only_retrieval', default=False, action='store_true', help='Restrict flat retrieval to leaf nodes only (used in run_leaf_rank.py)')
         parser.add_argument('--leaf_no_initial_rewrite', default=False, action='store_true',
                             help='Skip initial rewrite in run_leaf_rank.py and start rewrite after first retrieval iteration')
+        parser.add_argument(
+            '--leaf_emr_memory_mode',
+            type=str,
+            default='off',
+            choices=['off', 'accumulated'],
+            help=(
+                'EMR-style rewrite memory mode for run_leaf_rank.py: '
+                'off=baseline prompt only; '
+                'accumulated=paper-faithful cumulative document memory with global sentence filtering'
+            ),
+        )
+        parser.add_argument(
+            '--leaf_emr_history_rank_topk',
+            type=int,
+            default=10,
+            help='Number of retrieved doc ids recorded per rewrite step in EMR-style history for run_leaf_rank.py',
+        )
+        parser.add_argument(
+            '--leaf_emr_doc_topk',
+            type=int,
+            default=10,
+            help='Number of current retrieved docs admitted into EMR-style document memory per rewrite step',
+        )
+        parser.add_argument(
+            '--leaf_emr_sent_topk',
+            type=int,
+            default=10,
+            help='Number of globally selected sentences kept across the cumulative EMR document pool',
+        )
+        parser.add_argument(
+            '--leaf_emr_compression',
+            type=str,
+            default='on',
+            choices=['on', 'off'],
+            help='EMR memory compression mode: on=global sentence filtering, off=full document text with token-budget fitting',
+        )
+        parser.add_argument(
+            '--leaf_emr_memory_max_tokens',
+            type=int,
+            default=0,
+            help='Maximum token budget for the EMR-style document memory block; 0 means auto-fit by model context window',
+        )
         parser.add_argument('--use_retriever_traversal', default=False, action='store_true',
                             help='If set, score traversal slates with retriever embeddings instead of LLM prompts')
 
@@ -348,7 +429,41 @@ class HyperParams(argparse.Namespace):
             help=(
                 'Round6 expandable-beam ablation mode: '
                 'off=disable expandable-beam ablations; '
-                'ended_reseat=keep legacy rewrite flow but replace only locally ended beam slots using retrieval-scored leftover expandable paths'
+                'ended_reseat=keep legacy rewrite flow but replace only locally ended beam slots using the configured ended-reseat policy'
+            ),
+        )
+        parser.add_argument(
+            '--round6_expandable_candidate_mode',
+            type=str,
+            default='direct_children',
+            choices=['direct_children', 'descendant_flat'],
+            help=(
+                'Round6 ended-reseat active-slot candidate scope: '
+                'direct_children=keep current direct-child branch selector; '
+                'descendant_flat=score strict descendant non-leaf branches instead of only direct children'
+            ),
+        )
+        parser.add_argument(
+            '--round6_expandable_ended_scope',
+            type=str,
+            default='leftover_expandable',
+            choices=['leftover_expandable', 'whole_tree_flat', 'goexplore_direct_child'],
+            help=(
+                'Round6 ended-reseat replacement scope: '
+                'leftover_expandable=current behavior using leftover instantiated expandable paths; '
+                'whole_tree_flat=score whole-tree non-leaf branches for ended-slot replacement; '
+                'goexplore_direct_child=score missed direct-child alternatives from root/selected decision points'
+            ),
+        )
+        parser.add_argument(
+            '--round6_expandable_reseat_policy',
+            type=str,
+            default='score',
+            choices=['score', 'random'],
+            help=(
+                'Round6 ended-reseat replacement policy: '
+                'score=current behavior using retrieval-scored replacement candidates; '
+                'random=sample ended-slot replacements uniformly from the same candidate pool'
             ),
         )
         parser.add_argument(
@@ -389,6 +504,38 @@ class HyperParams(argparse.Namespace):
             type=str,
             default='agent_executor_v1_icl2_explore',
             help='Rewrite prompt used only on method2 explore steps',
+        )
+        parser.add_argument(
+            '--mcts_num_simulations',
+            type=int,
+            default=32,
+            help='Number of UCT simulations per iteration in run_mcts.py',
+        )
+        parser.add_argument(
+            '--mcts_exploration_c',
+            type=float,
+            default=1.4,
+            help='Exploration constant for UCT child selection in run_mcts.py',
+        )
+        parser.add_argument(
+            '--mcts_reward_mode',
+            type=str,
+            default='mean_score',
+            choices=['mean_score', 'max_score', 'hit_count'],
+            help='Immediate branch reward proxy used by run_mcts.py',
+        )
+        parser.add_argument(
+            '--mcts_rollout_topk',
+            type=int,
+            default=100,
+            help='Top-K descendant leaf retrieval size used for one-step MCTS reward estimates',
+        )
+        parser.add_argument(
+            '--mcts_state_init',
+            type=str,
+            default='root',
+            choices=['root', 'best_root_child'],
+            help='Initial active branch state for run_mcts.py',
         )
         parser.add_argument(
             '--round5_mode',

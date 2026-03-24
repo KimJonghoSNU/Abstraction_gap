@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import pickle as pkl
+import random
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -1026,6 +1028,186 @@ def _filter_scored_rows_to_expandable(
     return filtered
 
 
+def _path_sort_key(path: Tuple[int, ...]) -> Tuple[int, Tuple[int, ...]]:
+    return (len(tuple(path)), tuple(path))
+
+
+def _filter_scored_rows_to_allowed_paths(
+    scored_rows: Sequence[Dict[str, Any]],
+    allowed_paths: Sequence[Tuple[int, ...]],
+) -> List[Dict[str, Any]]:
+    allowed_set = {tuple(path) for path in allowed_paths if path}
+    filtered: List[Dict[str, Any]] = []
+    seen: Set[Tuple[int, ...]] = set()
+    for row in scored_rows:
+        path_t = _row_path_tuple(row)
+        if (not path_t) or (path_t not in allowed_set) or (path_t in seen):
+            continue
+        seen.add(path_t)
+        filtered.append(row)
+    return filtered
+
+
+def _collect_strict_descendant_branch_paths(
+    *,
+    selected_branches: Sequence[Tuple[int, ...]],
+    child_branch_paths_by_path: Dict[Tuple[int, ...], List[Tuple[int, ...]]],
+    all_nonroot_nonleaf_paths: Sequence[Tuple[int, ...]],
+    root_path: Tuple[int, ...],
+) -> Tuple[List[Tuple[int, ...]], Dict[Tuple[int, ...], List[Tuple[int, ...]]]]:
+    selected_set = {tuple(path) for path in selected_branches if path}
+    if not selected_set:
+        return list(all_nonroot_nonleaf_paths), {
+            tuple(path): [tuple(root_path)] for path in all_nonroot_nonleaf_paths
+        }
+
+    parent_map: Dict[Tuple[int, ...], Set[Tuple[int, ...]]] = defaultdict(set)
+    seen: Set[Tuple[int, ...]] = set()
+    for source_path in sorted(selected_set, key=_path_sort_key):
+        stack: List[Tuple[int, ...]] = [tuple(path) for path in child_branch_paths_by_path.get(source_path, [])]
+        local_seen: Set[Tuple[int, ...]] = set()
+        while stack:
+            cur_path = tuple(stack.pop())
+            if cur_path in local_seen:
+                continue
+            local_seen.add(cur_path)
+            if cur_path not in selected_set:
+                seen.add(cur_path)
+                parent_map[cur_path].add(source_path)
+            for child_path in child_branch_paths_by_path.get(cur_path, []):
+                stack.append(tuple(child_path))
+
+    ordered_paths = sorted(seen, key=_path_sort_key)
+    return ordered_paths, {
+        tuple(path): sorted({tuple(parent) for parent in parents}, key=_path_sort_key)
+        for path, parents in parent_map.items()
+    }
+
+
+def _collect_goexplore_direct_child_candidates(
+    *,
+    selected_branches: Sequence[Tuple[int, ...]],
+    child_branch_paths_by_path: Dict[Tuple[int, ...], List[Tuple[int, ...]]],
+    root_branch_children: Sequence[Tuple[int, ...]],
+    root_path: Tuple[int, ...],
+) -> Tuple[List[Tuple[int, ...]], Dict[Tuple[int, ...], List[Tuple[int, ...]]]]:
+    selected_set = {tuple(path) for path in selected_branches if path}
+    if not selected_set:
+        root_children = [tuple(path) for path in root_branch_children]
+        return root_children, {
+            tuple(path): [tuple(root_path)] for path in root_children
+        }
+
+    parent_map: Dict[Tuple[int, ...], Set[Tuple[int, ...]]] = defaultdict(set)
+    decision_points: Set[Tuple[int, ...]] = {tuple(root_path)}
+    exploited_child_by_parent: Dict[Tuple[int, ...], Set[Tuple[int, ...]]] = defaultdict(set)
+
+    for branch_path in sorted(selected_set, key=_path_sort_key):
+        for depth in range(len(branch_path)):
+            parent_path = tuple(branch_path[:depth])
+            child_path = tuple(branch_path[: depth + 1])
+            exploited_child_by_parent[parent_path].add(child_path)
+            if depth > 0:
+                decision_points.add(parent_path)
+        decision_points.add(tuple(branch_path))
+
+    candidate_paths: Set[Tuple[int, ...]] = set()
+    for parent_path in sorted(decision_points, key=_path_sort_key):
+        child_paths = (
+            [tuple(path) for path in root_branch_children]
+            if parent_path == tuple(root_path)
+            else [tuple(path) for path in child_branch_paths_by_path.get(parent_path, [])]
+        )
+        for child_path in child_paths:
+            if child_path in selected_set:
+                continue
+            # Intent: go-explore replacement reopens missed direct children instead of teleporting arbitrarily.
+            if child_path in exploited_child_by_parent.get(parent_path, set()):
+                continue
+            candidate_paths.add(child_path)
+            parent_map[child_path].add(parent_path)
+
+    ordered_paths = sorted(candidate_paths, key=_path_sort_key)
+    return ordered_paths, {
+        tuple(path): sorted({tuple(parent) for parent in parents}, key=_path_sort_key)
+        for path, parents in parent_map.items()
+    }
+
+
+def _state_paths_to_endpoint_paths(state_paths: Sequence[Sequence[object]]) -> List[Tuple[int, ...]]:
+    endpoints: List[Tuple[int, ...]] = []
+    seen: Set[Tuple[int, ...]] = set()
+    for state_path in state_paths:
+        if not state_path:
+            continue
+        endpoint = tuple(getattr(state_path[-1], "path", ()) or ())
+        if (not endpoint) or (endpoint in seen):
+            continue
+        seen.add(endpoint)
+        endpoints.append(endpoint)
+    return endpoints
+
+
+def _materialize_beam_from_paths(
+    *,
+    sample: InferSample,
+    beam_paths: Sequence[Tuple[int, ...]],
+    path_scores: Dict[Tuple[int, ...], float],
+) -> None:
+    ordered_paths: List[Tuple[int, ...]] = []
+    seen: Set[Tuple[int, ...]] = set()
+    gate_scores: Dict[Tuple[int, ...], float] = {}
+    for path in beam_paths:
+        path_t = tuple(path)
+        if (not path_t) or (path_t in seen):
+            continue
+        seen.add(path_t)
+        ordered_paths.append(path_t)
+        gate_scores[path_t] = float(path_scores.get(path_t, 1.0))
+    if ordered_paths:
+        # Intent: convert retrieval-selected deeper branches back into actual beam states for the next traversal step.
+        sample.seed_beam_from_gate_paths(ordered_paths, gate_scores=gate_scores, reset_history=False)
+
+
+def _deterministic_random_rows(
+    *,
+    candidate_paths: Sequence[Tuple[int, ...]],
+    sample_count: int,
+    seed_key: str,
+) -> List[Dict[str, Any]]:
+    unique_paths = sorted(
+        {
+            tuple(path_t)
+            for path_t in candidate_paths
+            if tuple(path_t)
+        },
+        key=_path_sort_key,
+    )
+    if not unique_paths or sample_count <= 0:
+        return []
+    seed_int = int(hashlib.sha256(seed_key.encode("utf-8")).hexdigest()[:16], 16)
+    rng = random.Random(seed_int)
+    chosen_paths = (
+        unique_paths
+        if sample_count >= len(unique_paths)
+        else rng.sample(unique_paths, sample_count)
+    )
+    # Intent: keep the ended-reseat candidate pool fixed and vary only the replacement policy.
+    return [
+        {
+            "path": tuple(path_t),
+            "score_mode": "random",
+            "score": 0.0,
+            "max_score": 0.0,
+            "mean_score": 0.0,
+            "matched_count": 0,
+            "best_rank": None,
+            "best_leaf_path": [],
+        }
+        for path_t in chosen_paths
+    ]
+
+
 def _merge_local_with_global_escape(
     *,
     local_rows: Sequence[Dict[str, Any]],
@@ -1346,6 +1528,30 @@ if round6_expandable_mode not in {"off", "ended_reseat"}:
         f'Unsupported --round6_expandable_mode "{round6_expandable_mode}". '
         "Allowed: off|ended_reseat"
     )
+round6_expandable_candidate_mode = str(
+    getattr(hp, "ROUND6_EXPANDABLE_CANDIDATE_MODE", "direct_children") or "direct_children"
+).strip().lower()
+if round6_expandable_candidate_mode not in {"direct_children", "descendant_flat"}:
+    raise ValueError(
+        f'Unsupported --round6_expandable_candidate_mode "{round6_expandable_candidate_mode}". '
+        "Allowed: direct_children|descendant_flat"
+    )
+round6_expandable_ended_scope = str(
+    getattr(hp, "ROUND6_EXPANDABLE_ENDED_SCOPE", "leftover_expandable") or "leftover_expandable"
+).strip().lower()
+if round6_expandable_ended_scope not in {"leftover_expandable", "whole_tree_flat", "goexplore_direct_child"}:
+    raise ValueError(
+        f'Unsupported --round6_expandable_ended_scope "{round6_expandable_ended_scope}". '
+        "Allowed: leftover_expandable|whole_tree_flat|goexplore_direct_child"
+    )
+round6_expandable_reseat_policy = str(
+    getattr(hp, "ROUND6_EXPANDABLE_RESEAT_POLICY", "score") or "score"
+).strip().lower()
+if round6_expandable_reseat_policy not in {"score", "random"}:
+    raise ValueError(
+        f'Unsupported --round6_expandable_reseat_policy "{round6_expandable_reseat_policy}". '
+        "Allowed: score|random"
+    )
 round6_method2 = bool(getattr(hp, "ROUND6_METHOD2", False))
 round6_method2_mode = str(
     getattr(hp, "ROUND6_METHOD2_MODE", "archive_replace") or "archive_replace"
@@ -1395,6 +1601,9 @@ if round6_expandable_mode != "off" and round6_method2:
 hp.add_param("round6_global_escape", round6_global_escape)
 hp.add_param("round6_global_escape_slots", round6_global_escape_slots)
 hp.add_param("round6_expandable_mode", round6_expandable_mode)
+hp.add_param("round6_expandable_candidate_mode", round6_expandable_candidate_mode)
+hp.add_param("round6_expandable_ended_scope", round6_expandable_ended_scope)
+hp.add_param("round6_expandable_reseat_policy", round6_expandable_reseat_policy)
 hp.add_param("round6_method2", round6_method2)
 hp.add_param("round6_method2_mode", round6_method2_mode)
 hp.add_param("round6_expandable_pool_freeze_terminal_beam", round6_expandable_pool_freeze_terminal_beam)
@@ -1403,9 +1612,15 @@ hp.add_param("round6_explore_prompt_name", round6_explore_prompt_name)
 
 exp_dir_name = str(hp)
 RESULTS_DIR = f"{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/round6/{exp_dir_name}/"
-if os.path.exists(RESULTS_DIR) and os.listdir(RESULTS_DIR):
-    print(f"Results already exist at {RESULTS_DIR}. Skipping run.")
-    raise SystemExit(0)
+if os.path.exists(RESULTS_DIR):
+    # Intent: allow reruns after partial writes like logs or hparams; skip only when result pickles already exist.
+    has_result_pkl = any(
+        entry.endswith(".pkl") and os.path.isfile(os.path.join(RESULTS_DIR, entry))
+        for entry in os.listdir(RESULTS_DIR)
+    )
+    if has_result_pkl:
+        print(f"Results already exist at {RESULTS_DIR}. Skipping run.")
+        raise SystemExit(0)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 logger = setup_logger("lattice_runner_round6", f"{RESULTS_DIR}/run.log", logging.INFO)
@@ -1414,7 +1629,7 @@ with open(f"{RESULTS_DIR}/hparams.json", "w", encoding="utf-8") as f:
 for warning in startup_warnings:
     logger.warning(warning)
 logger.info(
-    "Round6 config | mode=%s | rewrite_prompt=%s | explore_prompt=%s | selector_mode=%s | selector_topk=%d | global_escape=%s | escape_slots=%d | expandable_mode=%s | method2=%s | method2_mode=%s | freeze_terminal_beam=%s | fusion_mode=%s",
+    "Round6 config | mode=%s | rewrite_prompt=%s | explore_prompt=%s | selector_mode=%s | selector_topk=%d | global_escape=%s | escape_slots=%d | expandable_mode=%s | expandable_candidate_mode=%s | expandable_ended_scope=%s | expandable_reseat_policy=%s | method2=%s | method2_mode=%s | freeze_terminal_beam=%s | fusion_mode=%s",
     "legacy",
     round5_rewrite_prompt_name,
     round6_explore_prompt_name,
@@ -1423,6 +1638,9 @@ logger.info(
     str(round6_global_escape).lower(),
     int(round6_global_escape_slots),
     round6_expandable_mode,
+    round6_expandable_candidate_mode,
+    round6_expandable_ended_scope,
+    round6_expandable_reseat_policy,
     str(round6_method2).lower(),
     round6_method2_mode,
     str(round6_expandable_pool_freeze_terminal_beam).lower(),
@@ -1486,6 +1704,14 @@ else:
     node_registry = compute_node_registry(semantic_root_node)
     leaf_indices, leaf_paths, leaf_indices_by_prefix, leaf_ancestor_paths = _build_tree_leaf_support_maps(node_registry)
 
+if using_dag_runtime and (
+    round6_expandable_candidate_mode == "descendant_flat"
+    or round6_expandable_ended_scope == "goexplore_direct_child"
+):
+    raise ValueError(
+        "DAG runtime does not support descendant-flat/goexplore ended-reseat path semantics in run_round6.py."
+    )
+
 root_path = tuple(getattr(semantic_root_node, "path", ()) or ())
 
 path_to_node: Dict[Tuple[int, ...], object] = {tuple(node.path): node for node in node_registry}
@@ -1501,6 +1727,14 @@ for node in node_registry:
 root_branch_children = child_branch_paths_by_path.get(root_path, [])
 if not root_branch_children:
     logger.warning("Root has no non-leaf children. Branch selector may fallback frequently.")
+all_nonroot_nonleaf_paths = sorted(
+    {
+        tuple(node.path)
+        for node in node_registry
+        if (not node.is_leaf) and tuple(node.path) != root_path
+    },
+    key=_path_sort_key,
+)
 
 doc_id_to_paths: Dict[str, List[Tuple[int, ...]]] = defaultdict(list)
 for leaf_idx in leaf_indices:
@@ -2108,6 +2342,7 @@ for iter_idx in range(hp.NUM_ITERS):
         selector_scored_rows: List[Dict[str, Any]] = []
         ended_reseat_scored_rows: List[Dict[str, Any]] = []
         ended_reseat_selected_rows: List[Dict[str, Any]] = []
+        ended_reseat_candidate_count = 0
         selector_global_escape_rows: List[Dict[str, Any]] = []
         selector_global_escape_selected_rows: List[Dict[str, Any]] = []
         selector_global_escape_replaced_rows: List[Dict[str, Any]] = []
@@ -2127,6 +2362,17 @@ for iter_idx in range(hp.NUM_ITERS):
             else:
                 score_mode = "hit"
             candidate_parent_map: Dict[Tuple[int, ...], List[Tuple[int, ...]]] = {}
+            ended_reseat_parent_map: Dict[Tuple[int, ...], List[Tuple[int, ...]]] = {}
+            use_descendant_flat_candidates = bool(
+                ended_reseat_enabled and round6_expandable_candidate_mode == "descendant_flat"
+            )
+            use_path_materialization = bool(
+                ended_reseat_enabled
+                and (
+                    round6_expandable_candidate_mode == "descendant_flat"
+                    or round6_expandable_ended_scope != "leftover_expandable"
+                )
+            )
             if terminal_freeze_active or terminal_freeze_triggered:
                 selector_candidate_paths = []
                 candidate_parent_map = {}
@@ -2144,12 +2390,21 @@ for iter_idx in range(hp.NUM_ITERS):
                 selector_candidate_paths = list(_build_expandable_state_path_map(sample).keys())
                 candidate_parent_map = {}
             else:
-                selector_candidate_paths, candidate_parent_map = _collect_candidate_child_branches_with_parents(
-                    selected_branches=(active_selected_before if ended_reseat_enabled else selected_before),
-                    child_branch_paths_by_path=child_branch_paths_by_path,
-                    root_branch_children=root_branch_children,
-                    root_path=root_path,
-                )
+                if use_descendant_flat_candidates:
+                    # Intent: flat-descendant mode lets active beams jump to any deeper branch within their current subtree.
+                    selector_candidate_paths, candidate_parent_map = _collect_strict_descendant_branch_paths(
+                        selected_branches=selected_before,
+                        child_branch_paths_by_path=child_branch_paths_by_path,
+                        all_nonroot_nonleaf_paths=all_nonroot_nonleaf_paths,
+                        root_path=root_path,
+                    )
+                else:
+                    selector_candidate_paths, candidate_parent_map = _collect_candidate_child_branches_with_parents(
+                        selected_branches=(active_selected_before if ended_reseat_enabled else selected_before),
+                        child_branch_paths_by_path=child_branch_paths_by_path,
+                        root_branch_children=root_branch_children,
+                        root_path=root_path,
+                    )
             local_row_limit = max(0, int(hp.MAX_BEAM_SIZE) - ended_reseat_count) if ended_reseat_enabled else max(1, int(hp.MAX_BEAM_SIZE))
             if not selector_candidate_paths and not (ended_reseat_enabled and ended_reseat_count > 0):
                 if not (terminal_freeze_active or terminal_freeze_triggered):
@@ -2219,10 +2474,16 @@ for iter_idx in range(hp.NUM_ITERS):
                         leaf_ancestor_paths=leaf_ancestor_paths,
                         score_mode=score_mode,
                     )
-                    selector_scored_rows = _filter_scored_rows_to_expandable(
-                        selector_scored_rows,
-                        expandable_state_path_map,
-                    )
+                    if use_descendant_flat_candidates:
+                        selector_scored_rows = _filter_scored_rows_to_allowed_paths(
+                            selector_scored_rows,
+                            selector_candidate_paths,
+                        )
+                    else:
+                        selector_scored_rows = _filter_scored_rows_to_expandable(
+                            selector_scored_rows,
+                            expandable_state_path_map,
+                        )
                 elif not ended_reseat_enabled:
                     selector_pick_reason = "no_local_hits"
                 final_selector_rows = list(selector_scored_rows[:local_row_limit]) if local_row_limit > 0 else []
@@ -2275,30 +2536,80 @@ for iter_idx in range(hp.NUM_ITERS):
 
                         selected_state_paths: List[List[object]] = []
                         selected_endpoints: Set[Tuple[int, ...]] = set()
-                        for row in final_selector_rows:
-                            path_t = _row_path_tuple(row)
-                            matched_state_path = expandable_state_path_map.get(path_t)
-                            if not matched_state_path:
-                                continue
-                            endpoint = tuple(getattr(matched_state_path[-1], "path", ()) or ())
-                            if not endpoint or endpoint in selected_endpoints:
-                                continue
-                            selected_endpoints.add(endpoint)
-                            selected_state_paths.append(matched_state_path)
+                        selected_path_order: List[Tuple[int, ...]] = []
+                        selected_path_scores: Dict[Tuple[int, ...], float] = {}
+                        if use_path_materialization:
+                            for row in final_selector_rows:
+                                path_t = _row_path_tuple(row)
+                                if (not path_t) or (path_t in selected_endpoints):
+                                    continue
+                                selected_endpoints.add(path_t)
+                                selected_path_order.append(path_t)
+                                selected_path_scores[path_t] = float(row.get("score", 0.0))
+                        else:
+                            for row in final_selector_rows:
+                                path_t = _row_path_tuple(row)
+                                matched_state_path = expandable_state_path_map.get(path_t)
+                                if not matched_state_path:
+                                    continue
+                                endpoint = tuple(getattr(matched_state_path[-1], "path", ()) or ())
+                                if not endpoint or endpoint in selected_endpoints:
+                                    continue
+                                selected_endpoints.add(endpoint)
+                                selected_path_scores[endpoint] = float(row.get("score", 0.0))
+                                selected_state_paths.append(matched_state_path)
                         if ended_reseat_enabled and ended_reseat_count > 0:
-                            leftover_candidate_paths = [
-                                tuple(path_t)
-                                for path_t in expandable_state_path_map.keys()
-                                if tuple(path_t) not in selected_endpoints
-                            ]
-                            if leftover_candidate_paths:
+                            if round6_expandable_ended_scope == "whole_tree_flat":
+                                # Intent: flat ended-slot reseat scores the whole semantic-tree branch registry, not just instantiated leftovers.
+                                leftover_candidate_paths = [
+                                    tuple(path_t)
+                                    for path_t in all_nonroot_nonleaf_paths
+                                    if tuple(path_t) not in selected_endpoints and tuple(path_t) not in set(selected_before)
+                                ]
+                                replacement_leaf_pool = list(leaf_indices)
+                            elif round6_expandable_ended_scope == "goexplore_direct_child":
+                                leftover_candidate_paths, ended_reseat_parent_map = _collect_goexplore_direct_child_candidates(
+                                    selected_branches=selected_before,
+                                    child_branch_paths_by_path=child_branch_paths_by_path,
+                                    root_branch_children=root_branch_children,
+                                    root_path=root_path,
+                                )
+                                leftover_candidate_paths = [
+                                    tuple(path_t)
+                                    for path_t in leftover_candidate_paths
+                                    if tuple(path_t) not in selected_endpoints
+                                ]
                                 replacement_leaf_pool = _collect_leaf_pool(
                                     selected_branches=leftover_candidate_paths,
                                     leaf_indices_by_prefix=leaf_indices_by_prefix,
                                     all_leaf_indices=leaf_indices,
                                     fallback_to_all=False,
                                 )
-                                if replacement_leaf_pool:
+                            else:
+                                leftover_candidate_paths = [
+                                    tuple(path_t)
+                                    for path_t in expandable_state_path_map.keys()
+                                    if tuple(path_t) not in selected_endpoints
+                                ]
+                                replacement_leaf_pool = _collect_leaf_pool(
+                                    selected_branches=leftover_candidate_paths,
+                                    leaf_indices_by_prefix=leaf_indices_by_prefix,
+                                    all_leaf_indices=leaf_indices,
+                                    fallback_to_all=False,
+                                )
+                            ended_reseat_candidate_count = int(len(leftover_candidate_paths))
+                            if leftover_candidate_paths:
+                                if round6_expandable_reseat_policy == "random":
+                                    random_seed_key = (
+                                        f"{hp.SUBSET}|{sample_idx}|{iter_idx}|"
+                                        f"{ended_reseat_count}|{round6_expandable_ended_scope}|ended_reseat_random"
+                                    )
+                                    ended_reseat_selected_rows = _deterministic_random_rows(
+                                        candidate_paths=leftover_candidate_paths,
+                                        sample_count=max(0, ended_reseat_count),
+                                        seed_key=random_seed_key,
+                                    )
+                                elif replacement_leaf_pool:
                                     # Intent: score only the leftover expandable frontier when reseating ended beam slots.
                                     replacement_hits = _retrieve_leaf_hits(
                                         query=selector_query,
@@ -2315,14 +2626,21 @@ for iter_idx in range(hp.NUM_ITERS):
                                             leaf_ancestor_paths=leaf_ancestor_paths,
                                             score_mode=score_mode,
                                         )
-                                        ended_reseat_scored_rows = _filter_scored_rows_to_expandable(
-                                            ended_reseat_scored_rows,
-                                            expandable_state_path_map,
-                                        )
+                                        if round6_expandable_ended_scope == "leftover_expandable":
+                                            ended_reseat_scored_rows = _filter_scored_rows_to_expandable(
+                                                ended_reseat_scored_rows,
+                                                expandable_state_path_map,
+                                            )
+                                        else:
+                                            ended_reseat_scored_rows = _filter_scored_rows_to_allowed_paths(
+                                                ended_reseat_scored_rows,
+                                                leftover_candidate_paths,
+                                            )
                                         ended_reseat_selected_rows = list(
                                             ended_reseat_scored_rows[: max(0, ended_reseat_count)]
                                         )
-                        if not selected_state_paths and not ended_reseat_selected_rows:
+                        local_selected_count = len(selected_path_order) if use_path_materialization else len(selected_state_paths)
+                        if local_selected_count == 0 and not ended_reseat_selected_rows:
                             selector_pick_reason = "no_expandable_match"
                         else:
                             selector_chosen_child_parent_map = {
@@ -2339,48 +2657,75 @@ for iter_idx in range(hp.NUM_ITERS):
                                 selector_pick_reason = f"explore_{round5_selector_mode}_replace"
                             else:
                                 fallback_state_paths = list(getattr(sample, "beam_state_paths", None) or [])
-                                merged_state_paths = list(selected_state_paths)
-                                merged_endpoints = {
-                                    tuple(getattr(path[-1], "path", ()) or ())
-                                    for path in merged_state_paths
-                                    if path
-                                }
-                                if ended_reseat_enabled and ended_reseat_selected_rows:
-                                    # Intent: reseat only the locally ended slots, leaving non-ended local continuation intact.
-                                    for row in ended_reseat_selected_rows:
-                                        path_t = _row_path_tuple(row)
-                                        matched_state_path = expandable_state_path_map.get(path_t)
-                                        if not matched_state_path:
+                                if use_path_materialization:
+                                    final_beam_paths = list(selected_path_order)
+                                    if ended_reseat_enabled and ended_reseat_selected_rows:
+                                        # Intent: keep non-ended continuation but let ended slots jump to retrieval-selected branch paths.
+                                        for row in ended_reseat_selected_rows:
+                                            path_t = _row_path_tuple(row)
+                                            if (not path_t) or (path_t in selected_endpoints):
+                                                continue
+                                            selected_endpoints.add(path_t)
+                                            final_beam_paths.append(path_t)
+                                            selected_path_scores[path_t] = float(row.get("score", 0.0))
+                                            if len(final_beam_paths) >= max(1, int(hp.MAX_BEAM_SIZE)):
+                                                break
+                                    # Intent: preserve baseline traversal continuity by filling missing beams with current beam endpoints.
+                                    for fallback_endpoint in _state_paths_to_endpoint_paths(fallback_state_paths):
+                                        if (not fallback_endpoint) or (fallback_endpoint in selected_endpoints):
                                             continue
-                                        replacement_endpoint = tuple(getattr(matched_state_path[-1], "path", ()) or ())
-                                        if not replacement_endpoint or replacement_endpoint in merged_endpoints:
+                                        selected_endpoints.add(fallback_endpoint)
+                                        final_beam_paths.append(fallback_endpoint)
+                                        if len(final_beam_paths) >= max(1, int(hp.MAX_BEAM_SIZE)):
+                                            break
+                                    _materialize_beam_from_paths(
+                                        sample=sample,
+                                        beam_paths=final_beam_paths[: max(1, int(hp.MAX_BEAM_SIZE))],
+                                        path_scores=selected_path_scores,
+                                    )
+                                else:
+                                    merged_state_paths = list(selected_state_paths)
+                                    merged_endpoints = {
+                                        tuple(getattr(path[-1], "path", ()) or ())
+                                        for path in merged_state_paths
+                                        if path
+                                    }
+                                    if ended_reseat_enabled and ended_reseat_selected_rows:
+                                        # Intent: reseat only the locally ended slots, leaving non-ended local continuation intact.
+                                        for row in ended_reseat_selected_rows:
+                                            path_t = _row_path_tuple(row)
+                                            matched_state_path = expandable_state_path_map.get(path_t)
+                                            if not matched_state_path:
+                                                continue
+                                            replacement_endpoint = tuple(getattr(matched_state_path[-1], "path", ()) or ())
+                                            if not replacement_endpoint or replacement_endpoint in merged_endpoints:
+                                                continue
+                                            merged_endpoints.add(replacement_endpoint)
+                                            merged_state_paths.append(matched_state_path)
+                                            if len(merged_state_paths) >= max(1, int(hp.MAX_BEAM_SIZE)):
+                                                break
+                                    # Intent: preserve baseline traversal continuity by filling missing beams with retriever-slate picks.
+                                    for fallback_path in fallback_state_paths:
+                                        if not fallback_path:
                                             continue
-                                        merged_endpoints.add(replacement_endpoint)
-                                        merged_state_paths.append(matched_state_path)
+                                        fallback_endpoint = tuple(getattr(fallback_path[-1], "path", ()) or ())
+                                        if not fallback_endpoint or fallback_endpoint in merged_endpoints:
+                                            continue
+                                        merged_endpoints.add(fallback_endpoint)
+                                        merged_state_paths.append(fallback_path)
                                         if len(merged_state_paths) >= max(1, int(hp.MAX_BEAM_SIZE)):
                                             break
-                                # Intent: preserve baseline traversal continuity by filling missing beams with retriever-slate picks.
-                                for fallback_path in fallback_state_paths:
-                                    if not fallback_path:
-                                        continue
-                                    fallback_endpoint = tuple(getattr(fallback_path[-1], "path", ()) or ())
-                                    if not fallback_endpoint or fallback_endpoint in merged_endpoints:
-                                        continue
-                                    merged_endpoints.add(fallback_endpoint)
-                                    merged_state_paths.append(fallback_path)
-                                    if len(merged_state_paths) >= max(1, int(hp.MAX_BEAM_SIZE)):
-                                        break
-                                sample.beam_state_paths = merged_state_paths[: max(1, int(hp.MAX_BEAM_SIZE))]
+                                    sample.beam_state_paths = merged_state_paths[: max(1, int(hp.MAX_BEAM_SIZE))]
                                 if explore_effective:
                                     local_pick_reason = (
                                         f"explore_{round5_selector_mode}_all_expandable_full"
-                                        if len(selected_state_paths) >= max(1, int(hp.MAX_BEAM_SIZE))
+                                        if local_selected_count >= max(1, int(hp.MAX_BEAM_SIZE))
                                         else f"explore_{round5_selector_mode}_all_expandable_partial_fill"
                                     )
                                 else:
                                     local_pick_reason = (
                                         f"{round5_selector_mode}_applied_full"
-                                        if len(selected_state_paths) >= max(1, int(hp.MAX_BEAM_SIZE))
+                                        if local_selected_count >= max(1, int(hp.MAX_BEAM_SIZE))
                                         else f"{round5_selector_mode}_applied_partial_fill"
                                     )
                                 selector_pick_reason = (
@@ -2394,7 +2739,29 @@ for iter_idx in range(hp.NUM_ITERS):
                                         if len(ended_reseat_selected_rows) >= ended_reseat_count
                                         else ("partial" if ended_reseat_selected_rows else "none")
                                     )
-                                    selector_pick_reason = f"{round5_selector_mode}_ended_reseat_{ended_reseat_status}"
+                                    if round6_expandable_reseat_policy == "random":
+                                        if (
+                                            round6_expandable_candidate_mode == "direct_children"
+                                            and round6_expandable_ended_scope == "leftover_expandable"
+                                        ):
+                                            selector_pick_reason = (
+                                                f"{round5_selector_mode}_ended_reseat_random_{ended_reseat_status}"
+                                            )
+                                        else:
+                                            selector_pick_reason = (
+                                                f"{round5_selector_mode}_ended_reseat_random_"
+                                                f"{round6_expandable_candidate_mode}_{round6_expandable_ended_scope}_{ended_reseat_status}"
+                                            )
+                                    elif (
+                                        round6_expandable_candidate_mode == "direct_children"
+                                        and round6_expandable_ended_scope == "leftover_expandable"
+                                    ):
+                                        selector_pick_reason = f"{round5_selector_mode}_ended_reseat_{ended_reseat_status}"
+                                    else:
+                                        selector_pick_reason = (
+                                            f"{round5_selector_mode}_ended_reseat_"
+                                            f"{round6_expandable_candidate_mode}_{round6_expandable_ended_scope}_{ended_reseat_status}"
+                                        )
                 elif not selector_scored_rows and not (ended_reseat_enabled and ended_reseat_count > 0):
                     selector_pick_reason = "no_candidate_match"
         selector_pick_reason_by_idx[sample_idx] = selector_pick_reason
@@ -2420,7 +2787,10 @@ for iter_idx in range(hp.NUM_ITERS):
         info["ended_beam_count"] = int(ended_reseat_count)
         info["ended_beam_paths"] = [[int(x) for x in path] for path in ended_selected_before]
         info["ended_beam_reseat_enabled"] = bool(ended_reseat_enabled)
-        info["ended_beam_reseat_candidate_count"] = int(len(ended_reseat_scored_rows))
+        info["ended_beam_reseat_candidate_mode"] = str(round6_expandable_candidate_mode if ended_reseat_enabled else "")
+        info["ended_beam_reseat_scope"] = str(round6_expandable_ended_scope if ended_reseat_enabled else "")
+        info["ended_beam_reseat_policy"] = str(round6_expandable_reseat_policy if ended_reseat_enabled else "")
+        info["ended_beam_reseat_candidate_count"] = int(ended_reseat_candidate_count)
         reached_after = sample.get_top_predictions(k=None, rel_fn=sample.get_rel_fn(leaf=True))
         existing_leaf_indices = set(cumulative_leaf_indices_by_sample[sample_idx])
         new_leaf_paths: List[Tuple[int, ...]] = []
@@ -2646,11 +3016,23 @@ for iter_idx in range(hp.NUM_ITERS):
                 "global_escape_enabled": bool(round6_global_escape),
                 "global_escape_slots": int(round6_global_escape_slots),
                 "round6_expandable_mode": round6_expandable_mode if round6_expandable_mode != "off" else "",
+                "round6_expandable_candidate_mode": (
+                    round6_expandable_candidate_mode if round6_expandable_mode != "off" else ""
+                ),
+                "round6_expandable_ended_scope": (
+                    round6_expandable_ended_scope if round6_expandable_mode != "off" else ""
+                ),
+                "round6_expandable_reseat_policy": (
+                    round6_expandable_reseat_policy if round6_expandable_mode != "off" else ""
+                ),
                 "round6_method2_mode": round6_method2_mode if round6_method2 else "",
                 "global_escape_pick_reason": str(global_escape_pick_reason_by_idx.get(sample_idx, "disabled")),
                 "ended_beam_count": int(info.get("ended_beam_count", 0)),
                 "ended_beam_paths": info.get("ended_beam_paths", []),
                 "ended_beam_reseat_enabled": bool(info.get("ended_beam_reseat_enabled", False)),
+                "ended_beam_reseat_candidate_mode": str(info.get("ended_beam_reseat_candidate_mode", "")),
+                "ended_beam_reseat_scope": str(info.get("ended_beam_reseat_scope", "")),
+                "ended_beam_reseat_policy": str(info.get("ended_beam_reseat_policy", "")),
                 "ended_beam_reseat_candidate_count": int(info.get("ended_beam_reseat_candidate_count", 0)),
                 "explore_step": bool(info.get("explore_step", False)),
                 "explore_effective": bool(info.get("explore_effective", False)),

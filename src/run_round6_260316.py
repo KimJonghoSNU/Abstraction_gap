@@ -1401,9 +1401,15 @@ hp.add_param("round6_explore_prompt_name", round6_explore_prompt_name)
 
 exp_dir_name = str(hp)
 RESULTS_DIR = f"{BASE_DIR}/results/{hp.DATASET}/{hp.SUBSET}/round6/{exp_dir_name}/"
-if os.path.exists(RESULTS_DIR) and os.listdir(RESULTS_DIR):
-    print(f"Results already exist at {RESULTS_DIR}. Skipping run.")
-    raise SystemExit(0)
+if os.path.exists(RESULTS_DIR):
+    # Intent: allow reruns after partial writes like logs or hparams; skip only when result pickles already exist.
+    has_result_pkl = any(
+        entry.endswith(".pkl") and os.path.isfile(os.path.join(RESULTS_DIR, entry))
+        for entry in os.listdir(RESULTS_DIR)
+    )
+    if has_result_pkl:
+        print(f"Results already exist at {RESULTS_DIR}. Skipping run.")
+        raise SystemExit(0)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 logger = setup_logger("lattice_runner_round6", f"{RESULTS_DIR}/run.log", logging.INFO)

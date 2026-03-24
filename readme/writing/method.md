@@ -271,3 +271,8 @@ Notes:
 - `\textsc{ReachablePools}` returns all corpus leaves at `t=0`; afterwards it restricts retrieval to the tree region induced by the current beam and the reached leaf set.
 - `\textsc{BranchScore}` can instantiate the selector in the text, e.g. `max` or `mean` over descendant-hit similarities.
 - If space is tight, the metric-computation line can be dropped from the algorithm and left in the main text.
+
+
+## vs beam search, mcts
+
+beam search보다 memory가 있고, Go-Explore보다 corpus-grounded하며, MCTS보다 rollout-free인 archived-frontier retrieval search로 잡는 게 가장 설득력 있다.
