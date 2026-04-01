@@ -283,30 +283,12 @@ def _format_rewrite_prompt(
         )
 
 
-def _compose_next_query(
-    original_query: str,
-    query_state_before: str,
-    rewrite_blob: str,
-    append_mode: bool,
-) -> Tuple[str, str]:
-    query_state_before_str = str(query_state_before or "").strip()
+def _compose_next_query(original_query: str, rewrite_blob: str, query_pre: str) -> str:
     rewrite = str(rewrite_blob or "").strip()
     if rewrite:
-        if append_mode and query_state_before_str:
-            # Intent: ended-beam transition steps should extend the previously useful retrieval direction instead of discarding it.
-            query_state_after = f"{query_state_before_str} {rewrite}".strip()
-        else:
-            # Intent: ordinary steps replace the suffix state so stale retrieval directions do not accumulate indefinitely.
-            query_state_after = rewrite
-    else:
-        query_state_after = query_state_before_str
-
-    original_query_str = str(original_query or "").strip()
-    if query_state_after:
-        query_post = f"{original_query_str} {query_state_after}".strip()
-    else:
-        query_post = original_query_str
-    return query_state_after, query_post
+        # Intent: keep retrieval target anchored to the original query while appending abstract evidence hints.
+        return (str(original_query or "").strip() + " " + rewrite).strip()
+    return str(query_pre or original_query or "").strip()
 
 
 def _load_rewrite_cache(
@@ -972,39 +954,6 @@ def _collect_leaf_pool(
     return out
 
 
-def _build_union_leaf_pool(
-    *,
-    base_branch_paths: Sequence[Tuple[int, ...]],
-    cumulative_leaf_indices: Sequence[int],
-    leaf_indices_by_prefix: Dict[Tuple[int, ...], List[int]],
-    all_leaf_indices: Sequence[int],
-    fallback_to_all: bool = True,
-) -> Tuple[List[int], int, int]:
-    branch_component = _collect_leaf_pool(
-        selected_branches=base_branch_paths,
-        leaf_indices_by_prefix=leaf_indices_by_prefix,
-        all_leaf_indices=all_leaf_indices,
-        fallback_to_all=False,
-    )
-    cumulative_component = [int(x) for x in list(cumulative_leaf_indices or [])]
-    pool: List[int] = []
-    seen: Set[int] = set()
-    for idx in branch_component:
-        if idx in seen:
-            continue
-        seen.add(idx)
-        pool.append(int(idx))
-    for idx in cumulative_component:
-        if idx in seen:
-            continue
-        seen.add(idx)
-        pool.append(int(idx))
-    if not pool and fallback_to_all:
-        # Intent: if both live-frontier descendants and cumulative reached leaves are empty, keep round6 recoverable with a full-leaf fallback.
-        pool = [int(x) for x in list(all_leaf_indices)]
-    return pool, int(len(branch_component)), int(len(cumulative_component))
-
-
 def _retrieve_leaf_hits(
     *,
     query: str,
@@ -1211,231 +1160,6 @@ def _collect_goexplore_direct_child_candidates(
     return ordered_paths, {
         tuple(path): sorted({tuple(parent) for parent in parents}, key=_path_sort_key)
         for path, parents in parent_map.items()
-    }
-
-
-def _coerce_reseat_seen_endpoints_by_depth(raw_value: Any) -> Dict[int, Set[Tuple[int, ...]]]:
-    seen_by_depth: Dict[int, Set[Tuple[int, ...]]] = defaultdict(set)
-    if not isinstance(raw_value, dict):
-        return {}
-    for depth_key, path_values in raw_value.items():
-        try:
-            depth = int(depth_key)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(path_values, (list, tuple, set)):
-            continue
-        for path_value in path_values:
-            path_t = tuple(int(x) for x in list(path_value or []))
-            if path_t:
-                seen_by_depth[depth].add(path_t)
-    return {int(depth): set(paths) for depth, paths in seen_by_depth.items()}
-
-
-def _coerce_reseat_consumed_count_by_depth(raw_value: Any) -> Dict[int, int]:
-    consumed_by_depth: Dict[int, int] = {}
-    if not isinstance(raw_value, dict):
-        return {}
-    for depth_key, count_value in raw_value.items():
-        try:
-            depth = int(depth_key)
-            consumed_by_depth[depth] = max(0, int(count_value))
-        except (TypeError, ValueError):
-            continue
-    return consumed_by_depth
-
-
-def _depth_hist_from_paths(paths: Sequence[Tuple[int, ...]]) -> Dict[int, int]:
-    hist: Dict[int, int] = defaultdict(int)
-    for path_t in paths:
-        if path_t:
-            hist[int(len(path_t))] += 1
-    return {int(depth): int(count) for depth, count in sorted(hist.items())}
-
-
-def _prepare_depth_batched_reseat_candidates(
-    *,
-    sample: InferSample,
-    candidate_paths: Sequence[Tuple[int, ...]],
-    desired_count: int,
-    batch_size: int,
-    skip_seen_same_depth: bool,
-) -> Dict[str, Any]:
-    unique_candidate_paths = sorted(
-        {
-            tuple(path_t)
-            for path_t in candidate_paths
-            if tuple(path_t)
-        },
-        key=_path_sort_key,
-    )
-    candidate_depth_hist = _depth_hist_from_paths(unique_candidate_paths)
-    seen_by_depth = _coerce_reseat_seen_endpoints_by_depth(
-        getattr(sample, "round6_reseat_seen_endpoints_by_depth", {})
-    )
-    consumed_by_depth = _coerce_reseat_consumed_count_by_depth(
-        getattr(sample, "round6_reseat_consumed_count_by_depth", {})
-    )
-    paths_by_depth: Dict[int, List[Tuple[int, ...]]] = defaultdict(list)
-    for path_t in unique_candidate_paths:
-        paths_by_depth[int(len(path_t))].append(path_t)
-
-    def _remaining_paths(depth: int) -> List[Tuple[int, ...]]:
-        depth_paths = list(paths_by_depth.get(int(depth), []))
-        if not skip_seen_same_depth:
-            return depth_paths
-        blocked_paths = seen_by_depth.get(int(depth), set())
-        return [path_t for path_t in depth_paths if path_t not in blocked_paths]
-
-    available_depths = sorted(int(depth) for depth in paths_by_depth.keys())
-    available_depths_with_remaining = [
-        int(depth)
-        for depth in available_depths
-        if _remaining_paths(int(depth))
-    ]
-    raw_active_depth = getattr(sample, "round6_reseat_active_depth", None)
-    try:
-        active_depth_before = int(raw_active_depth) if raw_active_depth is not None else None
-    except (TypeError, ValueError):
-        active_depth_before = None
-
-    if not available_depths_with_remaining or desired_count <= 0:
-        return {
-            "candidate_paths_for_selection": [],
-            "candidate_depth_hist": candidate_depth_hist,
-            "active_depth_before": active_depth_before,
-            "active_depth_used": None,
-            "spill_used": False,
-            "seen_count_at_active_depth": 0,
-            "consumed_count_at_active_depth": 0,
-            "paths_by_depth": {int(depth): list(paths) for depth, paths in paths_by_depth.items()},
-            "seen_by_depth": seen_by_depth,
-            "consumed_by_depth": consumed_by_depth,
-            "batch_size": int(max(1, batch_size)),
-            "skip_seen_same_depth": bool(skip_seen_same_depth),
-        }
-
-    if active_depth_before not in available_depths_with_remaining:
-        active_depth_used = int(available_depths_with_remaining[0])
-    else:
-        active_depth_used = int(active_depth_before)
-
-    candidate_paths_for_selection: List[Tuple[int, ...]] = []
-    spill_used = False
-    active_depth_index = available_depths_with_remaining.index(active_depth_used)
-    for depth in available_depths_with_remaining[active_depth_index:]:
-        remaining_paths = _remaining_paths(depth)
-        if not remaining_paths:
-            continue
-        if int(depth) != int(active_depth_used):
-            # Intent: only spill deeper when the current reseat depth cannot cover the current ended slots.
-            spill_used = True
-        candidate_paths_for_selection.extend(remaining_paths)
-        if len(candidate_paths_for_selection) >= int(desired_count):
-            break
-
-    return {
-        "candidate_paths_for_selection": list(candidate_paths_for_selection),
-        "candidate_depth_hist": candidate_depth_hist,
-        "active_depth_before": active_depth_before,
-        "active_depth_used": int(active_depth_used),
-        "spill_used": bool(spill_used),
-        "seen_count_at_active_depth": int(len(seen_by_depth.get(int(active_depth_used), set()))),
-        "consumed_count_at_active_depth": int(consumed_by_depth.get(int(active_depth_used), 0)),
-        "paths_by_depth": {int(depth): list(paths) for depth, paths in paths_by_depth.items()},
-        "seen_by_depth": seen_by_depth,
-        "consumed_by_depth": consumed_by_depth,
-        "batch_size": int(max(1, batch_size)),
-        "skip_seen_same_depth": bool(skip_seen_same_depth),
-    }
-
-
-def _finalize_depth_batched_reseat_state(
-    *,
-    sample: InferSample,
-    prep_state: Dict[str, Any],
-    selected_rows: Sequence[Dict[str, Any]],
-) -> Dict[str, Any]:
-    seen_by_depth = {
-        int(depth): set(paths)
-        for depth, paths in dict(prep_state.get("seen_by_depth", {})).items()
-    }
-    consumed_by_depth = {
-        int(depth): int(count)
-        for depth, count in dict(prep_state.get("consumed_by_depth", {})).items()
-    }
-    paths_by_depth = {
-        int(depth): [tuple(path_t) for path_t in paths]
-        for depth, paths in dict(prep_state.get("paths_by_depth", {})).items()
-    }
-    batch_size = int(max(1, prep_state.get("batch_size", 1)))
-    skip_seen_same_depth = bool(prep_state.get("skip_seen_same_depth", False))
-    active_depth_used = prep_state.get("active_depth_used", None)
-    active_depth_after = int(active_depth_used) if active_depth_used is not None else None
-
-    selected_depths: List[int] = []
-    for row in selected_rows:
-        path_t = _row_path_tuple(row)
-        if not path_t:
-            continue
-        depth = int(len(path_t))
-        selected_depths.append(depth)
-        # Intent: persist same-depth reseat endpoints so later iterations do not keep reopening the same shallow slots.
-        seen_by_depth.setdefault(depth, set()).add(path_t)
-        consumed_by_depth[depth] = int(consumed_by_depth.get(depth, 0)) + 1
-
-    def _has_remaining_at_depth(depth: int) -> bool:
-        depth_paths = list(paths_by_depth.get(int(depth), []))
-        if not depth_paths:
-            return False
-        if not skip_seen_same_depth:
-            return True
-        blocked_paths = seen_by_depth.get(int(depth), set())
-        return any(path_t not in blocked_paths for path_t in depth_paths)
-
-    available_depths = sorted(int(depth) for depth in paths_by_depth.keys())
-    if active_depth_after is not None:
-        active_depth_exhausted = not _has_remaining_at_depth(active_depth_after)
-        active_depth_consumed = int(consumed_by_depth.get(active_depth_after, 0)) >= int(batch_size)
-        if active_depth_exhausted or active_depth_consumed:
-            deeper_depths = [
-                int(depth)
-                for depth in available_depths
-                if int(depth) > int(active_depth_after) and _has_remaining_at_depth(int(depth))
-            ]
-            if deeper_depths:
-                # Intent: move the reseat controller forward only after the current depth has been consumed or exhausted.
-                active_depth_after = int(deeper_depths[0])
-            else:
-                fallback_depths = [
-                    int(depth)
-                    for depth in available_depths
-                    if _has_remaining_at_depth(int(depth))
-                ]
-                active_depth_after = int(fallback_depths[0]) if fallback_depths else None
-
-    sample.round6_reseat_active_depth = active_depth_after
-    sample.round6_reseat_seen_endpoints_by_depth = {
-        int(depth): set(paths)
-        for depth, paths in seen_by_depth.items()
-    }
-    sample.round6_reseat_consumed_count_by_depth = {
-        int(depth): int(count)
-        for depth, count in consumed_by_depth.items()
-    }
-    return {
-        "selected_depths": [int(depth) for depth in selected_depths],
-        "active_depth_after": active_depth_after,
-        "seen_count_at_active_depth_after": (
-            int(len(seen_by_depth.get(int(active_depth_after), set())))
-            if active_depth_after is not None
-            else 0
-        ),
-        "consumed_count_at_active_depth_after": (
-            int(consumed_by_depth.get(int(active_depth_after), 0))
-            if active_depth_after is not None
-            else 0
-        ),
     }
 
 
@@ -1861,12 +1585,6 @@ if round6_expandable_reseat_policy not in {"score", "random"}:
         f'Unsupported --round6_expandable_reseat_policy "{round6_expandable_reseat_policy}". '
         "Allowed: score|random"
     )
-round6_reseat_depth_control = bool(getattr(hp, "ROUND6_RESEAT_DEPTH_CONTROL", False))
-round6_reseat_depth_batch_size = int(getattr(hp, "ROUND6_RESEAT_DEPTH_BATCH_SIZE", 0) or 0)
-if round6_reseat_depth_batch_size <= 0:
-    round6_reseat_depth_batch_size = max(1, int(hp.MAX_BEAM_SIZE))
-round6_reseat_skip_seen_same_depth = bool(getattr(hp, "ROUND6_RESEAT_SKIP_SEEN_SAME_DEPTH", False))
-seed = int(getattr(hp, "SEED", 0) or 0)
 round6_method2 = bool(getattr(hp, "ROUND6_METHOD2", False))
 round6_method2_mode = str(
     getattr(hp, "ROUND6_METHOD2_MODE", "archive_replace") or "archive_replace"
@@ -1919,17 +1637,11 @@ hp.add_param("round6_expandable_mode", round6_expandable_mode)
 hp.add_param("round6_expandable_candidate_mode", round6_expandable_candidate_mode)
 hp.add_param("round6_expandable_ended_scope", round6_expandable_ended_scope)
 hp.add_param("round6_expandable_reseat_policy", round6_expandable_reseat_policy)
-hp.add_param("round6_reseat_depth_control", round6_reseat_depth_control)
-hp.add_param("round6_reseat_depth_batch_size", round6_reseat_depth_batch_size)
-hp.add_param("round6_reseat_skip_seen_same_depth", round6_reseat_skip_seen_same_depth)
-hp.add_param("seed", seed)
 hp.add_param("round6_method2", round6_method2)
 hp.add_param("round6_method2_mode", round6_method2_mode)
 hp.add_param("round6_expandable_pool_freeze_terminal_beam", round6_expandable_pool_freeze_terminal_beam)
 hp.add_param("round6_fusion_mode", round6_fusion_mode)
 hp.add_param("round6_explore_prompt_name", round6_explore_prompt_name)
-# Intent: behavior-level result naming must change when round6 retrieval/query-state semantics change so old runs are never overwritten.
-hp.add_param("round6_behavior", "reseat_depth_batch_v1" if round6_reseat_depth_control else "frontiercum_qstate_v1")
 round6_emr_topk = max(1, int(getattr(hp, "ROUND6_EMR_TOPK", EMR_DEFAULT_DOC_TOPK) or EMR_DEFAULT_DOC_TOPK))
 round6_emr_sent_topk = max(1, int(getattr(hp, "ROUND6_EMR_SENT_TOPK", EMR_DEFAULT_SENT_TOPK) or EMR_DEFAULT_SENT_TOPK))
 round6_emr_compression = str(getattr(hp, "ROUND6_EMR_COMPRESSION", EMR_DEFAULT_COMPRESSION) or EMR_DEFAULT_COMPRESSION).strip().lower()
@@ -1961,7 +1673,7 @@ with open(f"{RESULTS_DIR}/hparams.json", "w", encoding="utf-8") as f:
 for warning in startup_warnings:
     logger.warning(warning)
 logger.info(
-    "Round6 config | mode=%s | rewrite_prompt=%s | explore_prompt=%s | selector_mode=%s | selector_topk=%d | global_escape=%s | escape_slots=%d | expandable_mode=%s | expandable_candidate_mode=%s | expandable_ended_scope=%s | expandable_reseat_policy=%s | reseat_depth_control=%s | reseat_depth_batch_size=%d | reseat_skip_seen_same_depth=%s | method2=%s | method2_mode=%s | freeze_terminal_beam=%s | fusion_mode=%s",
+    "Round6 config | mode=%s | rewrite_prompt=%s | explore_prompt=%s | selector_mode=%s | selector_topk=%d | global_escape=%s | escape_slots=%d | expandable_mode=%s | expandable_candidate_mode=%s | expandable_ended_scope=%s | expandable_reseat_policy=%s | method2=%s | method2_mode=%s | freeze_terminal_beam=%s | fusion_mode=%s",
     "legacy",
     round5_rewrite_prompt_name,
     round6_explore_prompt_name,
@@ -1973,9 +1685,6 @@ logger.info(
     round6_expandable_candidate_mode,
     round6_expandable_ended_scope,
     round6_expandable_reseat_policy,
-    str(round6_reseat_depth_control).lower(),
-    int(round6_reseat_depth_batch_size),
-    str(round6_reseat_skip_seen_same_depth).lower(),
     str(round6_method2).lower(),
     round6_method2_mode,
     str(round6_expandable_pool_freeze_terminal_beam).lower(),
@@ -2202,7 +1911,6 @@ for i in range(num_samples):
     sample.original_query = original_query
     sample.gold_doc_ids = list(gold_doc_ids)
     sample.last_rewrite_raw = ""
-    sample.round6_query_state = ""
     sample.rewrite_history = []
     sample.iter_records = []
     sample.round6_emr_history = []
@@ -2212,10 +1920,6 @@ for i in range(num_samples):
     # Intent: Go-Explore state is the archived parent decision and which child branches have already been taken there.
     sample.round6_archive_records = {}
     sample.round6_last_trigger_selected_prefixes = []
-    # Intent: depth-batched reseat keeps shallow replacement buckets active until they are consumed or exhausted.
-    sample.round6_reseat_active_depth = None
-    sample.round6_reseat_seen_endpoints_by_depth = {}
-    sample.round6_reseat_consumed_count_by_depth = {}
     # Intent: separate official all-iter memory from diagnostic leaf-trigger-only memory.
     sample.round6_fusion_bank_all_iters = []
     sample.round6_fusion_bank_leaf_trigger_only = []
@@ -2231,8 +1935,6 @@ for i in range(num_samples):
         sample.SAVE_LIST.append("gold_doc_ids")
     if "last_rewrite_raw" not in sample.SAVE_LIST:
         sample.SAVE_LIST.append("last_rewrite_raw")
-    if "round6_query_state" not in sample.SAVE_LIST:
-        sample.SAVE_LIST.append("round6_query_state")
     if "iter_records" not in sample.SAVE_LIST:
         sample.SAVE_LIST.append("iter_records")
     all_eval_samples.append(sample)
@@ -2266,17 +1968,10 @@ for iter_idx in range(hp.NUM_ITERS):
             and round6_expandable_pool_freeze_terminal_beam
             and getattr(sample, "round6_terminal_freeze_active", False)
         )
-        selected_before_current = _selected_branch_paths_from_sample(sample)
-        _, ended_selected_before_current = _partition_selected_branches_by_child_candidates(
-            selected_branches=selected_before_current,
-            child_branch_paths_by_path=child_branch_paths_by_path,
-        )
-        ended_beam_transition_step = bool(
-            round6_expandable_mode == "ended_reseat" and len(ended_selected_before_current) > 0
-        )
-        query_state_before = str(getattr(sample, "round6_query_state", "") or "").strip()
         seen_query = str(sample.query or sample.original_query).strip()
         cumulative_pool = sorted(cumulative_leaf_indices_by_sample[sample_idx])
+        if not cumulative_pool:
+            cumulative_pool = list(leaf_indices)
 
         query_pre = seen_query
         prompt_name_for_iter = round5_rewrite_prompt_name
@@ -2286,12 +1981,8 @@ for iter_idx in range(hp.NUM_ITERS):
         explore_fallback_reason = ""
         explore_candidate_paths: List[Tuple[int, ...]] = []
         explore_candidate_parent_map: Dict[Tuple[int, ...], List[Tuple[int, ...]]] = {}
-        retrieval_pool_indices: List[int] = []
-        retrieval_pool_source = "frontier_descendants_plus_cumulative"
-        retrieval_pool_branch_component_size = 0
-        retrieval_pool_cumulative_component_size = int(len(cumulative_pool))
-        explore_evidence_pool: List[int] = []
-        explore_pool_source = retrieval_pool_source
+        explore_evidence_pool = list(cumulative_pool)
+        explore_pool_source = "cumulative_reached_leaves"
         explore_candidate_scope = "direct_children"
         last_trigger_selected_prefixes = [
             tuple(path)
@@ -2313,14 +2004,10 @@ for iter_idx in range(hp.NUM_ITERS):
             # Intent: once terminal freeze is active, keep rewrite evidence on the last beam-local pool instead of reopening any new branch scope.
             frozen_gate_pool = list(getattr(sample, "round6_terminal_frozen_gate_pool_indices", []) or [])
             explore_evidence_pool = [int(x) for x in frozen_gate_pool] if frozen_gate_pool else list(cumulative_pool)
-            if not explore_evidence_pool:
-                explore_evidence_pool = [int(x) for x in list(leaf_indices)]
-            retrieval_pool_indices = list(explore_evidence_pool)
             query_pre = seen_query
             prompt_name_for_iter = round5_rewrite_prompt_name
             prompt_template_for_iter = rewrite_template
             explore_pool_source = "terminal_frozen_gate_pool"
-            retrieval_pool_source = "terminal_frozen_gate_pool"
             explore_candidate_scope = "terminal_frozen_beam"
             explore_step = False
         elif explore_step:
@@ -2342,9 +2029,8 @@ for iter_idx in range(hp.NUM_ITERS):
                     ]
                     for path_t in explore_candidate_paths
                 }
-                explore_evidence_pool, retrieval_pool_branch_component_size, retrieval_pool_cumulative_component_size = _build_union_leaf_pool(
-                    base_branch_paths=explore_candidate_paths,
-                    cumulative_leaf_indices=cumulative_pool,
+                explore_evidence_pool = _collect_leaf_pool(
+                    selected_branches=explore_candidate_paths,
                     leaf_indices_by_prefix=leaf_indices_by_prefix,
                     all_leaf_indices=leaf_indices,
                     fallback_to_all=False,
@@ -2360,18 +2046,15 @@ for iter_idx in range(hp.NUM_ITERS):
                     prompt_name_for_iter = round6_explore_prompt_name
                     prompt_template_for_iter = explore_rewrite_template
                     explore_effective = True
-                    explore_pool_source = "archive_sibling_descendants_plus_cumulative"
-                    retrieval_pool_source = explore_pool_source
+                    explore_pool_source = "archive_sibling_descendants"
                     explore_candidate_scope = "archived_sibling_candidates"
-                    retrieval_pool_indices = list(explore_evidence_pool)
             else:
                 current_expandable_state_path_map = _build_expandable_state_path_map(sample)
                 # Intent: expandable_pool explore widens both rewrite evidence and selector scope to the whole live expandable frontier.
                 explore_candidate_paths = [tuple(path_t) for path_t in current_expandable_state_path_map.keys()]
                 explore_candidate_parent_map = {}
-                explore_evidence_pool, retrieval_pool_branch_component_size, retrieval_pool_cumulative_component_size = _build_union_leaf_pool(
-                    base_branch_paths=explore_candidate_paths,
-                    cumulative_leaf_indices=cumulative_pool,
+                explore_evidence_pool = _collect_leaf_pool(
+                    selected_branches=explore_candidate_paths,
                     leaf_indices_by_prefix=leaf_indices_by_prefix,
                     all_leaf_indices=leaf_indices,
                     fallback_to_all=False,
@@ -2381,10 +2064,8 @@ for iter_idx in range(hp.NUM_ITERS):
                     prompt_name_for_iter = round5_rewrite_prompt_name
                     prompt_template_for_iter = rewrite_template
                     explore_effective = True
-                    explore_pool_source = "all_expandable_descendants_plus_cumulative"
-                    retrieval_pool_source = explore_pool_source
+                    explore_pool_source = "all_expandable_descendants"
                     explore_candidate_scope = "all_expandable_paths"
-                    retrieval_pool_indices = list(explore_evidence_pool)
             if not explore_effective:
                 explore_fallback_reason = (
                     "no_recoverable_candidates"
@@ -2394,34 +2075,11 @@ for iter_idx in range(hp.NUM_ITERS):
                 explore_mask_fallback = True
                 explore_candidate_paths = []
                 explore_candidate_parent_map = {}
-                retrieval_pool_indices, retrieval_pool_branch_component_size, retrieval_pool_cumulative_component_size = _build_union_leaf_pool(
-                    base_branch_paths=selected_before_current,
-                    cumulative_leaf_indices=cumulative_pool,
-                    leaf_indices_by_prefix=leaf_indices_by_prefix,
-                    all_leaf_indices=leaf_indices,
-                )
-                explore_evidence_pool = list(retrieval_pool_indices)
-                retrieval_pool_source = "frontier_descendants_plus_cumulative"
-                explore_pool_source = retrieval_pool_source
-        else:
-            retrieval_pool_indices, retrieval_pool_branch_component_size, retrieval_pool_cumulative_component_size = _build_union_leaf_pool(
-                base_branch_paths=selected_before_current,
-                cumulative_leaf_indices=cumulative_pool,
-                leaf_indices_by_prefix=leaf_indices_by_prefix,
-                all_leaf_indices=leaf_indices,
-            )
-            explore_evidence_pool = list(retrieval_pool_indices)
-            retrieval_pool_source = "frontier_descendants_plus_cumulative"
-            explore_pool_source = retrieval_pool_source
-
-        if not retrieval_pool_indices:
-            retrieval_pool_indices = [int(x) for x in list(leaf_indices)]
-        if not explore_evidence_pool:
-            explore_evidence_pool = list(retrieval_pool_indices)
+                explore_evidence_pool = list(cumulative_pool)
 
         pre_hits = _retrieve_leaf_hits(
             query=query_pre,
-            leaf_pool_indices=retrieval_pool_indices,
+            leaf_pool_indices=explore_evidence_pool,
             retriever=retriever,
             node_embs=node_embs,
             node_registry=node_registry,
@@ -2465,7 +2123,7 @@ for iter_idx in range(hp.NUM_ITERS):
                 render_prompt=lambda history_text, memory_text: _format_rewrite_prompt(
                     prompt_template_for_iter,
                     original_query=str(sample.original_query),
-                    previous_rewrite=query_state_before,
+                    previous_rewrite=str(getattr(sample, "last_rewrite_raw", "") or ""),
                     leaf_descs=leaf_descs,
                     domain_route_hint=subset_domain_route_hint,
                     relevance_definition=subset_relevance_definition,
@@ -2483,15 +2141,12 @@ for iter_idx in range(hp.NUM_ITERS):
             "cached_rewrite": "",
             "cached_docs": {},
             "prompt_name": prompt_name_for_iter,
-            "selected_branches_before_current": [list(p) for p in selected_before_current],
-            "ended_beam_transition_step": bool(ended_beam_transition_step),
             "explore_step": bool(explore_step),
             "explore_effective": bool(explore_effective),
             "terminal_freeze_active": bool(terminal_freeze_active),
             "terminal_freeze_triggered": False,
             "explore_fallback_reason": str(explore_fallback_reason),
             "explore_pool_source": str(explore_pool_source),
-            "retrieval_pool_source": str(retrieval_pool_source),
             "explore_candidate_scope": str(explore_candidate_scope),
             "explore_archive_records": archive_records_summary,
             "explore_candidate_paths": [[int(x) for x in path] for path in explore_candidate_paths],
@@ -2518,8 +2173,6 @@ for iter_idx in range(hp.NUM_ITERS):
             "terminal_frozen_selector_pool_size": int(
                 len(list(getattr(sample, "round6_terminal_frozen_selector_pool_indices", []) or []))
             ),
-            "query_state_before": query_state_before,
-            "query_state_after": query_state_before,
             "query_pre": query_pre,
             "query_post": query_pre,
             "leaf_descs": leaf_descs,
@@ -2527,13 +2180,9 @@ for iter_idx in range(hp.NUM_ITERS):
             "rewrite_docs": {},
             "raw_output": "",
             "cumulative_pool_pre_size": int(len(cumulative_pool)),
-            "masked_pool_pre_size": int(len(retrieval_pool_indices)),
-            "explore_evidence_pool_size": int(len(retrieval_pool_indices)),
-            "explore_evidence_pool_indices": [int(x) for x in retrieval_pool_indices],
-            "retrieval_pool_indices": [int(x) for x in retrieval_pool_indices],
-            "retrieval_pool_branch_component_size": int(retrieval_pool_branch_component_size),
-            "retrieval_pool_cumulative_component_size": int(retrieval_pool_cumulative_component_size),
-            "retrieval_pool_total_size": int(len(retrieval_pool_indices)),
+            "masked_pool_pre_size": int(len(explore_evidence_pool)),
+            "explore_evidence_pool_size": int(len(explore_evidence_pool)),
+            "explore_evidence_pool_indices": [int(x) for x in explore_evidence_pool],
             # Intent: persist rewrite-time retrieval evidence (query_pre) for off-branch/noise attribution analysis.
             "pre_hit_paths": [list(p) for p in pre_hit_paths],
             "pre_hit_doc_ids": list(pre_hit_doc_ids),
@@ -2568,7 +2217,7 @@ for iter_idx in range(hp.NUM_ITERS):
         prompt = _format_rewrite_prompt(
             prompt_template_for_iter,
             original_query=str(sample.original_query),
-            previous_rewrite=query_state_before,
+            previous_rewrite=str(getattr(sample, "last_rewrite_raw", "") or ""),
             leaf_descs=leaf_descs,
             domain_route_hint=subset_domain_route_hint,
             relevance_definition=subset_relevance_definition,
@@ -2659,26 +2308,21 @@ for iter_idx in range(hp.NUM_ITERS):
             raw_output = str(generated.get("raw_output", "") or "")
 
         query_pre = str(info.get("query_pre", "") or sample.original_query)
-        query_state_before = str(info.get("query_state_before", "") or "")
-        query_state_after, query_post = _compose_next_query(
-            str(sample.original_query),
-            query_state_before,
-            rewrite_blob,
-            bool(info.get("ended_beam_transition_step", False)),
-        )
+        query_post = _compose_next_query(str(sample.original_query), rewrite_blob, query_pre)
         sample.last_rewrite_raw = rewrite_blob
-        sample.round6_query_state = query_state_after
         sample.query = query_post
 
         info["rewrite"] = rewrite_blob
         info["rewrite_docs"] = rewrite_docs
         info["raw_output"] = raw_output
-        info["query_state_after"] = query_state_after
         info["query_post"] = query_post
 
+        cumulative_pool_eval = sorted(cumulative_leaf_indices_by_sample[sample_idx])
+        if not cumulative_pool_eval:
+            cumulative_pool_eval = list(leaf_indices)
         eval_hits = _retrieve_leaf_hits(
             query=query_post,
-            leaf_pool_indices=list(info.get("retrieval_pool_indices", [])),
+            leaf_pool_indices=cumulative_pool_eval,
             retriever=retriever,
             node_embs=node_embs,
             node_registry=node_registry,
@@ -2702,7 +2346,7 @@ for iter_idx in range(hp.NUM_ITERS):
             gold_doc_ids,
             excluded_doc_ids=getattr(sample, "excluded_ids_set", None),
         )
-        info["cumulative_pool_eval_size"] = int(info.get("retrieval_pool_total_size", 0))
+        info["cumulative_pool_eval_size"] = int(len(cumulative_pool_eval))
         info["eval_paths"] = [list(p) for p in eval_paths]
         info["eval_doc_ids"] = list(eval_doc_ids)
         info["eval_doc_ids_eval"] = list(eval_doc_ids_eval)
@@ -2714,8 +2358,6 @@ for iter_idx in range(hp.NUM_ITERS):
                 "iter": iter_idx,
                 "cache_hit": bool(info.get("cache_hit", False)),
                 "prompt_name": str(info.get("prompt_name", round5_rewrite_prompt_name)),
-                "query_state_before": query_state_before,
-                "query_state_after": query_state_after,
                 "query_pre": query_pre,
                 "query_post": query_post,
                 "rewrite": rewrite_blob,
@@ -2837,15 +2479,6 @@ for iter_idx in range(hp.NUM_ITERS):
         ended_reseat_scored_rows: List[Dict[str, Any]] = []
         ended_reseat_selected_rows: List[Dict[str, Any]] = []
         ended_reseat_candidate_count = 0
-        ended_reseat_depth_control_state: Dict[str, Any] = {
-            "candidate_depth_hist": {},
-            "active_depth_before": None,
-            "active_depth_after": None,
-            "selected_depths": [],
-            "seen_count_at_active_depth": 0,
-            "consumed_count_at_active_depth": 0,
-            "spill_used": False,
-        }
         selector_global_escape_rows: List[Dict[str, Any]] = []
         selector_global_escape_selected_rows: List[Dict[str, Any]] = []
         selector_global_escape_replaced_rows: List[Dict[str, Any]] = []
@@ -2916,9 +2549,15 @@ for iter_idx in range(hp.NUM_ITERS):
             else:
                 if terminal_freeze_active or terminal_freeze_triggered:
                     selector_local_pool = list(terminal_frozen_selector_pool)
+                elif explore_effective:
+                    # Intent: the first explore controller only scores recoverable sibling directions, not the just-expanded live frontier.
+                    selector_local_pool = [int(x) for x in list(info.get("explore_evidence_pool_indices", []) or [])]
                 else:
-                    # Intent: selector scoring should see the same frontier-plus-cumulative retrieval boundary as rewrite/eval retrieval.
-                    selector_local_pool = [int(x) for x in list(info.get("retrieval_pool_indices", []) or [])]
+                    selector_local_pool = _collect_leaf_pool(
+                        selected_branches=selected_before,
+                        leaf_indices_by_prefix=leaf_indices_by_prefix,
+                        all_leaf_indices=leaf_indices,
+                    )
                 selector_query = str(
                     info.get("query_post", "")
                     or sample.query
@@ -3056,7 +2695,6 @@ for iter_idx in range(hp.NUM_ITERS):
                                 selected_path_scores[endpoint] = float(row.get("score", 0.0))
                                 selected_state_paths.append(matched_state_path)
                         if ended_reseat_enabled and ended_reseat_count > 0:
-                            depth_batch_prep_state: Dict[str, Any] | None = None
                             if round6_expandable_ended_scope == "whole_tree_flat":
                                 # Intent: flat ended-slot reseat scores the whole semantic-tree branch registry, not just instantiated leftovers.
                                 leftover_candidate_paths = [
@@ -3077,9 +2715,8 @@ for iter_idx in range(hp.NUM_ITERS):
                                     for path_t in leftover_candidate_paths
                                     if tuple(path_t) not in selected_endpoints
                                 ]
-                                replacement_leaf_pool, _, _ = _build_union_leaf_pool(
-                                    base_branch_paths=leftover_candidate_paths,
-                                    cumulative_leaf_indices=sorted(cumulative_leaf_indices_by_sample[sample_idx]),
+                                replacement_leaf_pool = _collect_leaf_pool(
+                                    selected_branches=leftover_candidate_paths,
                                     leaf_indices_by_prefix=leaf_indices_by_prefix,
                                     all_leaf_indices=leaf_indices,
                                     fallback_to_all=False,
@@ -3090,69 +2727,29 @@ for iter_idx in range(hp.NUM_ITERS):
                                     for path_t in expandable_state_path_map.keys()
                                     if tuple(path_t) not in selected_endpoints
                                 ]
-                                replacement_leaf_pool, _, _ = _build_union_leaf_pool(
-                                    base_branch_paths=leftover_candidate_paths,
-                                    cumulative_leaf_indices=sorted(cumulative_leaf_indices_by_sample[sample_idx]),
+                                replacement_leaf_pool = _collect_leaf_pool(
+                                    selected_branches=leftover_candidate_paths,
                                     leaf_indices_by_prefix=leaf_indices_by_prefix,
                                     all_leaf_indices=leaf_indices,
                                     fallback_to_all=False,
                                 )
                             ended_reseat_candidate_count = int(len(leftover_candidate_paths))
                             if leftover_candidate_paths:
-                                candidate_paths_for_selection = list(leftover_candidate_paths)
-                                replacement_leaf_pool_for_selection = list(replacement_leaf_pool)
-                                if round6_reseat_depth_control:
-                                    depth_batch_prep_state = _prepare_depth_batched_reseat_candidates(
-                                        sample=sample,
-                                        candidate_paths=leftover_candidate_paths,
-                                        desired_count=max(0, ended_reseat_count),
-                                        batch_size=round6_reseat_depth_batch_size,
-                                        skip_seen_same_depth=round6_reseat_skip_seen_same_depth,
-                                    )
-                                    ended_reseat_depth_control_state["candidate_depth_hist"] = dict(
-                                        depth_batch_prep_state.get("candidate_depth_hist", {})
-                                    )
-                                    ended_reseat_depth_control_state["active_depth_before"] = depth_batch_prep_state.get(
-                                        "active_depth_before", None
-                                    )
-                                    ended_reseat_depth_control_state["seen_count_at_active_depth"] = int(
-                                        depth_batch_prep_state.get("seen_count_at_active_depth", 0)
-                                    )
-                                    ended_reseat_depth_control_state["consumed_count_at_active_depth"] = int(
-                                        depth_batch_prep_state.get("consumed_count_at_active_depth", 0)
-                                    )
-                                    ended_reseat_depth_control_state["spill_used"] = bool(
-                                        depth_batch_prep_state.get("spill_used", False)
-                                    )
-                                    candidate_paths_for_selection = list(
-                                        depth_batch_prep_state.get("candidate_paths_for_selection", [])
-                                    )
-                                    if candidate_paths_for_selection:
-                                        replacement_leaf_pool_for_selection, _, _ = _build_union_leaf_pool(
-                                            base_branch_paths=candidate_paths_for_selection,
-                                            cumulative_leaf_indices=sorted(cumulative_leaf_indices_by_sample[sample_idx]),
-                                            leaf_indices_by_prefix=leaf_indices_by_prefix,
-                                            all_leaf_indices=leaf_indices,
-                                            fallback_to_all=False,
-                                        )
                                 if round6_expandable_reseat_policy == "random":
                                     random_seed_key = (
                                         f"{hp.SUBSET}|{sample_idx}|{iter_idx}|"
                                         f"{ended_reseat_count}|{round6_expandable_ended_scope}|ended_reseat_random"
                                     )
-                                    # Intent: seed=0 preserves the historical random-control stream, while nonzero seeds fork it deterministically.
-                                    if seed != 0:
-                                        random_seed_key = f"{random_seed_key}|seed={seed}"
                                     ended_reseat_selected_rows = _deterministic_random_rows(
-                                        candidate_paths=candidate_paths_for_selection,
+                                        candidate_paths=leftover_candidate_paths,
                                         sample_count=max(0, ended_reseat_count),
                                         seed_key=random_seed_key,
                                     )
-                                elif replacement_leaf_pool_for_selection and candidate_paths_for_selection:
+                                elif replacement_leaf_pool:
                                     # Intent: score only the leftover expandable frontier when reseating ended beam slots.
                                     replacement_hits = _retrieve_leaf_hits(
                                         query=selector_query,
-                                        leaf_pool_indices=replacement_leaf_pool_for_selection,
+                                        leaf_pool_indices=replacement_leaf_pool,
                                         retriever=retriever,
                                         node_embs=node_embs,
                                         node_registry=node_registry,
@@ -3161,7 +2758,7 @@ for iter_idx in range(hp.NUM_ITERS):
                                     if replacement_hits:
                                         ended_reseat_scored_rows = _score_candidate_branches_score(
                                             local_hits=replacement_hits,
-                                            candidate_child_paths=candidate_paths_for_selection,
+                                            candidate_child_paths=leftover_candidate_paths,
                                             leaf_ancestor_paths=leaf_ancestor_paths,
                                             score_mode=score_mode,
                                         )
@@ -3173,23 +2770,11 @@ for iter_idx in range(hp.NUM_ITERS):
                                         else:
                                             ended_reseat_scored_rows = _filter_scored_rows_to_allowed_paths(
                                                 ended_reseat_scored_rows,
-                                                candidate_paths_for_selection,
+                                                leftover_candidate_paths,
                                             )
                                         ended_reseat_selected_rows = list(
                                             ended_reseat_scored_rows[: max(0, ended_reseat_count)]
                                         )
-                                if depth_batch_prep_state is not None:
-                                    depth_batch_finalize = _finalize_depth_batched_reseat_state(
-                                        sample=sample,
-                                        prep_state=depth_batch_prep_state,
-                                        selected_rows=ended_reseat_selected_rows,
-                                    )
-                                    ended_reseat_depth_control_state["selected_depths"] = list(
-                                        depth_batch_finalize.get("selected_depths", [])
-                                    )
-                                    ended_reseat_depth_control_state["active_depth_after"] = depth_batch_finalize.get(
-                                        "active_depth_after", None
-                                    )
                         local_selected_count = len(selected_path_order) if use_path_materialization else len(selected_state_paths)
                         if local_selected_count == 0 and not ended_reseat_selected_rows:
                             selector_pick_reason = "no_expandable_match"
@@ -3342,17 +2927,6 @@ for iter_idx in range(hp.NUM_ITERS):
         info["ended_beam_reseat_scope"] = str(round6_expandable_ended_scope if ended_reseat_enabled else "")
         info["ended_beam_reseat_policy"] = str(round6_expandable_reseat_policy if ended_reseat_enabled else "")
         info["ended_beam_reseat_candidate_count"] = int(ended_reseat_candidate_count)
-        info["reseat_active_depth_before"] = ended_reseat_depth_control_state.get("active_depth_before", None)
-        info["reseat_active_depth_after"] = ended_reseat_depth_control_state.get("active_depth_after", None)
-        info["ended_reseat_candidate_depth_hist"] = ended_reseat_depth_control_state.get("candidate_depth_hist", {})
-        info["ended_reseat_selected_depths"] = ended_reseat_depth_control_state.get("selected_depths", [])
-        info["ended_reseat_seen_count_at_active_depth"] = int(
-            ended_reseat_depth_control_state.get("seen_count_at_active_depth", 0)
-        )
-        info["ended_reseat_consumed_count_at_active_depth"] = int(
-            ended_reseat_depth_control_state.get("consumed_count_at_active_depth", 0)
-        )
-        info["ended_reseat_depth_spill_used"] = bool(ended_reseat_depth_control_state.get("spill_used", False))
         reached_after = sample.get_top_predictions(k=None, rel_fn=sample.get_rel_fn(leaf=True))
         existing_leaf_indices = set(cumulative_leaf_indices_by_sample[sample_idx])
         new_leaf_paths: List[Tuple[int, ...]] = []
@@ -3602,8 +3176,6 @@ for iter_idx in range(hp.NUM_ITERS):
             {
                 "iter": iter_idx,
                 "round5_mode": round5_mode,
-                "query_state_before": str(info.get("query_state_before", "")),
-                "query_state_after": str(info.get("query_state_after", "")),
                 "query_pre": str(info.get("query_pre", "")),
                 "query_post": str(info.get("query_post", "")),
                 "rewrite": str(info.get("rewrite", "")),
@@ -3612,7 +3184,6 @@ for iter_idx in range(hp.NUM_ITERS):
                 "possible_answer_docs": info.get("rewrite_docs", {}),
                 "selected_branches_before": [list(p) for p in selected_before_by_idx.get(sample_idx, [])],
                 "selected_branches_after": [list(p) for p in selected_after],
-                "ended_beam_transition_step": bool(info.get("ended_beam_transition_step", False)),
                 "selector_mode": round5_selector_mode,
                 "selector_source": str(selector_source_by_idx.get(sample_idx, "retriever_slate")),
                 "selector_pick_reason": str(selector_pick_reason_by_idx.get(sample_idx, "retriever_slate_default")),
@@ -3628,9 +3199,6 @@ for iter_idx in range(hp.NUM_ITERS):
                 "round6_expandable_reseat_policy": (
                     round6_expandable_reseat_policy if round6_expandable_mode != "off" else ""
                 ),
-                "round6_reseat_depth_control": bool(round6_reseat_depth_control),
-                "round6_reseat_depth_batch_size": int(round6_reseat_depth_batch_size),
-                "round6_reseat_skip_seen_same_depth": bool(round6_reseat_skip_seen_same_depth),
                 "round6_method2_mode": round6_method2_mode if round6_method2 else "",
                 "global_escape_pick_reason": str(global_escape_pick_reason_by_idx.get(sample_idx, "disabled")),
                 "ended_beam_count": int(info.get("ended_beam_count", 0)),
@@ -3640,17 +3208,6 @@ for iter_idx in range(hp.NUM_ITERS):
                 "ended_beam_reseat_scope": str(info.get("ended_beam_reseat_scope", "")),
                 "ended_beam_reseat_policy": str(info.get("ended_beam_reseat_policy", "")),
                 "ended_beam_reseat_candidate_count": int(info.get("ended_beam_reseat_candidate_count", 0)),
-                "reseat_active_depth_before": info.get("reseat_active_depth_before", None),
-                "reseat_active_depth_after": info.get("reseat_active_depth_after", None),
-                "ended_reseat_candidate_depth_hist": info.get("ended_reseat_candidate_depth_hist", {}),
-                "ended_reseat_selected_depths": info.get("ended_reseat_selected_depths", []),
-                "ended_reseat_seen_count_at_active_depth": int(
-                    info.get("ended_reseat_seen_count_at_active_depth", 0)
-                ),
-                "ended_reseat_consumed_count_at_active_depth": int(
-                    info.get("ended_reseat_consumed_count_at_active_depth", 0)
-                ),
-                "ended_reseat_depth_spill_used": bool(info.get("ended_reseat_depth_spill_used", False)),
                 "explore_step": bool(info.get("explore_step", False)),
                 "explore_effective": bool(info.get("explore_effective", False)),
                 "explore_trigger_reason": "new_leaf_reached" if bool(info.get("explore_step", False)) else "",
@@ -3708,10 +3265,6 @@ for iter_idx in range(hp.NUM_ITERS):
                 "cumulative_pool_pre_size": int(info.get("cumulative_pool_pre_size", 0)),
                 "masked_pool_pre_size": int(info.get("masked_pool_pre_size", 0)),
                 "cumulative_pool_eval_size": int(info.get("cumulative_pool_eval_size", 0)),
-                "retrieval_pool_source": str(info.get("retrieval_pool_source", "")),
-                "retrieval_pool_branch_component_size": int(info.get("retrieval_pool_branch_component_size", 0)),
-                "retrieval_pool_cumulative_component_size": int(info.get("retrieval_pool_cumulative_component_size", 0)),
-                "retrieval_pool_total_size": int(info.get("retrieval_pool_total_size", 0)),
                 "emr_history": info.get("emr_history", []),
                 "emr_memory_mode": str(info.get("emr_memory_mode", "off")),
                 "emr_memory_compression": str(info.get("emr_memory_compression", round6_emr_compression)),

@@ -152,6 +152,10 @@ class HyperParams(argparse.Namespace):
         if not bool(payload.get('round5_fused_memory', False)):
             payload.pop('round5_fused_memory', None)
         leaf_emr_mode = str(payload.get('leaf_emr_memory_mode', 'off')).lower()
+        if not bool(payload.get('leaf_allow_stop', False)):
+            payload.pop('leaf_allow_stop', None)
+            payload.pop('leaf_stop_prompt_name', None)
+            payload.pop('leaf_stop_cache_path', None)
         if leaf_emr_mode == 'off':
             payload.pop('leaf_emr_memory_mode', None)
             payload.pop('leaf_emr_history_rank_topk', None)
@@ -185,6 +189,12 @@ class HyperParams(argparse.Namespace):
                 payload.pop('round6_emr_compression', None)
             if int(payload.get('round6_emr_memory_max_tokens', EMR_DEFAULT_MEMORY_MAX_TOKENS) or EMR_DEFAULT_MEMORY_MAX_TOKENS) == EMR_DEFAULT_MEMORY_MAX_TOKENS:
                 payload.pop('round6_emr_memory_max_tokens', None)
+        if not bool(payload.get('round6_hypbank', False)):
+            payload.pop('round6_hypbank', None)
+        if not bool(payload.get('round6_context_packing', False)):
+            payload.pop('round6_context_packing', None)
+        if not bool(payload.get('round6_hypbank_context_packing', False)):
+            payload.pop('round6_hypbank_context_packing', None)
         if not bool(payload.get('round6_global_escape', False)):
             payload.pop('round6_global_escape', None)
             payload.pop('round6_global_escape_slots', None)
@@ -195,6 +205,9 @@ class HyperParams(argparse.Namespace):
             payload.pop('round6_expandable_candidate_mode', None)
             payload.pop('round6_expandable_ended_scope', None)
             payload.pop('round6_expandable_reseat_policy', None)
+            payload.pop('round6_reseat_depth_control', None)
+            payload.pop('round6_reseat_depth_batch_size', None)
+            payload.pop('round6_reseat_skip_seen_same_depth', None)
         else:
             if str(payload.get('round6_expandable_candidate_mode', 'direct_children')).lower() == 'direct_children':
                 payload.pop('round6_expandable_candidate_mode', None)
@@ -202,6 +215,20 @@ class HyperParams(argparse.Namespace):
                 payload.pop('round6_expandable_ended_scope', None)
             if str(payload.get('round6_expandable_reseat_policy', 'score')).lower() == 'score':
                 payload.pop('round6_expandable_reseat_policy', None)
+            if not bool(payload.get('round6_reseat_depth_control', False)):
+                payload.pop('round6_reseat_depth_control', None)
+                payload.pop('round6_reseat_depth_batch_size', None)
+                payload.pop('round6_reseat_skip_seen_same_depth', None)
+            else:
+                if int(payload.get('round6_reseat_depth_batch_size', 0) or 0) <= 0:
+                    payload.pop('round6_reseat_depth_batch_size', None)
+                elif int(payload.get('round6_reseat_depth_batch_size', 0) or 0) == int(payload.get('max_beam_size', 0) or 0):
+                    payload.pop('round6_reseat_depth_batch_size', None)
+                if not bool(payload.get('round6_reseat_skip_seen_same_depth', False)):
+                    payload.pop('round6_reseat_skip_seen_same_depth', None)
+        if int(payload.get('seed', 0) or 0) == 0:
+            # Intent: keep seed=0 path-compatible with the historical random reseat baseline.
+            payload.pop('seed', None)
         if not bool(payload.get('round6_method2', False)):
             payload.pop('round6_method2', None)
             payload.pop('round6_method2_mode', None)
@@ -364,6 +391,34 @@ class HyperParams(argparse.Namespace):
         parser.add_argument('--leaf_no_initial_rewrite', default=False, action='store_true',
                             help='Skip initial rewrite in run_leaf_rank.py and start rewrite after first retrieval iteration')
         parser.add_argument(
+            '--leaf_thinkqe_style',
+            default=False,
+            action='store_true',
+            help=(
+                'Enable a paper-faithful ThinkQE-style loop in run_leaf_rank.py: '
+                'exclude previous-round rewrite-context docs plus a cumulative blocklist, '
+                'and accumulate rewrites onto the current query without original-query repetition'
+            ),
+        )
+        parser.add_argument(
+            '--leaf_allow_stop',
+            default=False,
+            action='store_true',
+            help='Enable a separate stop-judge prompt in run_leaf_rank.py and early-exit stopped samples from future iterations',
+        )
+        parser.add_argument(
+            '--leaf_stop_prompt_name',
+            type=str,
+            default='leaf_stop_judge_v1',
+            help='Prompt template name for the separate stop-judge call in run_leaf_rank.py',
+        )
+        parser.add_argument(
+            '--leaf_stop_cache_path',
+            type=str,
+            default=None,
+            help='Optional JSONL cache for stop-judge results in run_leaf_rank.py; defaults to rewrite_cache_path + .stop when unset',
+        )
+        parser.add_argument(
             '--leaf_emr_memory_mode',
             type=str,
             default='off',
@@ -432,6 +487,24 @@ class HyperParams(argparse.Namespace):
             help='Top-K local leaf retrieval size used to score branch candidates for --round5_selector_mode=maxscore_global|meanscore_global|max_hit_global',
         )
         parser.add_argument(
+            '--round6_hypbank',
+            default=False,
+            action='store_true',
+            help='Enable reseat-time hypothesis-bank pruning in run_round6_hypbank.py while keeping frontiercum behavior unchanged by default',
+        )
+        parser.add_argument(
+            '--round6_context_packing',
+            default=False,
+            action='store_true',
+            help='Enable next-iteration reseat-aware rewrite-context packing in run_round6_hypbank.py without requiring --round6_hypbank',
+        )
+        parser.add_argument(
+            '--round6_hypbank_context_packing',
+            default=False,
+            action='store_true',
+            help='Deprecated alias for --round6_context_packing in run_round6_hypbank.py',
+        )
+        parser.add_argument(
             '--round6_global_escape',
             default=False,
             action='store_true',
@@ -481,12 +554,37 @@ class HyperParams(argparse.Namespace):
             '--round6_expandable_reseat_policy',
             type=str,
             default='score',
-            choices=['score', 'random'],
+            choices=['score', 'random', 'mcts'],
             help=(
                 'Round6 ended-reseat replacement policy: '
                 'score=current behavior using retrieval-scored replacement candidates; '
-                'random=sample ended-slot replacements uniformly from the same candidate pool'
+                'random=sample ended-slot replacements uniformly from the same candidate pool; '
+                'mcts=use a visit/value-backed ended-slot replacement controller over the same candidate pool'
             ),
+        )
+        parser.add_argument(
+            '--round6_reseat_depth_control',
+            default=False,
+            action='store_true',
+            help='Enable soft depth-batched control for ended-reseat candidate selection in run_round6.py',
+        )
+        parser.add_argument(
+            '--round6_reseat_depth_batch_size',
+            type=int,
+            default=0,
+            help='Beam-sized quota for advancing the active reseat depth; 0 defaults to max_beam_size',
+        )
+        parser.add_argument(
+            '--round6_reseat_skip_seen_same_depth',
+            default=False,
+            action='store_true',
+            help='Skip same-depth ended-reseat endpoints that were already selected before for the same sample',
+        )
+        parser.add_argument(
+            '--seed',
+            type=int,
+            default=0,
+            help='Generic deterministic seed override; round6 expandable random reseat uses this when nonzero',
         )
         parser.add_argument(
             '--round6_method2',

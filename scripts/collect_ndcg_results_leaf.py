@@ -133,6 +133,80 @@ def _load_leaf_metrics(metrics_path: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _load_done_marker(metrics_path: str) -> Dict[str, object]:
+    done_path = os.path.join(os.path.dirname(metrics_path), "leaf_iter_done.json")
+    if not os.path.exists(done_path):
+        return {}
+    try:
+        with open(done_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_iter_horizon(
+    metrics_path: str,
+    observed_max_iter: Optional[int],
+    max_iter: Optional[int],
+) -> Optional[int]:
+    if max_iter is not None:
+        return max(0, int(max_iter))
+    done_meta = _load_done_marker(metrics_path)
+    for key in ("num_iters_requested", "num_iters_completed"):
+        try:
+            value = int(done_meta.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    if observed_max_iter is None:
+        return None
+    return int(observed_max_iter) + 1
+
+
+def _group_ndcg_by_iter(
+    df: pd.DataFrame,
+    *,
+    metrics_path: str,
+    max_iter: Optional[int],
+    carry_stop_forward: bool,
+) -> pd.Series:
+    if "iter" not in df.columns or "nDCG@10" not in df.columns:
+        return pd.Series(dtype=float)
+    if (not carry_stop_forward) or ("query_idx" not in df.columns):
+        return df.groupby("iter")["nDCG@10"].mean()
+
+    score_df = df[["iter", "query_idx", "nDCG@10"]].copy()
+    score_df["iter"] = pd.to_numeric(score_df["iter"], errors="coerce")
+    score_df["query_idx"] = pd.to_numeric(score_df["query_idx"], errors="coerce")
+    score_df["nDCG@10"] = pd.to_numeric(score_df["nDCG@10"], errors="coerce")
+    score_df = score_df.dropna(subset=["iter", "query_idx", "nDCG@10"])
+    if score_df.empty:
+        return pd.Series(dtype=float)
+    score_df["iter"] = score_df["iter"].astype(int)
+    score_df["query_idx"] = score_df["query_idx"].astype(int)
+
+    horizon = _resolve_iter_horizon(
+        metrics_path,
+        observed_max_iter=int(score_df["iter"].max()) if not score_df.empty else None,
+        max_iter=max_iter,
+    )
+    if horizon is None or horizon <= 0:
+        return pd.Series(dtype=float)
+
+    pivot = score_df.pivot_table(
+        index="iter",
+        columns="query_idx",
+        values="nDCG@10",
+        aggfunc="last",
+    )
+    pivot = pivot.sort_index().reindex(range(int(horizon)))
+    # Intent: carry forward each query's last observed score so stop runs remain comparable to fixed-iteration summaries.
+    carried = pivot.ffill()
+    return carried.mean(axis=1, skipna=True)
+
+
 def _extract_last_ndcg(
     grouped: pd.Series,
     max_iter: Optional[int] = None,
@@ -169,6 +243,7 @@ def collect_ndcg_results(
     exclude_subdirs: List[str],
     include_dir: Optional[str],
     max_iter: Optional[int],
+    carry_stop_forward: bool,
 ) -> pd.DataFrame:
     records: List[Dict[str, object]] = []
     for metrics_path in tqdm(sorted(_find_metrics_files(base_dir, include_dir))):
@@ -179,9 +254,12 @@ def collect_ndcg_results(
         if df.empty:
             continue
         category, exp_id = _relative_experiment_id(base_dir, metrics_path, drop_map)
-        if "iter" not in df.columns or "nDCG@10" not in df.columns:
-            continue
-        grouped = df.groupby("iter")["nDCG@10"].mean()
+        grouped = _group_ndcg_by_iter(
+            df,
+            metrics_path=metrics_path,
+            max_iter=max_iter,
+            carry_stop_forward=carry_stop_forward,
+        )
         if grouped.empty:
             continue
         # Intent: mirror the main collector by reporting the terminal leaf-ranking score, not the initial iteration score.
@@ -263,6 +341,16 @@ def main() -> None:
         help="If set, compute ndcg_end/ndcg_max using only iterations with index < max_iter (e.g., 5 => iter 0..4).",
     )
     parser.add_argument(
+        "--no_carry_stop_forward",
+        dest="carry_stop_forward",
+        default=True,
+        action="store_false",
+        help=(
+            "Disable carry-forward of each query's last observed nDCG@10. "
+            "By default the collector carries stopped queries forward when later iter rows are missing."
+        ),
+    )
+    parser.add_argument(
         "--drop_param",
         action="append",
         default=[
@@ -297,7 +385,14 @@ def main() -> None:
         out_csv = out_csv[:-4] + f"_maxiter{int(args.max_iter)}" + out_csv[-4:]
     print(f"Collecting leaf-only nDCG@10 results from {base_dir}...")
     drop_map = _build_drop_map(args.drop_param)
-    df = collect_ndcg_results(base_dir, drop_map, args.exclude_subdir, args.include_dir, args.max_iter)
+    df = collect_ndcg_results(
+        base_dir,
+        drop_map,
+        args.exclude_subdir,
+        args.include_dir,
+        args.max_iter,
+        args.carry_stop_forward,
+    )
     wide_df = _append_ndcg_mean_columns(_format_wide_results(df))
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     wide_df.to_csv(out_csv, index=False)

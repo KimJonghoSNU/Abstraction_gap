@@ -9,9 +9,12 @@ Track the branch-state trajectory of the direct-child ended-reseat run:
 - after entering, when does it first leave that region?
 - at what branch depth does that exit happen?
 
-This is intentionally branch-state analysis, not retrieval-state analysis.
-The target question is whether the controller leaves the correct region, and
-when that happens in iteration/depth terms.
+This is primarily branch-state analysis, but we also reconstruct one strict
+retrieval-side signal from saved iter records: whether the current retrieval
+pool still contains any exact gold doc leaf.
+The target question is whether the controller leaves the correct region, when
+that happens in iteration/depth terms, and whether retrieval recoverability
+persists after branch-state exit.
 
 Examples
 --------
@@ -107,18 +110,63 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _normalize_paths(items: Sequence[Any]) -> List[Tuple[int, ...]]:
+    out: List[Tuple[int, ...]] = []
+    for item in list(items or []):
+        if not item:
+            continue
+        out.append(tuple(int(x) for x in list(item)))
+    return out
+
+
+def _count_pool_gold_hits(
+    selected_branches: Sequence[Tuple[int, ...]],
+    cumulative_reached_leaves: Sequence[Tuple[int, ...]],
+    gold_paths: Sequence[Tuple[int, ...]],
+) -> int:
+    cumulative_set = {tuple(path) for path in list(cumulative_reached_leaves or [])}
+    selected_list = [tuple(path) for path in list(selected_branches or [])]
+    if (not cumulative_set) and (not selected_list):
+        return int(len(gold_paths))
+
+    hits = 0
+    for gold_path in gold_paths:
+        gp_t = tuple(gold_path)
+        if gp_t in cumulative_set:
+            hits += 1
+            continue
+        if any(_is_prefix(branch_path, gp_t) for branch_path in selected_list):
+            hits += 1
+    return hits
+
+
 def _analyze_sample(subset: str, query_idx: int, sample: Dict[str, Any]) -> Dict[str, Any]:
     gold_paths = [tuple(path) for path in (sample.get("gold_paths", []) or []) if path]
+    gold_path_set = set(gold_paths)
     iter_records = sample.get("iter_records", []) or []
     per_iter_rows: List[Dict[str, Any]] = []
     on_region_flags: List[bool] = []
     per_iter_gold_depths: List[List[int]] = []
+    cumulative_reached_leaf_paths: set[Tuple[int, ...]] = set()
 
     for iter_idx, rec in enumerate(iter_records):
         selected = [tuple(path) for path in (rec.get("selected_branches_after", []) or []) if path]
+        selected_before = [tuple(path) for path in (rec.get("selected_branches_before", []) or []) if path]
         gold_selected = [path for path in selected if _branch_is_gold_ancestor(path, gold_paths)]
         gold_depths = [len(path) for path in gold_selected]
         on_region = bool(gold_selected)
+        # Intent: frontiercum_qstate retrieval pool is frontier descendants union cumulative reached leaves before the current iter.
+        pool_gold_hits = _count_pool_gold_hits(
+            selected_branches=selected_before,
+            cumulative_reached_leaves=sorted(cumulative_reached_leaf_paths),
+            gold_paths=gold_paths,
+        )
+        pool_has_any_gold_doc = int(pool_gold_hits > 0)
+        pool_gold_doc_recall = (
+            float(pool_gold_hits / len(gold_path_set))
+            if gold_path_set
+            else float("nan")
+        )
         on_region_flags.append(on_region)
         per_iter_gold_depths.append(gold_depths)
         per_iter_rows.append(
@@ -131,9 +179,13 @@ def _analyze_sample(subset: str, query_idx: int, sample: Dict[str, Any]) -> Dict
                 "num_gold_selected": int(len(gold_selected)),
                 "gold_selected_depth_mean": float(np.mean(gold_depths)) if gold_depths else float("nan"),
                 "gold_selected_depth_max": float(max(gold_depths)) if gold_depths else float("nan"),
+                "pool_has_any_gold_doc": int(pool_has_any_gold_doc),
+                "pool_gold_doc_hits": int(pool_gold_hits),
+                "pool_gold_doc_recall": float(pool_gold_doc_recall),
                 "ndcg10": _safe_float(rec.get("metrics", {}).get("nDCG@10")),
             }
         )
+        cumulative_reached_leaf_paths.update(_normalize_paths(rec.get("new_leaf_paths", []) or []))
 
     first_enter_iter = next((idx for idx, flag in enumerate(on_region_flags) if flag), None)
     first_exit_iter = None
@@ -195,6 +247,32 @@ def _build_rows(samples_by_subset: Dict[str, List[Dict[str, Any]]]) -> Tuple[pd.
             iter_rows.extend(row.pop("iter_rows"))
             summary_rows.append(row)
     return pd.DataFrame(summary_rows), pd.DataFrame(iter_rows)
+
+
+def _aggregate_pool_subset_iter(iter_rows_df: pd.DataFrame) -> pd.DataFrame:
+    metric_cols = [
+        "pool_has_any_gold_doc",
+        "pool_gold_doc_hits",
+        "pool_gold_doc_recall",
+        "ndcg10",
+    ]
+    subset_iter = (
+        iter_rows_df.groupby(["subset", "iter"], as_index=False)[metric_cols]
+        .mean(numeric_only=True)
+        .sort_values(["subset", "iter"])
+    )
+    counts = (
+        iter_rows_df.groupby(["subset", "iter"], as_index=False)["query_idx"]
+        .nunique()
+        .rename(columns={"query_idx": "num_queries"})
+    )
+    return subset_iter.merge(counts, on=["subset", "iter"], how="left")
+
+
+def _build_pool_curve_wide(pool_subset_iter_df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    pivot = pool_subset_iter_df.pivot(index="subset", columns="iter", values=value_col).sort_index()
+    pivot.columns = [f"iter_{int(col)}" for col in pivot.columns]
+    return pivot.reset_index()
 
 
 def _aggregate_subset(rows_df: pd.DataFrame) -> pd.DataFrame:
@@ -276,6 +354,9 @@ def main() -> None:
     overall_df = _aggregate_overall(subset_df)
     hist_df = _build_histograms(rows_df)
     examples_df = _build_examples(rows_df)
+    pool_subset_iter_df = _aggregate_pool_subset_iter(iter_rows_df)
+    pool_curve_has_any_df = _build_pool_curve_wide(pool_subset_iter_df, "pool_has_any_gold_doc")
+    pool_curve_recall_df = _build_pool_curve_wide(pool_subset_iter_df, "pool_gold_doc_recall")
 
     out_dir = os.path.dirname(os.path.abspath(args.out_prefix))
     if out_dir:
@@ -287,6 +368,9 @@ def main() -> None:
     overall_df.to_csv(f"{args.out_prefix}_overall_summary.csv", index=False)
     hist_df.to_csv(f"{args.out_prefix}_hist.csv", index=False)
     examples_df.to_csv(f"{args.out_prefix}_examples.csv", index=False)
+    pool_subset_iter_df.to_csv(f"{args.out_prefix}_pool_subset_iter.csv", index=False)
+    pool_curve_has_any_df.to_csv(f"{args.out_prefix}_pool_curve_has_any.csv", index=False)
+    pool_curve_recall_df.to_csv(f"{args.out_prefix}_pool_curve_recall.csv", index=False)
 
     print(f"Saved rows to {args.out_prefix}_rows.csv")
     print(f"Saved iter rows to {args.out_prefix}_iter_rows.csv")
@@ -294,6 +378,9 @@ def main() -> None:
     print(f"Saved overall summary to {args.out_prefix}_overall_summary.csv")
     print(f"Saved histograms to {args.out_prefix}_hist.csv")
     print(f"Saved examples to {args.out_prefix}_examples.csv")
+    print(f"Saved pool subset-iter summary to {args.out_prefix}_pool_subset_iter.csv")
+    print(f"Saved pool has-any curve to {args.out_prefix}_pool_curve_has_any.csv")
+    print(f"Saved pool recall curve to {args.out_prefix}_pool_curve_recall.csv")
 
 
 if __name__ == "__main__":

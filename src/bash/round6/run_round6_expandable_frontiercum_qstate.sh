@@ -1,13 +1,13 @@
 #!/bin/bash
 
 mkdir -p ../logs
-LOG_FILE="../logs/run_round6_expandable_emr_$(date '+%Y_%m_%d').log"
+LOG_FILE="../logs/run_round6_expandable_frontiercum_qstate_$(date '+%Y_%m_%d').log"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting run_round6_expandable_emr.sh script"
+log "Starting run_round6_expandable_frontiercum_qstate.sh script"
 
 # RETRIEVER_MODEL_PATH="/data4/jaeyoung/models/Diver-Retriever-4B"
 RETRIEVER_MODEL_PATH="/data2/pretrained_models/reason-embed-qwen3-8b-0928"
@@ -19,15 +19,6 @@ ROUND6_EXPANDABLE_CANDIDATE_MODE="${ROUND6_EXPANDABLE_CANDIDATE_MODE:-direct_chi
 ROUND6_EXPANDABLE_ENDED_SCOPE="${ROUND6_EXPANDABLE_ENDED_SCOPE:-leftover_expandable}"
 ROUND6_EXPANDABLE_RESEAT_POLICY="${ROUND6_EXPANDABLE_RESEAT_POLICY:-score}"
 ROUND5_REWRITE_PROMPT_NAME="${ROUND5_REWRITE_PROMPT_NAME:-agent_executor_v1_icl2}"
-ROUND6_EMR_MEMORY="${ROUND6_EMR_MEMORY:-1}"
-ROUND6_EMR_TOPK="${ROUND6_EMR_TOPK:-10}"
-ROUND6_EMR_SENT_TOPK="${ROUND6_EMR_SENT_TOPK:-10}"
-ROUND6_EMR_COMPRESSION="${ROUND6_EMR_COMPRESSION:-on}"
-ROUND6_EMR_MEMORY_MAX_TOKENS="${ROUND6_EMR_MEMORY_MAX_TOKENS:-0}"
-if [[ "${ROUND6_EMR_MEMORY}" == "1" && "${ROUND5_REWRITE_PROMPT_NAME}" == "agent_executor_v1_icl2" ]]; then
-    # Intent: keep the default round6 prompt stable while auto-switching to the memory-aware variant only for EMR runs.
-    ROUND5_REWRITE_PROMPT_NAME="agent_executor_v1_icl2_emr_memory"
-fi
 
 COMMON_PARAMS=(
     --reasoning_in_traversal_prompt -1
@@ -52,15 +43,6 @@ if [[ "$ROUND5_DISABLE_CALIBRATION" == "1" ]]; then
     # Intent: default to retriever-score-only branch logic in the expandable reseat ablation.
     COMMON_PARAMS+=(--disable_calibration)
 fi
-if [[ "${ROUND6_EMR_MEMORY}" == "1" ]]; then
-    COMMON_PARAMS+=(
-        --round6_emr_memory
-        --round6_emr_topk "$ROUND6_EMR_TOPK"
-        --round6_emr_sent_topk "$ROUND6_EMR_SENT_TOPK"
-        --round6_emr_compression "$ROUND6_EMR_COMPRESSION"
-        --round6_emr_memory_max_tokens "$ROUND6_EMR_MEMORY_MAX_TOKENS"
-    )
-fi
 
 RUN_SUBSETS=(
     "biology"
@@ -70,10 +52,10 @@ RUN_SUBSETS=(
     "robotics"
     "sustainable_living"
     "stackoverflow"
-    "theoremqa_questions"
+    # "theoremqa_questions"
     "theoremqa_theorems"
     "pony"
-    "aops"
+    # "aops"
     # "leetcode"
 )
 
@@ -96,8 +78,6 @@ QUERY_SOURCES=(
     "original"
 )
 
-log "round6_emr_memory=${ROUND6_EMR_MEMORY} round6_emr_topk=${ROUND6_EMR_TOPK} round6_emr_compression=${ROUND6_EMR_COMPRESSION} rewrite_prompt_name=${ROUND5_REWRITE_PROMPT_NAME} round6_emr_memory_max_tokens=${ROUND6_EMR_MEMORY_MAX_TOKENS}"
-
 read -r -a SELECTOR_MODES <<< "$ROUND5_SELECTOR_MODES"
 for selector_mode in "${SELECTOR_MODES[@]}"; do
     for query_source in "${QUERY_SOURCES[@]}"; do
@@ -114,8 +94,8 @@ for selector_mode in "${SELECTOR_MODES[@]}"; do
                 exit 1
             fi
 
-            # Intent: keep score-policy naming stable while separating EMR runs from the non-memory expandable launcher.
-            suffix="round6_mrr_selector_accum_${selector_mode}_expandable_${ROUND6_EXPANDABLE_MODE}_emr"
+            # Intent: keep score-policy naming stable, and add an explicit suffix only for the random control.
+            suffix="round6_mrr_selector_accum_${selector_mode}_expandable_${ROUND6_EXPANDABLE_MODE}_frontiercum_qstate"
             if [[ "${ROUND6_EXPANDABLE_RESEAT_POLICY}" != "score" ]]; then
                 suffix="${suffix}_${ROUND6_EXPANDABLE_RESEAT_POLICY}"
             fi
@@ -144,6 +124,7 @@ for selector_mode in "${SELECTOR_MODES[@]}"; do
             final_args+=("--query_source" "$query_source")
             final_args+=("--suffix" "$suffix")
             if [[ -n "$ROUND5_REWRITE_PROMPT_NAME" ]]; then
+                # Intent: expose the rewrite prompt override while keeping the ablation focused on beam replacement only.
                 final_args+=("--rewrite_prompt_name" "$ROUND5_REWRITE_PROMPT_NAME")
             fi
 

@@ -13,24 +13,37 @@ sys.path.append(SCRIPT_DIR)
 from collect_ndcg_results_leaf import (  # noqa: E402
     _build_drop_map,
     _find_metrics_files,
+    _group_ndcg_by_iter,
     _load_leaf_metrics,
     _normalize_glob_pattern,
     _relative_experiment_id,
 )
 
+DEFAULT_EXCLUDE_SUBSETS = ["leetcode", "theoremqa_questions", "aops"]
+
 
 def _extract_iter_means(
     df: pd.DataFrame,
     metric: str,
+    metrics_path: str,
     max_iter: Optional[int] = None,
+    carry_stop_forward: bool = True,
 ) -> List[Tuple[int, float]]:
     rows: List[Tuple[int, float]] = []
     if "iter" not in df.columns or metric not in df.columns:
         return rows
 
-    grouped = df.groupby("iter")[metric].mean()
-    if max_iter is not None:
-        grouped = grouped[grouped.index < int(max_iter)]
+    if str(metric) == "nDCG@10":
+        grouped = _group_ndcg_by_iter(
+            df,
+            metrics_path=metrics_path,
+            max_iter=max_iter,
+            carry_stop_forward=carry_stop_forward,
+        )
+    else:
+        grouped = df.groupby("iter")[metric].mean()
+        if max_iter is not None:
+            grouped = grouped[grouped.index < int(max_iter)]
     for iter_idx, mean_val in grouped.items():
         rows.append((int(iter_idx), float(mean_val)))
     return rows
@@ -40,11 +53,14 @@ def collect_iter_results(
     base_dir: str,
     drop_map: Dict[str, str],
     exclude_subdirs: List[str],
+    exclude_subsets: List[str],
     include_dir: Optional[str],
     metric: str,
     max_iter: Optional[int],
+    carry_stop_forward: bool,
 ) -> pd.DataFrame:
     records: List[Dict[str, object]] = []
+    excluded_subset_set = {str(x).strip() for x in list(exclude_subsets or []) if str(x).strip()}
     for metrics_path in tqdm(sorted(_find_metrics_files(base_dir, include_dir))):
         if any(f"{os.sep}{subdir}{os.sep}" in metrics_path for subdir in exclude_subdirs):
             print(f"Skipping excluded path: {metrics_path}")
@@ -53,7 +69,16 @@ def collect_iter_results(
         if df.empty:
             continue
         category, exp_id = _relative_experiment_id(base_dir, metrics_path, drop_map)
-        for iter_idx, mean_val in _extract_iter_means(df, metric, max_iter=max_iter):
+        if category in excluded_subset_set:
+            print(f"Skipping excluded subset={category}: {metrics_path}")
+            continue
+        for iter_idx, mean_val in _extract_iter_means(
+            df,
+            metric,
+            metrics_path,
+            max_iter=max_iter,
+            carry_stop_forward=carry_stop_forward,
+        ):
             records.append(
                 {
                     "category": category,
@@ -110,6 +135,12 @@ def main() -> None:
         default=["260116", "260121"],
         help="Subdirectory name to exclude",
     )
+    parser.add_argument(
+        "--exclude_subsets",
+        nargs="*",
+        default=None,
+        help="Subset names to exclude from the summary. Pass --exclude_subsets with no values to disable all default exclusions.",
+    )
     parser.add_argument("--metric", type=str, default="nDCG@10", help="Metric column to aggregate")
     parser.add_argument(
         "--include_dir",
@@ -122,6 +153,16 @@ def main() -> None:
         type=int,
         default=None,
         help="If set, keep only iterations with index < max_iter.",
+    )
+    parser.add_argument(
+        "--no_carry_stop_forward",
+        dest="carry_stop_forward",
+        default=True,
+        action="store_false",
+        help=(
+            "Disable carry-forward of each query's last observed nDCG@10 for stop runs. "
+            "This only affects --metric 'nDCG@10'; other metrics remain active-row means."
+        ),
     )
     parser.add_argument(
         "--drop_param",
@@ -159,13 +200,16 @@ def main() -> None:
 
     print(f"Collecting per-iteration {args.metric} means from {base_dir}...")
     drop_map = _build_drop_map(args.drop_param)
+    exclude_subsets = DEFAULT_EXCLUDE_SUBSETS if args.exclude_subsets is None else list(args.exclude_subsets)
     df = collect_iter_results(
         base_dir,
         drop_map,
         args.exclude_subdir,
+        exclude_subsets,
         args.include_dir,
         args.metric,
         args.max_iter,
+        args.carry_stop_forward,
     )
     wide_df = _format_flat_overall_iter_results(df, args.metric)
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)

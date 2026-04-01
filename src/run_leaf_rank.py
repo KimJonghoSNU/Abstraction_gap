@@ -68,7 +68,7 @@ QE_PROMPT_TEMPLATES = {}
 
 from rewrite_prompts import REWRITE_PROMPT_TEMPLATES
 
-def _clean_qe_text(text: str) -> str:
+def _extract_qe_candidate(text: str) -> str:
     text = text.split("</think>\n")[-1].strip()
     if "```" in text:
         try:
@@ -78,6 +78,11 @@ def _clean_qe_text(text: str) -> str:
                 text = fenced[-1].strip()
         except Exception:
             pass
+    return text.strip()
+
+
+def _parse_rewrite_output(text: str) -> str:
+    text = _extract_qe_candidate(text)
     try:
         obj = json.loads(text)
     except Exception:
@@ -96,11 +101,44 @@ def _clean_qe_text(text: str) -> str:
     return text.strip()
 
 
+def _clean_qe_text(text: str) -> str:
+    return _parse_rewrite_output(text)
+
+
+def _parse_stop_decision(text: str) -> str:
+    candidate = _extract_qe_candidate(text).strip().lower()
+    if candidate == "stop":
+        return "stop"
+    if candidate == "continue":
+        return "continue"
+    return "continue"
+
+
+def _get_relevance_definition(subset_name: str) -> str:
+    name = str(subset_name or "").strip().lower()
+    relevance_definitions = {
+        "leetcode": "The relevant documents share the core algorithm or data structure needed to solve the coding problem.",
+        "theoremqa_questions": "A document is relevant if it references the same or a closely related theorem needed to answer the question.",
+        "pony": "A document is relevant if it provides the exact syntax, concept, or reference needed to answer the coding or configuration question.",
+        "stackexchange": "A document is relevant if it can directly support an accepted or high-quality answer to the query, not just a semantically nearby topic.",
+        "scifact": "A document is relevant if it contains sufficient evidence to support or refute the scientific claim.",
+        "nq": "A document is relevant if it directly contains the answer to the question.",
+        "fiqa": "A document is relevant if it contains the specific information needed to answer the financial question.",
+        "scidocs": "A document is relevant if it is directly cited by or strongly tied to the query paper's core scientific content.",
+    }
+    relevance_definitions["aops"] = relevance_definitions["theoremqa_questions"]
+    relevance_definitions["theoremqa_theorems"] = relevance_definitions["theoremqa_questions"]
+    relevance_definitions["theoq"] = relevance_definitions["theoremqa_questions"]
+    relevance_definitions["theot"] = relevance_definitions["theoremqa_questions"]
+    return relevance_definitions.get(name, relevance_definitions["stackexchange"])
+
+
 def _format_rewrite_prompt(
     template: str,
     original_query: str,
     previous_rewrite: str,
     context_descs: List[str],
+    relevance_definition: str = "",
     history_actions: str = "",
     memory_docs: str = "",
 ) -> str:
@@ -111,6 +149,7 @@ def _format_rewrite_prompt(
             leaf_descs=context_blob,
             original_query=(original_query or ""),
             previous_rewrite=(previous_rewrite or ""),
+            relevance_definition=(relevance_definition or ""),
             history_actions=(history_actions or ""),
             memory_docs=(memory_docs or ""),
         )
@@ -121,9 +160,27 @@ def _format_rewrite_prompt(
             .replace("{leaf_descs}", context_blob)
             .replace("{original_query}", original_query or "")
             .replace("{previous_rewrite}", previous_rewrite or "")
+            .replace("{relevance_definition}", relevance_definition or "")
             .replace("{history_actions}", history_actions or "")
             .replace("{memory_docs}", memory_docs or "")
         )
+
+
+def _build_stop_prompt(
+    template: str,
+    *,
+    original_query: str,
+    previous_rewrite: str,
+    context_descs: List[str],
+    relevance_definition: str,
+) -> str:
+    return _format_rewrite_prompt(
+        template,
+        original_query,
+        previous_rewrite,
+        context_descs,
+        relevance_definition=relevance_definition,
+    )
 
 
 def _rewrite_cache_key(
@@ -148,6 +205,13 @@ def _rewrite_cache_key(
     return f"{prefix}||{query}||ctx={context_sig}||mem={memory_sig}{iter_tag}"
 
 
+def _mark_sample_stopped(sample: Dict[str, Any], *, stop_iter: int, stop_phase: str) -> None:
+    # Intent: true early exit removes the sample from future retrieval and rewrite iterations once stop is decided.
+    sample["active"] = False
+    sample["stop_iter"] = int(stop_iter)
+    sample["stop_phase"] = str(stop_phase)
+
+
 def _apply_rewrite(mode: str, base_query: str, rewrite: str) -> str:
     rewrite = (rewrite or "").strip()
     if not rewrite:
@@ -155,6 +219,15 @@ def _apply_rewrite(mode: str, base_query: str, rewrite: str) -> str:
     if mode == "replace":
         return rewrite
     return (base_query + " " + rewrite).strip()
+
+
+def _apply_leaf_rewrite(sample: Dict[str, Any], mode: str, rewrite: str, *, thinkqe_style: bool) -> str:
+    rewrite = (rewrite or "").strip()
+    if thinkqe_style:
+        # Intent: ThinkQE-style query evolution accumulates the new rewrite onto the live query state instead of rebuilding from the original query.
+        base_query = str(sample.get("current_query", sample.get("original_query", "")))
+        return (base_query + " " + rewrite).strip() if rewrite else base_query
+    return _apply_rewrite(mode, str(sample.get("original_query", "")), rewrite)
 
 
 def _hits_to_context_hits(hits: List[object], topk: int) -> List[object]:
@@ -181,6 +254,70 @@ def _hits_to_context_descs(hits: List[object], node_registry: List[object], topk
             desc = desc[:max_desc_len]
         descs.append(desc)
     return descs
+
+
+def _hits_to_doc_context_rows(
+    hits: List[object],
+    node_registry: List[object],
+    path_to_doc_id: Dict[Tuple[int, ...], str],
+    max_desc_len: Optional[int],
+    excluded_doc_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen_doc_ids: set[str] = set()
+    excluded = {str(x) for x in (excluded_doc_ids or [])}
+    for h in hits:
+        path = tuple(h.path)
+        doc_id = path_to_doc_id.get(path)
+        if not doc_id or doc_id in seen_doc_ids or doc_id in excluded:
+            continue
+        seen_doc_ids.add(doc_id)
+        desc = node_registry[int(h.registry_idx)].desc
+        if max_desc_len:
+            desc = desc[:max_desc_len]
+        rows.append({
+            "doc_id": str(doc_id),
+            "path": path,
+            "desc": desc,
+        })
+    return rows
+
+
+def _extend_unique_doc_ids(base_doc_ids: Sequence[str], appended_doc_ids: Sequence[str]) -> List[str]:
+    merged: List[str] = [str(x) for x in base_doc_ids]
+    seen = set(merged)
+    for doc_id in appended_doc_ids:
+        doc_id = str(doc_id)
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        merged.append(doc_id)
+    return merged
+
+
+def _select_thinkqe_context_rows(
+    sample: Dict[str, Any],
+    candidate_rows: Sequence[Dict[str, Any]],
+    topk: int,
+) -> Tuple[List[Dict[str, Any]], List[str], List[str], List[str]]:
+    prev_context_doc_ids = [str(x) for x in sample.get("thinkqe_prev_context_doc_ids", [])]
+    prev_context_set = set(prev_context_doc_ids)
+    blocklist_before = [str(x) for x in sample.get("thinkqe_blocklist_doc_ids", [])]
+    blocklist_set = set(blocklist_before)
+    selected_rows: List[Dict[str, Any]] = []
+    filtered_doc_ids: List[str] = []
+    for row in candidate_rows:
+        doc_id = str(row["doc_id"])
+        # Intent: ThinkQE-style filtering drops previous-context and blocklisted docs before selecting fresh rewrite evidence.
+        if doc_id in prev_context_set or doc_id in blocklist_set:
+            filtered_doc_ids.append(doc_id)
+            continue
+        selected_rows.append(row)
+        if len(selected_rows) >= topk:
+            break
+    blocklist_after = _extend_unique_doc_ids(blocklist_before, filtered_doc_ids)
+    selected_doc_ids = [str(row["doc_id"]) for row in selected_rows]
+    return selected_rows, selected_doc_ids, filtered_doc_ids, blocklist_after
 
 
 def _compute_leaf_metrics(
@@ -279,6 +416,7 @@ def _build_emr_prompt_memory(
     original_query: str,
     previous_rewrite: str,
     context_descs: List[str],
+    relevance_definition: str,
     prompt_budgeter: Optional[RewritePromptTokenBudgeter],
     compression_mode: str,
     max_memory_tokens: Optional[int],
@@ -310,6 +448,7 @@ def _build_emr_prompt_memory(
             original_query,
             previous_rewrite,
             context_descs,
+            relevance_definition=relevance_definition,
             history_actions=history_text,
             memory_docs=memory_text,
         ),
@@ -407,6 +546,14 @@ if not hp.NODE_EMB_PATH:
 rewrite_enabled = bool(hp.REWRITE_PROMPT_NAME or hp.REWRITE_PROMPT_PATH or hp.REWRITE_CACHE_PATH)
 if not rewrite_enabled:
     raise ValueError("rewrite prompt or cache is required for run_leaf_rank.py")
+stop_enabled = bool(getattr(hp, "LEAF_ALLOW_STOP", False))
+leaf_thinkqe_style = bool(getattr(hp, "LEAF_THINKQE_STYLE", False))
+if leaf_thinkqe_style:
+    logger.info(
+        "ThinkQE-style leaf loop enabled: previous rewrite-context exclusion + cumulative blocklist + accumulated concat updates."
+    )
+    if str(hp.REWRITE_MODE).lower() != "concat":
+        logger.warning("Ignoring --rewrite_mode=%s because --leaf_thinkqe_style always uses concat accumulation.", hp.REWRITE_MODE)
 
 rewrite_template = None
 if hp.REWRITE_PROMPT_NAME:
@@ -424,6 +571,18 @@ if hp.REWRITE_PROMPT_PATH:
 if rewrite_template is None and not hp.REWRITE_CACHE_PATH:
     raise ValueError("--rewrite_prompt_name or --rewrite_prompt_path is required when rewrite is enabled")
 
+stop_template = None
+if stop_enabled:
+    stop_prompt_name = str(getattr(hp, "LEAF_STOP_PROMPT_NAME", "leaf_stop_judge_v1") or "leaf_stop_judge_v1").strip()
+    if stop_prompt_name not in REWRITE_PROMPT_TEMPLATES:
+        raise ValueError(
+            f'Unknown --leaf_stop_prompt_name "{stop_prompt_name}". '
+            f"Available: {sorted(REWRITE_PROMPT_TEMPLATES.keys())}"
+        )
+    stop_template = REWRITE_PROMPT_TEMPLATES[stop_prompt_name]
+else:
+    stop_prompt_name = ""
+
 rewrite_map: Dict[str, str] = {}
 if hp.REWRITE_CACHE_PATH and os.path.exists(hp.REWRITE_CACHE_PATH) and (not hp.REWRITE_FORCE_REFRESH):
     with open(hp.REWRITE_CACHE_PATH, "r", encoding="utf-8") as f:
@@ -434,6 +593,20 @@ if hp.REWRITE_CACHE_PATH and os.path.exists(hp.REWRITE_CACHE_PATH) and (not hp.R
             rec = json.loads(line)
             if "key" in rec and "rewritten_query" in rec:
                 rewrite_map[str(rec["key"])] = str(rec["rewritten_query"])
+
+stop_cache_path = str(getattr(hp, "LEAF_STOP_CACHE_PATH", "") or "").strip()
+if not stop_cache_path and hp.REWRITE_CACHE_PATH:
+    stop_cache_path = f"{hp.REWRITE_CACHE_PATH}.stop"
+stop_map: Dict[str, str] = {}
+if stop_enabled and stop_cache_path and os.path.exists(stop_cache_path) and (not hp.REWRITE_FORCE_REFRESH):
+    with open(stop_cache_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if "key" in rec and "decision" in rec:
+                stop_map[str(rec["key"])] = str(rec["decision"])
 
 node_embs = np.load(hp.NODE_EMB_PATH, allow_pickle=False)
 emb_registry_indices = resolve_node_emb_registry_indices(full_node_registry, int(node_embs.shape[0]))
@@ -457,6 +630,7 @@ if hp.LEAF_ONLY_RETRIEVAL:
 else:
     node_registry = aligned_node_registry
 retriever = build_retriever(hp.RETRIEVER_MODEL_PATH, subset=hp.SUBSET, local_files_only=True)
+relevance_definition = _get_relevance_definition(hp.SUBSET)
 
 memory_mode = str(getattr(hp, "LEAF_EMR_MEMORY_MODE", "off") or "off").lower()
 memory_compression = str(getattr(hp, "LEAF_EMR_COMPRESSION", "on") or "on").lower()
@@ -496,12 +670,17 @@ for i in range(min(examples_df.shape[0], hp.NUM_EVAL_SAMPLES)):
         "original_query": original_query,
         "current_query": original_query,
         "last_rewrite": "",
+        "active": True,
         "gold_doc_ids": gold_doc_ids,
         "gold_paths": gold_paths,
         "excluded_ids": [str(x) for x in examples_df.iloc[i].get("excluded_ids", [])],
+        "stop_iter": None,
+        "stop_phase": "",
         "emr_history": [],
         "emr_doc_bank": {},
         "emr_doc_bank_next_order": 0,
+        "thinkqe_prev_context_doc_ids": [],
+        "thinkqe_blocklist_doc_ids": [],
     })
 
 logger.info(f"Loaded {len(samples)} eval samples.")
@@ -512,10 +691,13 @@ if hp.LEAF_NO_INITIAL_REWRITE:
     logger.info("Skipping initial rewrite due to --leaf_no_initial_rewrite.")
 else:
     logger.info("Starting initial rewrite.")
-    init_prompts = []
-    init_meta = []
+    init_candidates = []
     init_iter_records = []
+    stop_cache_records = []
+    rewrite_records = []
     for sample in samples:
+        if not bool(sample.get("active", True)):
+            continue
         hits = flat_retrieve_hits(
             retriever=retriever,
             query=sample["original_query"],
@@ -524,30 +706,39 @@ else:
             topk=hp.FLAT_TOPK,
         )
         rewrite_hits = [h for h in hits if h.is_leaf] if hp.LEAF_ONLY_RETRIEVAL else [h for h in hits if not h.is_leaf]
-        context_hits = _hits_to_context_hits(rewrite_hits, hp.REWRITE_CONTEXT_TOPK)
-        context_descs = _hits_to_context_descs(rewrite_hits, node_registry, hp.REWRITE_CONTEXT_TOPK, hp.MAX_DOC_DESC_CHAR_LEN)
+        if leaf_thinkqe_style:
+            context_rows = _hits_to_doc_context_rows(
+                rewrite_hits,
+                node_registry,
+                path_to_doc_id,
+                hp.MAX_DOC_DESC_CHAR_LEN,
+                excluded_doc_ids=sample.get("excluded_ids", []),
+            )
+            context_rows = context_rows[:int(hp.REWRITE_CONTEXT_TOPK)]
+            context_descs = [str(row["desc"]) for row in context_rows]
+            context_path_tuples = [tuple(row["path"]) for row in context_rows]
+            context_doc_ids = [str(row["doc_id"]) for row in context_rows]
+        else:
+            context_hits = _hits_to_context_hits(rewrite_hits, hp.REWRITE_CONTEXT_TOPK)
+            context_descs = _hits_to_context_descs(rewrite_hits, node_registry, hp.REWRITE_CONTEXT_TOPK, hp.MAX_DOC_DESC_CHAR_LEN)
+            context_path_tuples = [tuple(h.path) for h in context_hits]
+            context_doc_ids = _paths_to_ranked_doc_ids(context_path_tuples, path_to_doc_id)
         retrieved_path_tuples = [tuple(h.path) for h in rewrite_hits[:hp.FLAT_TOPK]]
         retrieved_doc_ids = _paths_to_ranked_doc_ids(retrieved_path_tuples, path_to_doc_id)
         retrieved_doc_ids_eval = filter_excluded_predictions(retrieved_doc_ids, sample.get("excluded_ids", []))
-        context_path_tuples = [tuple(h.path) for h in context_hits]
-        emr_state = _build_emr_prompt_memory(
-            sample=sample,
-            mode=memory_mode,
-            query_for_memory=sample["original_query"],
-            retrieved_doc_ids=retrieved_doc_ids,
-            compressor=emr_compressor,
-            doc_text_by_id=doc_text_by_id,
-            doc_topk=int(getattr(hp, "LEAF_EMR_DOC_TOPK", 10) or 10),
-            iter_idx=-1,
-            rewrite_template=rewrite_template,
-            original_query=sample["original_query"],
-            previous_rewrite="",
-            context_descs=context_descs,
-            prompt_budgeter=rewrite_prompt_budgeter,
-            compression_mode=memory_compression,
-            max_memory_tokens=int(getattr(hp, "LEAF_EMR_MEMORY_MAX_TOKENS", 0) or 0),
-        )
-        base_record = {
+        stop_cache_key = _rewrite_cache_key(
+            "leaf_stop_init",
+            sample["current_query"] if leaf_thinkqe_style else sample["original_query"],
+            context_descs,
+            iter_idx=None,
+            prompt_name=stop_prompt_name,
+        ) if stop_enabled else ""
+        init_candidates.append({
+            "sample": sample,
+            "context_descs": context_descs,
+            "retrieved_doc_ids": retrieved_doc_ids,
+            "thinkqe_context_doc_ids": context_doc_ids,
+            "base_record": {
             "phase": "initial_rewrite",
             "iter": -1,
             "query_idx": int(sample["index"]),
@@ -559,66 +750,179 @@ else:
             "retrieved_doc_ids_eval": retrieved_doc_ids_eval,
             "rewrite_context_topk": int(hp.REWRITE_CONTEXT_TOPK),
             "rewrite_context_paths": [list(p) for p in context_path_tuples],
-            "rewrite_context_doc_ids": _paths_to_ranked_doc_ids(context_path_tuples, path_to_doc_id),
+            "rewrite_context_doc_ids": list(context_doc_ids),
+            "rewrite_triggered": False,
+            "rewrite_stop_decision": "",
+            "stop_iter": None,
+            "stop_phase": "",
+            "stop_judge_triggered": bool(stop_enabled),
+            "stop_judge_cache_hit": False,
+            "thinkqe_style_enabled": bool(leaf_thinkqe_style),
+            "thinkqe_context_doc_ids": list(context_doc_ids),
+            "thinkqe_prev_context_doc_ids_before": [],
+            "thinkqe_filtered_doc_ids_this_round": [],
+            "thinkqe_blocklist_doc_ids_after": list(sample.get("thinkqe_blocklist_doc_ids", [])),
+            "thinkqe_rewrite_skipped_no_new_context": False,
             "emr_memory_mode": memory_mode,
-            "emr_memory_compression": emr_state["compression_mode"],
+            "emr_memory_compression": memory_compression,
             "emr_history": list(sample.get("emr_history", [])),
-            "emr_history_prompt_text": emr_state["history_text"],
-            "emr_memory_source": emr_state["memory_source"],
-            "emr_memory_doc_ids": list(emr_state["memory_doc_ids"]),
-            "emr_memory_docs_count": int(len(emr_state["memory_doc_ids"])),
-            "emr_memory_prompt_text": emr_state["memory_text"],
-            "emr_memory_overflow_dropped": list(emr_state["overflow_dropped"]),
-            "emr_memory_pool_doc_ids": list(emr_state["memory_pool_doc_ids"]),
-            "emr_memory_selected_sentences": list(emr_state["selected_sentences"]),
-            "emr_memory_prompt_tokens": emr_state["memory_prompt_tokens"],
-            "emr_prompt_total_tokens": emr_state["prompt_total_tokens"],
-            "emr_prompt_budget_tokens": emr_state["prompt_budget_tokens"],
-            "emr_model_context_tokens": emr_state["model_context_tokens"],
-            "rewrite_triggered": True,
-        }
+            "emr_history_prompt_text": "",
+            "emr_memory_source": "off" if memory_mode == "off" else memory_mode,
+            "emr_memory_doc_ids": [],
+            "emr_memory_docs_count": 0,
+            "emr_memory_prompt_text": "",
+            "emr_memory_overflow_dropped": [],
+            "emr_memory_pool_doc_ids": [],
+            "emr_memory_selected_sentences": [],
+            "emr_memory_prompt_tokens": None,
+            "emr_prompt_total_tokens": None,
+            "emr_prompt_budget_tokens": None,
+            "emr_model_context_tokens": rewrite_prompt_budgeter.max_context_tokens if rewrite_prompt_budgeter is not None else None,
+            },
+            "stop_cache_key": stop_cache_key,
+            "stop_decision": "continue",
+        })
+
+    if stop_enabled:
+        stop_prompts = []
+        stop_meta = []
+        for candidate in init_candidates:
+            stop_cache_key = str(candidate.get("stop_cache_key", ""))
+            if (not hp.REWRITE_FORCE_REFRESH) and stop_cache_key and (stop_cache_key in stop_map):
+                candidate["stop_decision"] = _parse_stop_decision(stop_map[stop_cache_key])
+                candidate["base_record"]["stop_judge_cache_hit"] = True
+                continue
+            stop_prompts.append(_build_stop_prompt(
+                stop_template,
+                original_query=candidate["sample"]["original_query"],
+                previous_rewrite="",
+                context_descs=candidate["context_descs"],
+                relevance_definition=relevance_definition,
+            ))
+            stop_meta.append(candidate)
+        if stop_prompts:
+            stop_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(stop_loop)
+            try:
+                stop_outputs = stop_loop.run_until_complete(
+                    llm_api.run_batch(
+                        stop_prompts,
+                        max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS,
+                        temperature=0.0,
+                    )
+                )
+            finally:
+                stop_loop.close()
+                asyncio.set_event_loop(None)
+            for candidate, out in zip(stop_meta, stop_outputs):
+                decision = _parse_stop_decision(out)
+                candidate["stop_decision"] = decision
+                if candidate["stop_cache_key"]:
+                    stop_map[candidate["stop_cache_key"]] = decision
+                    stop_cache_records.append({
+                        "key": candidate["stop_cache_key"],
+                        "decision": decision,
+                        "prompt_name": stop_prompt_name,
+                        "llm": hp.LLM,
+                        "context_descs": candidate["context_descs"],
+                    })
+
+    init_prompts = []
+    init_meta = []
+    for candidate in init_candidates:
+        sample = candidate["sample"]
+        base_record = dict(candidate["base_record"])
+        if stop_enabled and str(candidate.get("stop_decision", "continue")) == "stop":
+            _mark_sample_stopped(sample, stop_iter=-1, stop_phase="initial_rewrite")
+            base_record["rewrite_stop_decision"] = "stop"
+            base_record["stop_iter"] = -1
+            base_record["stop_phase"] = "initial_rewrite"
+            base_record["applied_rewrite"] = ""
+            base_record["applied_query"] = sample["current_query"]
+            base_record["emr_history_after_write"] = list(sample.get("emr_history", []))
+            init_iter_records.append(base_record)
+            continue
+
+        emr_state = _build_emr_prompt_memory(
+            sample=sample,
+            mode=memory_mode,
+            query_for_memory=sample["original_query"],
+            retrieved_doc_ids=candidate["retrieved_doc_ids"],
+            compressor=emr_compressor,
+            doc_text_by_id=doc_text_by_id,
+            doc_topk=int(getattr(hp, "LEAF_EMR_DOC_TOPK", 10) or 10),
+            iter_idx=-1,
+            rewrite_template=rewrite_template,
+            original_query=sample["original_query"],
+            previous_rewrite="",
+            context_descs=candidate["context_descs"],
+            relevance_definition=relevance_definition,
+            prompt_budgeter=rewrite_prompt_budgeter,
+            compression_mode=memory_compression,
+            max_memory_tokens=int(getattr(hp, "LEAF_EMR_MEMORY_MAX_TOKENS", 0) or 0),
+        )
+        base_record["emr_memory_compression"] = emr_state["compression_mode"]
+        base_record["emr_history_prompt_text"] = emr_state["history_text"]
+        base_record["emr_memory_source"] = emr_state["memory_source"]
+        base_record["emr_memory_doc_ids"] = list(emr_state["memory_doc_ids"])
+        base_record["emr_memory_docs_count"] = int(len(emr_state["memory_doc_ids"]))
+        base_record["emr_memory_prompt_text"] = emr_state["memory_text"]
+        base_record["emr_memory_overflow_dropped"] = list(emr_state["overflow_dropped"])
+        base_record["emr_memory_pool_doc_ids"] = list(emr_state["memory_pool_doc_ids"])
+        base_record["emr_memory_selected_sentences"] = list(emr_state["selected_sentences"])
+        base_record["emr_memory_prompt_tokens"] = emr_state["memory_prompt_tokens"]
+        base_record["emr_prompt_total_tokens"] = emr_state["prompt_total_tokens"]
+        base_record["emr_prompt_budget_tokens"] = emr_state["prompt_budget_tokens"]
+        base_record["emr_model_context_tokens"] = emr_state["model_context_tokens"]
+
         cache_key = _rewrite_cache_key(
             "leaf_init",
-            sample["original_query"],
-            context_descs,
+            sample["current_query"] if leaf_thinkqe_style else sample["original_query"],
+            candidate["context_descs"],
             iter_idx=None,
             prompt_name=str(hp.REWRITE_PROMPT_NAME or hp.REWRITE_PROMPT_PATH or ""),
             history_actions=emr_state["history_text"],
             memory_docs=emr_state["memory_text"],
         )
         if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
-            rewrite = rewrite_map[cache_key]
+            rewrite = _parse_rewrite_output(rewrite_map[cache_key])
             sample["last_rewrite"] = rewrite
-            sample["current_query"] = _apply_rewrite(hp.REWRITE_MODE, sample["original_query"], rewrite)
+            sample["current_query"] = _apply_leaf_rewrite(sample, hp.REWRITE_MODE, rewrite, thinkqe_style=leaf_thinkqe_style)
+            if leaf_thinkqe_style:
+                sample["thinkqe_prev_context_doc_ids"] = list(candidate.get("thinkqe_context_doc_ids", []))
+                sample["thinkqe_blocklist_doc_ids"] = []
             _append_emr_history_entry(
                 sample,
                 applied_query=sample["current_query"],
-                retrieved_doc_ids=retrieved_doc_ids,
+                retrieved_doc_ids=candidate["retrieved_doc_ids"],
                 history_rank_topk=int(getattr(hp, "LEAF_EMR_HISTORY_RANK_TOPK", 10) or 10),
             )
-            cached_record = dict(base_record)
-            cached_record["cache_hit"] = True
-            cached_record["applied_rewrite"] = rewrite
-            cached_record["applied_query"] = sample["current_query"]
-            cached_record["emr_history_after_write"] = list(sample.get("emr_history", []))
-            init_iter_records.append(cached_record)
+            base_record["cache_hit"] = True
+            base_record["rewrite_triggered"] = True
+            base_record["applied_rewrite"] = rewrite
+            base_record["applied_query"] = sample["current_query"]
+            base_record["emr_history_after_write"] = list(sample.get("emr_history", []))
+            init_iter_records.append(base_record)
             continue
+
         if rewrite_template is None:
             raise ValueError("Rewrite enabled but no prompt template is available.")
         init_prompts.append(_format_rewrite_prompt(
             rewrite_template,
             sample["original_query"],
             "",
-            context_descs,
+            candidate["context_descs"],
+            relevance_definition=relevance_definition,
             history_actions=emr_state["history_text"],
             memory_docs=emr_state["memory_text"],
         ))
         init_meta.append({
             "sample": sample,
             "cache_key": cache_key,
-            "context_descs": context_descs,
+            "context_descs": candidate["context_descs"],
             "base_record": base_record,
-            "retrieved_doc_ids": retrieved_doc_ids,
+            "retrieved_doc_ids": candidate["retrieved_doc_ids"],
+            "thinkqe_context_doc_ids": list(candidate.get("thinkqe_context_doc_ids", [])),
         })
 
     if init_prompts:
@@ -637,10 +941,13 @@ else:
             init_loop.close()
             asyncio.set_event_loop(None)
         for meta, out in zip(init_meta, init_outputs):
-            rewrite = _clean_qe_text(out)
+            rewrite = _parse_rewrite_output(out)
             rewrite_map[meta["cache_key"]] = rewrite
             meta["sample"]["last_rewrite"] = rewrite
-            meta["sample"]["current_query"] = _apply_rewrite(hp.REWRITE_MODE, meta["sample"]["original_query"], rewrite)
+            meta["sample"]["current_query"] = _apply_leaf_rewrite(meta["sample"], hp.REWRITE_MODE, rewrite, thinkqe_style=leaf_thinkqe_style)
+            if leaf_thinkqe_style:
+                meta["sample"]["thinkqe_prev_context_doc_ids"] = list(meta.get("thinkqe_context_doc_ids", []))
+                meta["sample"]["thinkqe_blocklist_doc_ids"] = []
             _append_emr_history_entry(
                 meta["sample"],
                 applied_query=meta["sample"]["current_query"],
@@ -649,6 +956,7 @@ else:
             )
             generated_record = dict(meta.get("base_record", {}))
             generated_record["cache_hit"] = False
+            generated_record["rewrite_triggered"] = True
             generated_record["applied_rewrite"] = rewrite
             generated_record["applied_query"] = meta["sample"]["current_query"]
             generated_record["emr_history_after_write"] = list(meta["sample"].get("emr_history", []))
@@ -666,16 +974,26 @@ else:
         with open(hp.REWRITE_CACHE_PATH, "a", encoding="utf-8") as f:
             for rec in rewrite_records:
                 f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+    if stop_enabled and stop_cache_path and stop_cache_records:
+        os.makedirs(os.path.dirname(stop_cache_path) or ".", exist_ok=True)
+        with open(stop_cache_path, "a", encoding="utf-8") as f:
+            for rec in stop_cache_records:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
     if init_iter_records:
         with open(iter_records_path, "a", encoding="utf-8") as f:
             for rec in init_iter_records:
                 f.write(json.dumps(rec, ensure_ascii=True) + "\n")
 
+completed_iters = 0
 for iter_idx in range(hp.NUM_ITERS):
+    active_samples = [sample for sample in samples if bool(sample.get("active", True))]
+    if not active_samples:
+        logger.info("No active samples remain at iter %d; stopping early.", iter_idx)
+        break
     iter_metrics = []
     iter_records = []
     iter_hits = []
-    for sample in tqdm(samples, desc=f"Iter {iter_idx} retrieval"):
+    for sample in tqdm(active_samples, desc=f"Iter {iter_idx} retrieval"):
         hits = flat_retrieve_hits(
             retriever=retriever,
             query=sample["current_query"],
@@ -716,6 +1034,17 @@ for iter_idx in range(hp.NUM_ITERS):
             "rewrite_context_paths": [list(p) for p in context_path_tuples],
             "rewrite_context_doc_ids": _paths_to_ranked_doc_ids(context_path_tuples, path_to_doc_id),
             "rewrite_triggered": False,
+            "rewrite_stop_decision": "",
+            "stop_iter": None,
+            "stop_phase": "",
+            "stop_judge_triggered": bool(stop_enabled),
+            "stop_judge_cache_hit": False,
+            "thinkqe_style_enabled": bool(leaf_thinkqe_style),
+            "thinkqe_context_doc_ids": [],
+            "thinkqe_prev_context_doc_ids_before": list(sample.get("thinkqe_prev_context_doc_ids", [])),
+            "thinkqe_filtered_doc_ids_this_round": [],
+            "thinkqe_blocklist_doc_ids_after": list(sample.get("thinkqe_blocklist_doc_ids", [])),
+            "thinkqe_rewrite_skipped_no_new_context": False,
             "emr_memory_mode": memory_mode,
             "emr_memory_compression": memory_compression,
             "emr_history": list(sample.get("emr_history", [])),
@@ -734,22 +1063,143 @@ for iter_idx in range(hp.NUM_ITERS):
         })
 
     if hp.REWRITE_EVERY > 0 and ((iter_idx + 1) % hp.REWRITE_EVERY == 0):
+        rewrite_candidates = []
+        stop_cache_records = []
+        rewrite_records = []
+        for row_idx, (sample, hits) in enumerate(zip(active_samples, iter_hits)):
+            rewrite_hits = [h for h in hits if h.is_leaf] if hp.LEAF_ONLY_RETRIEVAL else hits
+            context_doc_ids: List[str] = []
+            filtered_doc_ids: List[str] = []
+            blocklist_after = list(sample.get("thinkqe_blocklist_doc_ids", []))
+            rewrite_skipped_no_new_context = False
+            if leaf_thinkqe_style:
+                context_rows = _hits_to_doc_context_rows(
+                    rewrite_hits,
+                    node_registry,
+                    path_to_doc_id,
+                    hp.MAX_DOC_DESC_CHAR_LEN,
+                    excluded_doc_ids=sample.get("excluded_ids", []),
+                )
+                selected_rows, context_doc_ids, filtered_doc_ids, blocklist_after = _select_thinkqe_context_rows(
+                    sample,
+                    context_rows,
+                    int(hp.REWRITE_CONTEXT_TOPK),
+                )
+                context_rows = selected_rows
+                sample["thinkqe_blocklist_doc_ids"] = list(blocklist_after)
+                sample["thinkqe_prev_context_doc_ids"] = list(context_doc_ids)
+                if not context_rows:
+                    # Intent: if redundancy filtering leaves no fresh evidence, keep the query unchanged rather than recycling stale context.
+                    rewrite_skipped_no_new_context = True
+                context_descs = [str(row["desc"]) for row in context_rows]
+                context_path_tuples = [tuple(row["path"]) for row in context_rows]
+            else:
+                context_descs = _hits_to_context_descs(
+                    rewrite_hits,
+                    node_registry,
+                    hp.REWRITE_CONTEXT_TOPK,
+                    hp.MAX_DOC_DESC_CHAR_LEN,
+                )
+                context_hits = _hits_to_context_hits(rewrite_hits, hp.REWRITE_CONTEXT_TOPK)
+                context_path_tuples = [tuple(h.path) for h in context_hits]
+                context_doc_ids = _paths_to_ranked_doc_ids(context_path_tuples, path_to_doc_id)
+            retrieved_doc_ids = iter_records[row_idx]["retrieved_doc_ids"]
+            iter_records[row_idx]["rewrite_context_paths"] = [list(p) for p in context_path_tuples]
+            iter_records[row_idx]["rewrite_context_doc_ids"] = list(context_doc_ids)
+            iter_records[row_idx]["thinkqe_context_doc_ids"] = list(context_doc_ids)
+            iter_records[row_idx]["thinkqe_filtered_doc_ids_this_round"] = list(filtered_doc_ids)
+            iter_records[row_idx]["thinkqe_blocklist_doc_ids_after"] = list(blocklist_after)
+            iter_records[row_idx]["thinkqe_rewrite_skipped_no_new_context"] = bool(rewrite_skipped_no_new_context)
+            stop_cache_key = _rewrite_cache_key(
+                "leaf_stop_iter",
+                sample["current_query"] if leaf_thinkqe_style else f"{sample['original_query']}||{sample['last_rewrite']}",
+                context_descs,
+                iter_idx=iter_idx,
+                prompt_name=stop_prompt_name,
+            ) if stop_enabled else ""
+            rewrite_candidates.append({
+                "sample": sample,
+                "context_descs": context_descs,
+                "row_idx": row_idx,
+                "retrieved_doc_ids": retrieved_doc_ids,
+                "thinkqe_context_doc_ids": list(context_doc_ids),
+                "stop_cache_key": stop_cache_key,
+                "stop_decision": "continue",
+                "rewrite_skipped_no_new_context": bool(rewrite_skipped_no_new_context),
+            })
+
+        if stop_enabled:
+            stop_prompts = []
+            stop_meta = []
+            for candidate in rewrite_candidates:
+                if bool(candidate.get("rewrite_skipped_no_new_context", False)):
+                    continue
+                stop_cache_key = str(candidate.get("stop_cache_key", ""))
+                if (not hp.REWRITE_FORCE_REFRESH) and stop_cache_key and (stop_cache_key in stop_map):
+                    candidate["stop_decision"] = _parse_stop_decision(stop_map[stop_cache_key])
+                    iter_records[candidate["row_idx"]]["stop_judge_cache_hit"] = True
+                    continue
+                stop_prompts.append(_build_stop_prompt(
+                    stop_template,
+                    original_query=candidate["sample"]["original_query"],
+                    previous_rewrite=candidate["sample"]["last_rewrite"],
+                    context_descs=candidate["context_descs"],
+                    relevance_definition=relevance_definition,
+                ))
+                stop_meta.append(candidate)
+            if stop_prompts:
+                stop_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(stop_loop)
+                try:
+                    stop_outputs = stop_loop.run_until_complete(
+                        llm_api.run_batch(
+                            stop_prompts,
+                            max_concurrent_calls=hp.LLM_MAX_CONCURRENT_CALLS,
+                            staggering_delay=hp.LLM_API_STAGGERING_DELAY,
+                            temperature=0.0,
+                        )
+                    )
+                finally:
+                    stop_loop.close()
+                    asyncio.set_event_loop(None)
+                for candidate, out in zip(stop_meta, stop_outputs):
+                    decision = _parse_stop_decision(out)
+                    candidate["stop_decision"] = decision
+                    if candidate["stop_cache_key"]:
+                        stop_map[candidate["stop_cache_key"]] = decision
+                        stop_cache_records.append({
+                            "key": candidate["stop_cache_key"],
+                            "decision": decision,
+                            "prompt_name": stop_prompt_name,
+                            "llm": hp.LLM,
+                            "context_descs": candidate["context_descs"],
+                        })
+
         rewrite_prompts = []
         rewrite_meta = []
-        for row_idx, (sample, hits) in enumerate(zip(samples, iter_hits)):
-            rewrite_hits = [h for h in hits if h.is_leaf] if hp.LEAF_ONLY_RETRIEVAL else hits
-            context_descs = _hits_to_context_descs(
-                rewrite_hits,
-                node_registry,
-                hp.REWRITE_CONTEXT_TOPK,
-                hp.MAX_DOC_DESC_CHAR_LEN,
-            )
-            retrieved_doc_ids = iter_records[row_idx]["retrieved_doc_ids"]
+        for candidate in rewrite_candidates:
+            sample = candidate["sample"]
+            row_idx = int(candidate["row_idx"])
+            if bool(candidate.get("rewrite_skipped_no_new_context", False)):
+                iter_records[row_idx]["applied_rewrite"] = ""
+                iter_records[row_idx]["applied_query"] = sample["current_query"]
+                iter_records[row_idx]["emr_history_after_write"] = list(sample.get("emr_history", []))
+                continue
+            if stop_enabled and str(candidate.get("stop_decision", "continue")) == "stop":
+                _mark_sample_stopped(sample, stop_iter=int(iter_idx), stop_phase="iter_rewrite")
+                iter_records[row_idx]["rewrite_stop_decision"] = "stop"
+                iter_records[row_idx]["stop_iter"] = int(iter_idx)
+                iter_records[row_idx]["stop_phase"] = "iter_rewrite"
+                iter_records[row_idx]["applied_rewrite"] = ""
+                iter_records[row_idx]["applied_query"] = sample["current_query"]
+                iter_records[row_idx]["emr_history_after_write"] = list(sample.get("emr_history", []))
+                continue
+
             emr_state = _build_emr_prompt_memory(
                 sample=sample,
                 mode=memory_mode,
                 query_for_memory=sample["current_query"],
-                retrieved_doc_ids=retrieved_doc_ids,
+                retrieved_doc_ids=candidate["retrieved_doc_ids"],
                 compressor=emr_compressor,
                 doc_text_by_id=doc_text_by_id,
                 doc_topk=int(getattr(hp, "LEAF_EMR_DOC_TOPK", 10) or 10),
@@ -757,7 +1207,8 @@ for iter_idx in range(hp.NUM_ITERS):
                 rewrite_template=rewrite_template,
                 original_query=sample["original_query"],
                 previous_rewrite=sample["last_rewrite"],
-                context_descs=context_descs,
+                context_descs=candidate["context_descs"],
+                relevance_definition=relevance_definition,
                 prompt_budgeter=rewrite_prompt_budgeter,
                 compression_mode=memory_compression,
                 max_memory_tokens=int(getattr(hp, "LEAF_EMR_MEMORY_MAX_TOKENS", 0) or 0),
@@ -776,47 +1227,53 @@ for iter_idx in range(hp.NUM_ITERS):
             iter_records[row_idx]["emr_prompt_total_tokens"] = emr_state["prompt_total_tokens"]
             iter_records[row_idx]["emr_prompt_budget_tokens"] = emr_state["prompt_budget_tokens"]
             iter_records[row_idx]["emr_model_context_tokens"] = emr_state["model_context_tokens"]
+
             cache_key = _rewrite_cache_key(
                 "leaf_iter",
-                f"{sample['original_query']}||{sample['last_rewrite']}",
-                context_descs,
+                sample["current_query"] if leaf_thinkqe_style else f"{sample['original_query']}||{sample['last_rewrite']}",
+                candidate["context_descs"],
                 iter_idx=iter_idx,
                 prompt_name=str(hp.REWRITE_PROMPT_NAME or hp.REWRITE_PROMPT_PATH or ""),
                 history_actions=emr_state["history_text"],
                 memory_docs=emr_state["memory_text"],
             )
             if (not hp.REWRITE_FORCE_REFRESH) and (cache_key in rewrite_map):
-                rewrite = rewrite_map[cache_key]
+                rewrite = _parse_rewrite_output(rewrite_map[cache_key])
                 sample["last_rewrite"] = rewrite
-                sample["current_query"] = _apply_rewrite(hp.REWRITE_MODE, sample["original_query"], rewrite)
+                sample["current_query"] = _apply_leaf_rewrite(sample, hp.REWRITE_MODE, rewrite, thinkqe_style=leaf_thinkqe_style)
                 _append_emr_history_entry(
                     sample,
                     applied_query=sample["current_query"],
-                    retrieved_doc_ids=retrieved_doc_ids,
+                    retrieved_doc_ids=candidate["retrieved_doc_ids"],
                     history_rank_topk=int(getattr(hp, "LEAF_EMR_HISTORY_RANK_TOPK", 10) or 10),
                 )
                 iter_records[row_idx]["cache_hit"] = True
+                iter_records[row_idx]["rewrite_triggered"] = True
                 iter_records[row_idx]["applied_rewrite"] = rewrite
                 iter_records[row_idx]["applied_query"] = sample["current_query"]
                 iter_records[row_idx]["emr_history_after_write"] = list(sample.get("emr_history", []))
                 continue
+
             if rewrite_template is None:
                 raise ValueError("Rewrite enabled but no prompt template is available.")
             rewrite_prompts.append(_format_rewrite_prompt(
                 rewrite_template,
                 sample["original_query"],
                 sample["last_rewrite"],
-                context_descs,
+                candidate["context_descs"],
+                relevance_definition=relevance_definition,
                 history_actions=emr_state["history_text"],
                 memory_docs=emr_state["memory_text"],
             ))
             rewrite_meta.append({
                 "sample": sample,
                 "cache_key": cache_key,
-                "context_descs": context_descs,
+                "context_descs": candidate["context_descs"],
                 "row_idx": row_idx,
-                "retrieved_doc_ids": retrieved_doc_ids,
+                "retrieved_doc_ids": candidate["retrieved_doc_ids"],
+                "thinkqe_context_doc_ids": list(candidate.get("thinkqe_context_doc_ids", [])),
             })
+
         if rewrite_prompts:
             rewrite_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(rewrite_loop)
@@ -833,12 +1290,11 @@ for iter_idx in range(hp.NUM_ITERS):
             finally:
                 rewrite_loop.close()
                 asyncio.set_event_loop(None)
-            rewrite_records = []
             for meta, out in zip(rewrite_meta, rewrite_outputs):
-                rewrite = _clean_qe_text(out)
+                rewrite = _parse_rewrite_output(out)
                 rewrite_map[meta["cache_key"]] = rewrite
                 meta["sample"]["last_rewrite"] = rewrite
-                meta["sample"]["current_query"] = _apply_rewrite(hp.REWRITE_MODE, meta["sample"]["original_query"], rewrite)
+                meta["sample"]["current_query"] = _apply_leaf_rewrite(meta["sample"], hp.REWRITE_MODE, rewrite, thinkqe_style=leaf_thinkqe_style)
                 _append_emr_history_entry(
                     meta["sample"],
                     applied_query=meta["sample"]["current_query"],
@@ -846,6 +1302,7 @@ for iter_idx in range(hp.NUM_ITERS):
                     history_rank_topk=int(getattr(hp, "LEAF_EMR_HISTORY_RANK_TOPK", 10) or 10),
                 )
                 iter_records[meta["row_idx"]]["cache_hit"] = False
+                iter_records[meta["row_idx"]]["rewrite_triggered"] = True
                 iter_records[meta["row_idx"]]["applied_rewrite"] = rewrite
                 iter_records[meta["row_idx"]]["applied_query"] = meta["sample"]["current_query"]
                 iter_records[meta["row_idx"]]["emr_history_after_write"] = list(meta["sample"].get("emr_history", []))
@@ -856,11 +1313,16 @@ for iter_idx in range(hp.NUM_ITERS):
                     "llm": hp.LLM,
                     "context_descs": meta.get("context_descs", []),
                 })
-            if hp.REWRITE_CACHE_PATH and rewrite_records:
-                os.makedirs(os.path.dirname(hp.REWRITE_CACHE_PATH) or ".", exist_ok=True)
-                with open(hp.REWRITE_CACHE_PATH, "a", encoding="utf-8") as f:
-                    for rec in rewrite_records:
-                        f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+        if hp.REWRITE_CACHE_PATH and rewrite_records:
+            os.makedirs(os.path.dirname(hp.REWRITE_CACHE_PATH) or ".", exist_ok=True)
+            with open(hp.REWRITE_CACHE_PATH, "a", encoding="utf-8") as f:
+                for rec in rewrite_records:
+                    f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+        if stop_enabled and stop_cache_path and stop_cache_records:
+            os.makedirs(os.path.dirname(stop_cache_path) or ".", exist_ok=True)
+            with open(stop_cache_path, "a", encoding="utf-8") as f:
+                for rec in stop_cache_records:
+                    f.write(json.dumps(rec, ensure_ascii=True) + "\n")
 
     with open(metrics_path, "a", encoding="utf-8") as f:
         for metrics in iter_metrics:
@@ -872,14 +1334,22 @@ for iter_idx in range(hp.NUM_ITERS):
     mean_ndcg = float(np.mean([m["nDCG@10"] for m in iter_metrics])) if iter_metrics else 0.0
     mean_r10 = float(np.mean([m["Recall@10"] for m in iter_metrics])) if iter_metrics else 0.0
     mean_r100 = float(np.mean([m["Recall@100"] for m in iter_metrics])) if iter_metrics else 0.0
+    active_count = int(sum(1 for sample in samples if bool(sample.get("active", True))))
+    stopped_count = int(sum(1 for sample in samples if not bool(sample.get("active", True))))
     logger.info(
         f"Iter {iter_idx} mean metrics: nDCG@10={mean_ndcg:.2f}, "
-        f"Recall@10={mean_r10:.2f}, Recall@100={mean_r100:.2f}"
+        f"Recall@10={mean_r10:.2f}, Recall@100={mean_r100:.2f}, ActiveSamples={active_count}, StoppedSamples={stopped_count}"
     )
+    completed_iters = int(iter_idx + 1)
 
 logger.info("Saved metrics to %s", metrics_path)
 logger.info("Saved retrieval records to %s", iter_records_path)
 with open(done_marker_path, "w", encoding="utf-8") as f:
-    json.dump({"status": "completed", "num_iters": int(hp.NUM_ITERS)}, f, ensure_ascii=True, indent=2)
+    json.dump(
+        {"status": "completed", "num_iters_requested": int(hp.NUM_ITERS), "num_iters_completed": int(completed_iters)},
+        f,
+        ensure_ascii=True,
+        indent=2,
+    )
 logger.info("Wrote completion marker to %s", done_marker_path)
 logger.info("Completed run_leaf_rank.py.")
