@@ -1013,10 +1013,13 @@ def _retrieve_leaf_hits(
     node_embs: np.ndarray,
     node_registry: Sequence[object],
     topk: int,
+    q_emb: Optional[np.ndarray] = None,
 ) -> List[FlatHit]:
     if not leaf_pool_indices:
         return []
-    q_emb = retriever.encode_query(str(query or ""))
+    # Intent: keep legacy callers unchanged while allowing rollout-time query embeddings to be reused.
+    if q_emb is None:
+        q_emb = retriever.encode_query(str(query or ""))
     scores = (node_embs[list(leaf_pool_indices)] @ q_emb).astype(np.float32, copy=False)
     return _hits_from_scores(
         scores=scores,
@@ -1231,6 +1234,13 @@ class MCTSReseatNodeStats:
         return float(self.immediate_reward)
 
 
+@dataclass
+class MCTSReseatLeafScoreCache:
+    leaf_pool_indices: List[int]
+    scores: np.ndarray
+    position_by_leaf_idx: Dict[int, int]
+
+
 def _ensure_mcts_reseat_stats(
     stats_by_path: Dict[Tuple[int, ...], MCTSReseatNodeStats],
     path: Tuple[int, ...],
@@ -1290,10 +1300,53 @@ def _mcts_uct_value(
     return float(exploit + explore)
 
 
+def _build_mcts_reseat_leaf_score_cache(
+    *,
+    leaf_pool_indices: Sequence[int],
+    q_emb: np.ndarray,
+    node_embs: np.ndarray,
+) -> MCTSReseatLeafScoreCache:
+    pool = [int(idx) for idx in list(leaf_pool_indices or [])]
+    if not pool:
+        return MCTSReseatLeafScoreCache(leaf_pool_indices=[], scores=np.array([], dtype=np.float32), position_by_leaf_idx={})
+    scores = (node_embs[pool] @ q_emb).astype(np.float32, copy=False)
+    return MCTSReseatLeafScoreCache(
+        leaf_pool_indices=pool,
+        scores=scores,
+        position_by_leaf_idx={int(leaf_idx): int(pos) for pos, leaf_idx in enumerate(pool)},
+    )
+
+
+def _hits_from_mcts_reseat_leaf_score_cache(
+    *,
+    leaf_score_cache: MCTSReseatLeafScoreCache,
+    leaf_pool_indices: Sequence[int],
+    node_registry: Sequence[object],
+    topk: int,
+) -> List[FlatHit]:
+    pool = [int(idx) for idx in list(leaf_pool_indices or [])]
+    if not pool:
+        return []
+    positions: List[int] = []
+    for leaf_idx in pool:
+        if int(leaf_idx) not in leaf_score_cache.position_by_leaf_idx:
+            raise ValueError(
+                "MCTS reseat local_pool contains a leaf outside the slot root pool; leaf-score cache assumption is violated."
+            )
+        positions.append(int(leaf_score_cache.position_by_leaf_idx[int(leaf_idx)]))
+    subset_scores = leaf_score_cache.scores[np.asarray(positions, dtype=np.int64)]
+    return _hits_from_scores(
+        scores=subset_scores,
+        subset_indices=pool,
+        node_registry=node_registry,
+        topk=topk,
+    )
+
+
 def _score_mcts_subtree_rows(
     *,
     current_path: Tuple[int, ...],
-    selector_query: str,
+    leaf_score_cache: MCTSReseatLeafScoreCache,
     score_mode: str,
     round6_expandable_candidate_mode: str,
     cumulative_leaf_indices: Sequence[int],
@@ -1303,8 +1356,6 @@ def _score_mcts_subtree_rows(
     leaf_indices_by_prefix: Dict[Tuple[int, ...], List[int]],
     leaf_indices: Sequence[int],
     leaf_ancestor_paths: Dict[Tuple[int, ...], List[Tuple[int, ...]]],
-    retriever: DiverEmbeddingModel,
-    node_embs: np.ndarray,
     node_registry: Sequence[object],
     topk: int,
 ) -> Tuple[List[Dict[str, Any]], int]:
@@ -1332,11 +1383,10 @@ def _score_mcts_subtree_rows(
     if not local_pool:
         return [], 0
 
-    local_hits = _retrieve_leaf_hits(
-        query=selector_query,
+    # Intent: subtree rollout should reuse the slot-level root-pool scores instead of recomputing retrieval per visited node.
+    local_hits = _hits_from_mcts_reseat_leaf_score_cache(
+        leaf_score_cache=leaf_score_cache,
         leaf_pool_indices=local_pool,
-        retriever=retriever,
-        node_embs=node_embs,
         node_registry=node_registry,
         topk=topk,
     )
@@ -1358,7 +1408,7 @@ def _run_reseat_mcts(
     *,
     root_candidate_paths: Sequence[Tuple[int, ...]],
     root_scored_rows: Sequence[Dict[str, Any]],
-    selector_query: str,
+    leaf_score_cache: MCTSReseatLeafScoreCache,
     score_mode: str,
     round6_expandable_candidate_mode: str,
     cumulative_leaf_indices: Sequence[int],
@@ -1368,8 +1418,6 @@ def _run_reseat_mcts(
     leaf_indices_by_prefix: Dict[Tuple[int, ...], List[int]],
     leaf_indices: Sequence[int],
     leaf_ancestor_paths: Dict[Tuple[int, ...], List[Tuple[int, ...]]],
-    retriever: DiverEmbeddingModel,
-    node_embs: np.ndarray,
     node_registry: Sequence[object],
     topk: int,
     num_simulations: int,
@@ -1430,7 +1478,7 @@ def _run_reseat_mcts(
             if cached is None:
                 cached = _score_mcts_subtree_rows(
                     current_path=chosen_path,
-                    selector_query=selector_query,
+                    leaf_score_cache=leaf_score_cache,
                     score_mode=score_mode,
                     round6_expandable_candidate_mode=round6_expandable_candidate_mode,
                     cumulative_leaf_indices=list(cumulative_leaf_indices),
@@ -1440,8 +1488,6 @@ def _run_reseat_mcts(
                     leaf_indices_by_prefix=leaf_indices_by_prefix,
                     leaf_indices=leaf_indices,
                     leaf_ancestor_paths=leaf_ancestor_paths,
-                    retriever=retriever,
-                    node_embs=node_embs,
                     node_registry=node_registry,
                     topk=topk,
                 )
@@ -3452,6 +3498,8 @@ for iter_idx in range(hp.NUM_ITERS):
                                         for slot_idx in range(max(0, ended_reseat_count)):
                                             if not remaining_candidate_paths:
                                                 break
+                                            # Intent: one fixed selector query drives the whole reseat episode, so its embedding should be reused across root and subtree retrievals.
+                                            selector_q_emb = retriever.encode_query(str(selector_query or ""))
                                             current_root_pool, _, _ = _build_union_leaf_pool(
                                                 base_branch_paths=remaining_candidate_paths,
                                                 cumulative_leaf_indices=sorted(cumulative_leaf_indices_by_sample[sample_idx]),
@@ -3461,11 +3509,15 @@ for iter_idx in range(hp.NUM_ITERS):
                                             )
                                             if not current_root_pool:
                                                 break
-                                            replacement_hits = _retrieve_leaf_hits(
-                                                query=selector_query,
+                                            # Intent: slot-level root-pool scores are the primitive cache from which all rollout subsets are derived.
+                                            slot_leaf_score_cache = _build_mcts_reseat_leaf_score_cache(
                                                 leaf_pool_indices=current_root_pool,
-                                                retriever=retriever,
+                                                q_emb=selector_q_emb,
                                                 node_embs=node_embs,
+                                            )
+                                            replacement_hits = _hits_from_mcts_reseat_leaf_score_cache(
+                                                leaf_score_cache=slot_leaf_score_cache,
+                                                leaf_pool_indices=current_root_pool,
                                                 node_registry=node_registry,
                                                 topk=round5_mrr_pool_k,
                                             )
@@ -3490,7 +3542,7 @@ for iter_idx in range(hp.NUM_ITERS):
                                             mcts_result = _run_reseat_mcts(
                                                 root_candidate_paths=remaining_candidate_paths,
                                                 root_scored_rows=root_scored_rows,
-                                                selector_query=selector_query,
+                                                leaf_score_cache=slot_leaf_score_cache,
                                                 score_mode=score_mode,
                                                 round6_expandable_candidate_mode=round6_expandable_candidate_mode,
                                                 cumulative_leaf_indices=sorted(cumulative_leaf_indices_by_sample[sample_idx]),
@@ -3500,8 +3552,6 @@ for iter_idx in range(hp.NUM_ITERS):
                                                 leaf_indices_by_prefix=leaf_indices_by_prefix,
                                                 leaf_indices=leaf_indices,
                                                 leaf_ancestor_paths=leaf_ancestor_paths,
-                                                retriever=retriever,
-                                                node_embs=node_embs,
                                                 node_registry=node_registry,
                                                 topk=round5_mrr_pool_k,
                                                 num_simulations=int(getattr(hp, "MCTS_NUM_SIMULATIONS", 32) or 32),
